@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -22,6 +24,25 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+# ROCm: even a blocking event wait spins in the HSA runtime
+# (BusyWaitSignal::WaitRelaxed), burning a core per GPU worker for every step.
+# VLLM_ROCM_POLL_WAIT_US=N polls the event with an N-microsecond sleep instead
+# (0, the default, keeps the blocking wait). docs/rdna2/cpu-load-investigation.md
+_ROCM_POLL_WAIT_S = (
+    float(os.environ.get("VLLM_ROCM_POLL_WAIT_US", "0") or 0) * 1e-6
+    if torch.version.hip is not None
+    else 0.0
+)
+
+
+def _wait_event(event: torch.cuda.Event) -> None:
+    if _ROCM_POLL_WAIT_S > 0:
+        while not event.query():
+            time.sleep(_ROCM_POLL_WAIT_S)
+    else:
+        event.synchronize()
 
 
 @dataclass(frozen=True)
@@ -171,7 +192,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        _wait_event(self.copy_event)
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -256,7 +277,7 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
             pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         else:
             pooler_output = self.pooler_output_cpu
-        self.copy_event.synchronize()
+        _wait_event(self.copy_event)
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
 
