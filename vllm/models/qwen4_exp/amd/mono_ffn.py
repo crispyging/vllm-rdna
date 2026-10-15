@@ -48,9 +48,10 @@ _MODES = {"full", "piecewise", "eager"}
 _HC_ON = False  # K1: attention-side HC preamble on the persistent kernel
 _HC_MAX_ROWS = MAX_ROWS
 _ZEROS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_STAT_COLS = 36
+_STAT_COLS = 40
 _STAT_ROWS = MAX_ROWS + 1
 _STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
+_STAT_TAIL = 16384 + 65536  # stats block + the latency-probe chain region (mark 9)
 _TICKS_PER_US = 100.0  # wall_clock64 runs at 100 MHz on V620
 _last_log = [0.0]
 
@@ -99,17 +100,17 @@ def _workspace(device: torch.device) -> torch.Tensor:
         nbytes = int(torch.ops._rocm_C.mono_ffn_rdna2_workspace_bytes(2560, 320, 336, 512, 160, 640))
         # explicit coarse-grained allocation, not the caching allocator (whose
         # blocks can be fine-grained under HSA_FORCE_FINE_GRAIN_PCIE=1)
-        ws = torch.ops._rocm_C.mono_ffn_rdna2_workspace_alloc(nbytes + 8192, idx)
+        ws = torch.ops._rocm_C.mono_ffn_rdna2_workspace_alloc(nbytes + _STAT_TAIL, idx)
         _WORKSPACES[idx] = ws
         probe = torch.empty(1, dtype=torch.uint8, device=device)
         logger.info(
             "rdna_mono_ffn: workspace %d B on cuda:%d, HSA global flags %d "
             "(caching allocator: %d; 2 fine, 4 coarse, 8 extended fine)",
-            nbytes + 8192, idx, torch.ops._rocm_C.mono_ffn_rdna2_mem_flags(ws),
+            nbytes + _STAT_TAIL, idx, torch.ops._rocm_C.mono_ffn_rdna2_mem_flags(ws),
             torch.ops._rocm_C.mono_ffn_rdna2_mem_flags(probe),
         )
         # stats / tuning block right after the kernel's workspace
-        st = ws[nbytes : nbytes + _STAT_WORDS * 8].view(torch.int64)
+        st = ws[nbytes:].view(torch.int64)
         sc = _STAT_ROWS * _STAT_COLS
         st[sc + 0] = -1  # entry_min
         st[sc + 5] = _TUNE["sleep"]
@@ -138,7 +139,7 @@ def _log_stats():
         return
     _last_log[0] = now
     for idx, st in _STATS.items():
-        a = st.view(-1, _STAT_COLS).cpu()
+        a = st[:_STAT_WORDS].view(-1, _STAT_COLS).cpu()
         for w in range(1, _STAT_ROWS):
             r = a[w].tolist()
             n, nm, ng = r[0], r[12], r[16]
@@ -151,7 +152,7 @@ def _log_stats():
                 "total %.1f phases %s | entry spread %.1f wg0 %.1f | mark->first %.1f "
                 "mark->last %.1f | rest n=%d %.1f us | attn n=%d %.1f us (hc %.1f) | "
                 "linear AR n=%d %.1f us | core qsa n=%d %.1f gdn n=%d %.1f | "
-                "sclk attn %.0f ffn %.0f MHz | load pairs %.2f corr(pairs, kernel) %.2f",
+                "sclk attn %.0f ffn %.0f MHz | load pairs %.2f corr(pairs, kernel) %.2f | gap8 n=%d %.2f us | lat9 n=%d %.0f cyc",
                 idx, w, nm, us(r[13], nm), n, us(r[9], n), ph, us(r[8], n),
                 us(r[10], n), us(r[14], n), us(r[15], n), ng, us(r[17], ng),
                 r[18], us(r[19], r[18]), us(r[21], r[20]), r[22], us(r[23], r[22]),
@@ -160,6 +161,7 @@ def _log_stats():
                 100.0 * r[30] / r[31] if r[31] else 0.0,
                 r[32] / n if n else 0.0,
                 _corr(n, r[32], r[9], r[33], r[35], r[34]),
+                r[37], us(r[36], r[37]), r[39], r[38] / r[39] if r[39] else 0.0,
             )
 
 
@@ -341,6 +343,8 @@ def _mono_attn_hc(
         _LOGGED.add(key)
         logger.info("rdna_mono_hc: %d rows (%s) -> %s", m, mode, "K1 kernel" if use else "modules")
     _mark(3, hidden_states)
+    _mark(8, hidden_states)  # dispatch-gap probe (empty kernel after mark 3)
+    _mark(9, hidden_states)  # L2 latency probe; restarts the hc timer
     if use:
         out = mono.run_hc(hidden_states, prev_out, prev_inj)
     elif prev_out is not None and prev_inj is not None:

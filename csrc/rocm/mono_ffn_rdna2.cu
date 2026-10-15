@@ -190,7 +190,10 @@ struct Params {
 //  pairs p, p^2, p x kernel ticks, kernel ticks^2. Wall-clock ticks (100 MHz).
 // Tuning (0 = default): sleep = s_sleep argument while polling a barrier
 // (1, 2, 4, 8, 16, 32, 64, 127); flags bit 0 = skip the per-WG debug stores.
-constexpr int kStatCols = 36;
+//  36/37 dispatch-gap probe: time from mark 3 to the next (empty) mark 8 /
+//  count  38/39 latency probe: shader cycles for a 64-step dependent L2 load
+//  chain over the stats block / count (mark 9).
+constexpr int kStatCols = 40;
 constexpr int kTuneSleep = 5, kTuneFlags = 6, kFlagNoDebug = 1;
 constexpr int kStatRows = kMaxM + 1;
 constexpr int kStatWords = (kStatRows + 1) * kStatCols;
@@ -1635,7 +1638,26 @@ __global__ void mono_mark_kernel(unsigned long long* stats, int kind, int wtype)
   unsigned long long* row = stats + width * kStatCols;
   const unsigned long long t = wall_clock64();
   const unsigned long long c = __builtin_amdgcn_s_memtime();  // shader clock
-  if (kind == 6) {
+  if (kind == 8) {  // dispatch-gap probe: empty kernel right after mark 3
+    row[36] += t - sc[7];
+    row[37] += 1;
+    sc[7] = t;
+  } else if (kind == 9) {  // latency probe: dependent load chain in the stats block
+    const unsigned long long c0 = __builtin_amdgcn_s_memtime();
+    unsigned long long idx = 0;
+    const unsigned long long* chain = stats + (kStatRows + 1) * kStatCols;
+#pragma unroll 1
+    for (int i = 0; i < 64; i++) {
+      // each slot holds a pseudo-random next index in [0, 64), 1 KB apart
+      idx = __hip_atomic_load(chain + (idx & 63) * 128 + 64, __ATOMIC_RELAXED,
+                              __HIP_MEMORY_SCOPE_AGENT) + i;
+    }
+    const unsigned long long c1 = __builtin_amdgcn_s_memtime();
+    row[38] += (c1 - c0) + (idx == 0xFFFFFFFFFFFFull ? 1 : 0);
+    row[39] += 1;
+    sc[7] = wall_clock64();  // hc timer restarts after the probes
+    sc[10] = __builtin_amdgcn_s_memtime();
+  } else if (kind == 6) {
     sc[8] = t;
   } else if (kind == 7) {
     row[22] += 1;
