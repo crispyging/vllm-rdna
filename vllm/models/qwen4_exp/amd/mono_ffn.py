@@ -26,6 +26,7 @@ means are logged on eager steps. ``rdna_mono_ffn_modules`` keeps today's
 modules everywhere (the switch-off reference with the same marks).
 """
 
+import os
 import time
 
 import torch
@@ -54,6 +55,41 @@ _STAT_WORDS = (_STAT_ROWS + 1) * _STAT_COLS
 _STAT_TAIL = 16384 + 65536  # stats block + the latency-probe chain region (mark 9)
 _TICKS_PER_US = 100.0  # wall_clock64 runs at 100 MHz on V620
 _last_log = [0.0]
+
+
+_MONO_KEYS = ("rdna_mono_ffn", "rdna_mono_hc", "rdna_mono_gdn", "rdna_mono_qsa")
+HW_QUEUES_FOR_MONO = 4
+
+
+def set_worker_hw_queue_budget(vllm_config) -> None:
+    """Called in the engine-core process before the workers are spawned.
+
+    With a persistent kernel in the decode graph, the 2-HSA-queue cap the
+    launchers set (GPU_MAX_HW_QUEUES=2) makes CLR share HSA queues between
+    streams ("lowest load" at stream creation, so per process and per run);
+    whatever rides the second queue then overlaps the attention block's small
+    kernels instead of the FFN block, and under HSA_FORCE_FINE_GRAIN_PCIE=1
+    one to three TP4 ranks ran their attention-side kernels ~10 % slower per
+    layer while the others waited at the all-reduce (2026-10-15, 4x V620).
+    Four HW queues (one process per GPU, 8 HQDs) removed the skew. Raise the
+    budget for the workers when any rdna_mono_* switch is on; the
+    additional_config key ``rdna_mono_hw_queues`` overrides (0 = leave the
+    launcher's value alone)."""
+    extra = getattr(vllm_config, "additional_config", None) or {}
+    if not isinstance(extra, dict) or not any(bool(extra.get(k)) for k in _MONO_KEYS):
+        return
+    want = int(extra.get("rdna_mono_hw_queues", HW_QUEUES_FOR_MONO))
+    if want <= 0:
+        return
+    cur = os.environ.get("GPU_MAX_HW_QUEUES")
+    if cur is not None and cur.isdigit() and int(cur) >= want:
+        return
+    os.environ["GPU_MAX_HW_QUEUES"] = str(want)
+    logger.info(
+        "rdna_mono: GPU_MAX_HW_QUEUES %s -> %d for the workers (persistent "
+        "kernel in the decode graph; see mono_ffn.set_worker_hw_queue_budget)",
+        cur, want,
+    )
 
 
 def mono_ffn_requested(vllm_config) -> bool:

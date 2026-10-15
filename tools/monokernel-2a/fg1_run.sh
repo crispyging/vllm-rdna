@@ -14,7 +14,7 @@ LOCK=$HOME/w4a8_runs/port-v031/GPU69.lockdir
 mkdir -p "$RUN"
 log() { echo "[$(date +%T)] $*"; }
 
-until mkdir "$LOCK" 2>/dev/null; do sleep 30; done
+until mkdir "$LOCK" 2>/dev/null; do sleep "${LOCK_POLL:-3}"; done
 echo "fg1-skew: $TAG" > "$LOCK/owner"
 log "lock acquired ($TAG)"
 release() { rm -rf "$LOCK"; log "lock released"; }
@@ -27,10 +27,16 @@ for _ in $(seq 1 180); do
 done
 log "GPUs idle (VRAM% sum $busy)"
 
-SAMP=$RUN/sample-$TAG.csv
-setsid nohup bash "$HERE/fg1_sample.sh" "$SAMP" 1 > "$RUN/sample-$TAG.log" 2>&1 < /dev/null &
-SPID=$!
-echo "$SPID" > "$RUN/sample-$TAG.pid"
+# SAMPLE=1 opts into the sysfs sampler (off by default: two host power cuts
+# on 2026-10-15 coincided with it running during model load; unproven, but
+# the per-rank GPU timers are the primary evidence and do not need it).
+SPID=
+if [[ ${SAMPLE:-0} == 1 ]]; then
+    SAMP=$RUN/sample-$TAG.csv
+    setsid nohup bash "$HERE/fg1_sample.sh" "$SAMP" 5 > "$RUN/sample-$TAG.log" 2>&1 < /dev/null &
+    SPID=$!
+    echo "$SPID" > "$RUN/sample-$TAG.pid"
+fi
 
 export RUN GPUS=${GPUS:-6,7,8,9} PORT=${PORT:-18800} RECIPE=${RECIPE:-flashnext-mtp0}
 export CACHE=${CACHE:-$RUN/cache-$ARM}
@@ -39,6 +45,6 @@ export MONO_CFG=${MONO_CFG:-'"rdna_mono_ffn_max_rows":8'}
 log "serve ARM=$ARM FG=$FG RECIPE=$RECIPE CELLS=$CELLS MONO_CFG=$MONO_CFG extra=$*"
 ARM=$ARM TAG=$TAG bash "$HERE/serve_2a.sh" HSA_FORCE_FINE_GRAIN_PCIE="$FG" "$@"
 rc=$?
-kill -- -"$SPID" 2>/dev/null; kill "$SPID" 2>/dev/null
+[[ -n $SPID ]] && { kill -- -"$SPID" 2>/dev/null; kill "$SPID" 2>/dev/null; }
 log "serve done rc=$rc"
 grep -E "READY|bench-|PASS|FAIL" "$RUN/serve-$TAG/summary.txt" 2>/dev/null | grep -vE "^\s+(PASS|FAIL)  prompt" | cut -c1-220
