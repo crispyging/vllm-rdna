@@ -72,6 +72,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.policy import AcceptanceAwareKPolicy
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -302,6 +303,7 @@ class Scheduler(SchedulerInterface):
         # the draft count of every decode row this step. New decode rows are
         # padded (and stale rows clipped) to it so the step stays uniform.
         self._step_num_spec_tokens = self.num_spec_tokens
+        self._dynamic_sd_policy: AcceptanceAwareKPolicy | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -309,6 +311,12 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
+                if speculative_config.dynamic_sd_policy == "acceptance":
+                    self._dynamic_sd_policy = AcceptanceAwareKPolicy(
+                        speculative_config.num_speculative_tokens_per_batch_size,
+                        max_batch_size=self.scheduler_config.max_num_seqs,
+                        num_speculative_tokens=self.num_spec_tokens,
+                    )
             self.use_eagle = speculative_config.use_eagle()
             self.use_eagle_block_drop = speculative_config.use_eagle_block_drop()
             if self.use_eagle and not self.use_eagle_block_drop:
@@ -1670,9 +1678,14 @@ class Scheduler(SchedulerInterface):
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+            if self._dynamic_sd_policy is not None:
+                num_spec_tokens_to_schedule = self._dynamic_sd_policy.choose(
+                    len(num_scheduled_tokens)
+                )
+            else:
+                num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                    len(num_scheduled_tokens)
+                ]
             self._step_num_spec_tokens = num_spec_tokens_to_schedule
 
         scheduled_encoder_input_stats = None
@@ -2258,6 +2271,10 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+        if self._dynamic_sd_policy is not None:
+            self._dynamic_sd_policy.observe_step(
+                _uniform_decode_shape(scheduler_output)
+            )
 
         failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
@@ -2333,6 +2350,10 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                    if self._dynamic_sd_policy is not None:
+                        self._dynamic_sd_policy.observe_verify(
+                            num_draft_tokens, num_accepted
+                        )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -3623,3 +3644,17 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+
+def _uniform_decode_shape(scheduler_output: SchedulerOutput) -> tuple[int, int] | None:
+    """(num_reqs, K) of an all-decode step whose rows all verify K drafts; None
+    for an empty step, a step with prefill tokens or with mixed widths."""
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    if not num_scheduled or scheduler_output.scheduled_new_reqs:
+        return None
+    spec = scheduler_output.scheduled_spec_decode_tokens
+    k = len(spec.get(next(iter(num_scheduled)), ()))
+    for req_id, num_tokens in num_scheduled.items():
+        if len(spec.get(req_id, ())) != k or num_tokens != k + 1:
+            return None
+    return len(num_scheduled), k
