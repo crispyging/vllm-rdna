@@ -106,6 +106,38 @@ void mono_qsa_decode_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
                            torch::Tensor& out, torch::Tensor& scratch,
                            torch::Tensor& counters, int64_t splits);
 int64_t mono_qsa_decode_rdna2_splits(int64_t M, int64_t KVH, int64_t W);
+void mono_qsa_k_store_rdna2(
+    const torch::Tensor& pooled, const torch::Tensor& weight,
+    const torch::Tensor& cos_sin_cache, const torch::Tensor& positions,
+    double eps, double norm_beta, int64_t rotary_dim, int64_t mrope_h,
+    int64_t mrope_w, torch::Tensor& c_cache, const torch::Tensor& c_slots,
+    torch::Tensor& r_cache, const torch::Tensor& r_slots,
+    const torch::Tensor& r_rows, torch::Tensor& p_cache,
+    const torch::Tensor& p_rows);
+void mono_qsa_mqa_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
+                        const torch::Tensor& page_table,
+                        const torch::Tensor& token_to_req,
+                        const torch::Tensor& query_positions,
+                        const torch::Tensor& sequence_lengths,
+                        torch::Tensor& logits, torch::Tensor& visible_blocks,
+                        int64_t compress_ratio, double score_divisor,
+                        int64_t group, int64_t waves, int64_t tiles,
+                        int64_t lanes_per_key, int64_t unroll, bool q_lds);
+void mono_qsa_epilogue_rdna2(
+    const torch::Tensor& qk, torch::Tensor& q_out, const torch::Tensor& q_w,
+    const torch::Tensor& k_w, double q_eps, double k_eps, double norm_beta,
+    const torch::Tensor& cos_sin_cache, const torch::Tensor& positions,
+    int64_t rotary_dim, int64_t mrope_h, int64_t mrope_w,
+    const torch::Tensor& state_table, const torch::Tensor& token_to_req,
+    const torch::Tensor& query_start_loc, const torch::Tensor& end_positions,
+    int64_t compress_ratio, torch::Tensor& c_cache, const torch::Tensor& c_slots,
+    torch::Tensor& r_cache, const torch::Tensor& r_slots,
+    torch::Tensor& p_cache);
+void mono_qsa_store3_rdna2(torch::Tensor& c_cache, const torch::Tensor& c_slots,
+                           const torch::Tensor& c_rows, torch::Tensor& r_cache,
+                           const torch::Tensor& r_slots,
+                           const torch::Tensor& r_rows, torch::Tensor& p_cache,
+                           const torch::Tensor& p_rows);
 void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& inj, const torch::Tensor& norm_w,
                    const torch::Tensor& wd, const torch::Tensor& wu,

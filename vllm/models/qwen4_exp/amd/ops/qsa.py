@@ -697,6 +697,19 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
+    if MONO_QSA is not None and MONO_QSA.mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        score_divisor,
+        logits,
+        visible_blocks,
+    ):
+        return logits, visible_blocks
     block_n = _QSA_MQA_BLOCK_N
     _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {"num_stages": _QSA_MQA_STAGES}
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](

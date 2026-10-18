@@ -172,6 +172,9 @@ def install(vllm_config) -> Options | None:
         from .mono.rdna2 import qsa
         from .ops import qsa as qsa_ops
 
+        spec = getattr(vllm_config, "speculative_config", None)
+        width = 1 + (getattr(spec, "num_speculative_tokens", 0) or 0)
+        qsa.DECODE_WIDTH = width
         qsa_ops.MONO_QSA = qsa
     _log_parts(opts)
     return opts

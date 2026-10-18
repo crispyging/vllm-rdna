@@ -139,6 +139,17 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+_ACTIVE_LOGGED: set[str] = set()
+
+
+def _log_active(what: str) -> None:
+    """One line per process when a HIP QSA route first runs (the env gate is
+    read in the workers; this shows it reached them)."""
+    if what not in _ACTIVE_LOGGED:
+        _ACTIVE_LOGGED.add(what)
+        logger.info("QSA HIP path (VLLM_RDNA_QSA_HIP=1): %s active", what)
+
+
 def qsa_store_cache_rows_compat(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -158,6 +169,7 @@ def qsa_store_cache_rows_compat(
     page_size = cache.shape[1]
     width = cache.shape[3]
     ops.qsa_store_cache_rows_rdna2(rows, slot_mapping, cache, page_size, width)
+    _log_active("qsa_store_cache_rows_rdna2")
 
 
 def qsa_compress_groups_with_ratio_compat(
@@ -223,6 +235,7 @@ def qsa_compress_groups_with_ratio_compat(
         head_dim,
         bool(load_rope_positions),
     )
+    _log_active("qsa_compress_groups_rdna2")
     if _DEBUG:
         torch.accelerator.synchronize()
         changed = int((first_positions != pre_first).any(dim=1).sum())

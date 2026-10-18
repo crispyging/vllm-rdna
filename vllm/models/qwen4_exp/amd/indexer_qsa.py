@@ -197,6 +197,14 @@ class QSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project replicated Q/K, normalize+rotate Q, and preserve raw K."""
         qk, _ = self.index_qk_proj(hidden_states)
+        return self._qk_epilogue(qk, positions)
+
+    def _qk_epilogue(
+        self,
+        qk: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize+rotate Q from the projection; return it and the raw K."""
         q_raw, token_k = qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -295,6 +303,24 @@ class QSAIndexer(nn.Module):
             self.compress_ratio,
             rope_position_cache,
         )
+        if (
+            self._mono_qsa is not None
+            and rope_position_cache is not None
+            and self._mono_qsa.norm_rope_store3(
+                self.k_layernorm,
+                self.rotary_emb,
+                first_positions,
+                pooled,
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                raw_key_cache,
+                raw_metadata.slot_mapping,
+                token_k[:num_tokens],
+                rope_position_cache,
+                position_rows,
+            )
+        ):
+            return
         normalized = self.normalize_compressed_keys(pooled, first_positions)
         if (
             self._mono_qsa is not None
@@ -375,15 +401,31 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
-        q, token_k = self.project_qk(
-            hidden_states[:num_tokens], positions[..., :num_tokens]
-        )
-        self._update_and_compress(
-            token_k,
-            positions[..., :num_tokens],
-            raw_metadata,
-            compressed_metadata,
-        )
+        qk, _ = self.index_qk_proj(hidden_states[:num_tokens])
+        q = None
+        if self._mono_qsa is not None:
+            # q norm+RoPE, pooling, k norm+RoPE and the stores in one launch
+            q = self._mono_qsa.epilogue(
+                self.q_layernorm,
+                self.k_layernorm,
+                self.rotary_emb,
+                qk,
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+                self.compress_ratio,
+                self.compressed_key_cache.kv_cache,
+                self.raw_key_cache.key_cache,
+                self.raw_key_cache.rope_position_cache,
+            )
+        if q is None:
+            q, token_k = self._qk_epilogue(qk, positions[..., :num_tokens])
+            self._update_and_compress(
+                token_k,
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+            )
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
