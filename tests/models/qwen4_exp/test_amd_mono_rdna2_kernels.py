@@ -826,6 +826,139 @@ def test_qsa_mqa_matches_triton(group, shape, width, rows):
         )
 
 
+# mqa_dram_k (mode 2) shapes: (waves, slots per window, lanes per key, unroll):
+# auto slots, one slot (one run of every live tile per window), a few slots,
+# one slot per tile, 4 waves; every (lanes per key, unroll) the kernel builds
+_MQA_DRAM_SHAPES = [
+    (8, 0, 2, 1),
+    (8, 1, 1, 1),
+    (8, 3, 2, 2),
+    (8, 1 << 30, 4, 2),
+    (4, 5, 4, 4),
+]
+
+
+@pytest.mark.parametrize("group", [1, 2, 3, 4])
+@pytest.mark.parametrize("shape", _MQA_DRAM_SHAPES)
+@pytest.mark.parametrize("width", [1, 3])
+@pytest.mark.parametrize("rows", [1, 3, 8, 24, 130])
+@pytest.mark.parametrize("page", [64, 48])
+def test_qsa_mqa_dram_matches_triton(group, shape, width, rows, page):
+    """The DRAM-bound group kernel (mono_qsa_mqa_rdna2 mode 2) gives the
+    Triton kernel's visible_blocks and its logits on [0, visible) for any
+    group size against any batch layout (windows holding several requests,
+    ragged contexts, an unmapped page, a row with no request), power-of-two
+    and other pages, streamed or cached key loads."""
+    import math
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+    from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
+
+    if not mono_qsa._has_hip_mqa():
+        pytest.skip("mono_qsa_mqa_rdna2 not built")
+    seed = rows * 13 + width * 5 + group + page
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    ratio, cap = 4, 4000
+    reqs = (rows + width - 1) // width
+    ctx = torch.randint(1, cap * ratio, (reqs,), generator=g, device=DEV)
+    ctx[0] = cap * ratio  # one request at the column bound
+    live = (ctx // ratio + page - 1) // page
+    table = torch.full((reqs, -(-cap // page)), -1, dtype=torch.int32, device=DEV)
+    used = 1
+    for r in range(reqs):
+        n = int(live[r])
+        table[r, :n] = torch.randperm(n, generator=g, device=DEV).int() + used
+        used += n
+    table[0, 1] = -1  # an unmapped page
+    k_cache = torch.randn(used, page, 1, 128, generator=g, device=DEV).half()
+    q = torch.randn(rows, 4, 128, generator=g, device=DEV).half()
+    t2r = (torch.arange(rows, device=DEV) // width).int()
+    if rows > 2:
+        t2r[-1] = -1  # a row with no request
+    off = width - 1 - (torch.arange(rows, device=DEV) % width)
+    pos = (ctx[t2r.clamp(min=0).long()] - 1 - off).clamp(min=0)
+    seq = ctx.int()
+    waves, slots, lanes, unroll = shape
+    if seed % 2:
+        waves = -waves  # non-temporal key loads
+
+    old = qsa_ops.MONO_QSA
+    try:
+        qsa_ops.MONO_QSA = SimpleNamespace(mqa_paged=lambda *a: False)
+        ref_l, ref_v = qsa_ops.qsa_mqa_paged(
+            q, k_cache, table, t2r, pos, seq, ratio, num_columns=cap
+        )
+        mono_qsa.FORCE = (group, waves, slots, lanes, unroll, 2)
+        qsa_ops.MONO_QSA = mono_qsa
+        got_l, got_v = qsa_ops.qsa_mqa_paged(
+            q, k_cache, table, t2r, pos, seq, ratio, num_columns=cap
+        )
+    finally:
+        qsa_ops.MONO_QSA = old
+        mono_qsa.FORCE = None
+    torch.testing.assert_close(got_v, ref_v, rtol=0, atol=0)
+    scale = 1.0 / math.sqrt(128)
+    for r in range(rows):
+        n = int(ref_v[r])
+        torch.testing.assert_close(
+            got_l[r, :n], ref_l[r, :n], rtol=2e-3, atol=2e-3 * scale * 16
+        )
+
+
+def test_qsa_mqa_dram_page_refused():
+    """mqa_paged leaves a page size that splits a wave step's keys (40 keys,
+    16 per step at 2 lanes per key) to the Triton kernel instead of
+    launching mode 2."""
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+
+    if not mono_qsa._has_hip_mqa():
+        pytest.skip("mono_qsa_mqa_rdna2 not built")
+    q = torch.zeros(3, 4, 128, dtype=torch.float16, device=DEV)
+    k_cache = torch.zeros(2, 40, 1, 128, dtype=torch.float16, device=DEV)
+    table = torch.ones(1, 4, dtype=torch.int32, device=DEV)
+    t2r = torch.zeros(3, dtype=torch.int32, device=DEV)
+    pos = torch.full((3,), 100, dtype=torch.int64, device=DEV)
+    seq = torch.full((1,), 101, dtype=torch.int32, device=DEV)
+    logits = torch.empty(3, 160, dtype=torch.float32, device=DEV)
+    vis = torch.empty(3, dtype=torch.int32, device=DEV)
+    try:
+        mono_qsa.FORCE = (3, 8, 0, 2, 1, 2)
+        assert not mono_qsa.mqa_paged(
+            q, k_cache, table, t2r, pos, seq, 4, 11.3, logits, vis
+        )
+        mono_qsa.FORCE = (3, 8, 0, 4, 1, 2)  # 8 keys per step: covered
+        assert mono_qsa.mqa_paged(
+            q, k_cache, table, t2r, pos, seq, 4, 11.3, logits, vis
+        )
+    finally:
+        mono_qsa.FORCE = None
+
+
+def test_qsa_mqa_config_dram_group():
+    """mqa_config hands DRAM-bound MTP verify to DRAM_GROUP (group = the
+    decode width) once it is set, and keeps Triton (None) there otherwise;
+    the other regimes do not change."""
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+
+    old = (mono_qsa.DECODE_WIDTH, mono_qsa.DRAM_GROUP)
+    try:
+        mono_qsa.DECODE_WIDTH = 3
+        mono_qsa.DRAM_GROUP = None
+        dram = (24, 32768)  # 128k context, 8 requests of 3 rows
+        resident = (24, 4096)
+        assert mono_qsa.mqa_config(*dram) is None
+        cached = mono_qsa.mqa_config(*resident)
+        mono_qsa.DRAM_GROUP = (3, 8, 0, 2, 1, 2)
+        assert mono_qsa.mqa_config(*dram) == (3, 8, 0, 2, 1, 2)
+        assert mono_qsa.mqa_config(*resident) == cached
+        mono_qsa.DECODE_WIDTH = 2
+        assert mono_qsa.mqa_config(*dram) == (2, 8, 0, 2, 1, 2)
+        mono_qsa.DECODE_WIDTH = 1
+        assert mono_qsa.mqa_config(*dram) == (1, 8, 0, 16, 2)
+    finally:
+        mono_qsa.DECODE_WIDTH, mono_qsa.DRAM_GROUP = old
+
+
 @pytest.mark.parametrize("width", [1, 3])
 @pytest.mark.parametrize("n_req", [1, 5, 8])
 def test_qsa_epilogue_matches_today(default_vllm_config, width, n_req):

@@ -161,7 +161,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor token_to_req, Tensor query_positions, Tensor sequence_lengths, "
       "Tensor! logits, Tensor! visible_blocks, int compress_ratio, "
       "float score_divisor, int group, int waves, int tiles, "
-      "int lanes_per_key, int unroll, bool q_lds) -> ()");
+      "int lanes_per_key, int unroll, int mode) -> ()");
   rocm_ops.impl("mono_qsa_mqa_rdna2", torch::kCUDA, &mono_qsa_mqa_rdna2);
   rocm_ops.def(
       "mono_qsa_epilogue_rdna2(Tensor qk, Tensor! q_out, Tensor q_w, Tensor k_w, "

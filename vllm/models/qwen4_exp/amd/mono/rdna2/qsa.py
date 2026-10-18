@@ -34,9 +34,18 @@ DECODE_WIDTH = 1  # rows per request in a decode step (1 + speculative tokens)
 # (the QSA layers' keys of a step no longer fit the 128 MB Infinity Cache):
 # 32768 rows = 8 MB per layer.
 DRAM_KEYS = 32768
-# (group, waves, tile slots, lanes per key, unroll[, q in LDS]) forced for
-# every call; benches and tests set it, None = mqa_config's choice.
+# (group, waves, tile slots, lanes per key, unroll[, mode]) forced for every
+# call; benches and tests set it, None = mqa_config's choice. mode: 0 q in
+# registers, 1 q in LDS (mqa_k), 2 the DRAM-bound group kernel (mqa_dram_k:
+# one block per G-aligned window of rows, |tile slots| contiguous runs of
+# tiles per window, 0 = two blocks per CU).
 FORCE: tuple | None = None
+# The shape mqa_config gives DRAM-bound decode with speculative rows (MTP
+# verify past DRAM_KEYS keys per request), None = Triton there. Candidate:
+# (3, 8, 0, 2, 1, 2), mqa_dram_k with 2 lanes per key; set once
+# tools/rdna/mono/qsa_mqa_bench.py --bounded --cold shows it ahead of
+# Triton+E3 at 64k / 128k with 8-24 rows.
+DRAM_GROUP: tuple | None = None
 _COUNTERS: dict[int, torch.Tensor] = {}
 _LOGGED: set = set()
 
@@ -179,8 +188,9 @@ def mqa_config(rows: int, columns: int) -> tuple | None:
     * DRAM-bound decode, one row per request: 16 lanes per key (each load
       covers whole key rows), 8 waves, one tile per block (at the roofline,
       1.00-1.10x);
-    * DRAM-bound decode with speculative rows: Triton (its rows of a request
-      share K through L2; the group kernel loses 2-8 % there);
+    * DRAM-bound decode with speculative rows: ``DRAM_GROUP`` (the DRAM-bound
+      group kernel, mqa_dram_k), else Triton (its rows of a request share K
+      through L2; mqa_k's group shapes lose 2-8 % there);
     * prefill chunks (> 64 rows): groups of 3 adjacent rows from 64 rows at
       >= 16k context (each key row read once per group, 1.3-2.2x)."""
     if FORCE is not None:
@@ -193,6 +203,8 @@ def mqa_config(rows: int, columns: int) -> tuple | None:
         return small
     if width == 1:
         return (1, 8, 0, 16, 2)
+    if DRAM_GROUP is not None:
+        return (min(width, 4), *DRAM_GROUP[1:])
     return None
 
 
@@ -238,6 +250,9 @@ def mqa_paged(
     if cfg is None:
         return False
     group, waves, tiles, lanes, unroll, *rest = cfg
+    mode = int(rest[0]) if rest else 0
+    if mode == 2 and k_cache.shape[1] % (32 // lanes):
+        return False  # mqa_dram_k: a wave step's keys must share a page
     torch.ops._rocm_C.mono_qsa_mqa_rdna2(
         q,
         k_cache,
@@ -254,7 +269,7 @@ def mqa_paged(
         tiles,
         lanes,
         unroll,
-        bool(rest and rest[0]),
+        mode,
     )
     _log_once("indexer scoring (HIP)", q.shape[0], True)
     return True

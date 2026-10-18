@@ -122,7 +122,7 @@ void mono_qsa_mqa_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
                         torch::Tensor& logits, torch::Tensor& visible_blocks,
                         int64_t compress_ratio, double score_divisor,
                         int64_t group, int64_t waves, int64_t tiles,
-                        int64_t lanes_per_key, int64_t unroll, bool q_lds);
+                        int64_t lanes_per_key, int64_t unroll, int64_t mode);
 void mono_qsa_epilogue_rdna2(
     const torch::Tensor& qk, torch::Tensor& q_out, const torch::Tensor& q_w,
     const torch::Tensor& k_w, double q_eps, double k_eps, double norm_beta,

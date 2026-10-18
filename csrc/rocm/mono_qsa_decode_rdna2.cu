@@ -961,6 +961,211 @@ __global__ void __launch_bounds__(256) mqa_k(const Args a) {
   }
 }
 
+// The DRAM-bound group kernel (mode 2): MTP verify (G rows per request) at
+// long context with a cold Infinity Cache, where every key row comes from
+// DRAM. Triton's (rows, 128-key tiles) grid reads a request's keys once
+// through L2 for its 3 rows; mqa_k's group shapes read them once per block
+// but pay in VGPRs (q in registers), per-tile q reloads, 16-lane reductions,
+// non-leader blocks that only exit and a load bubble between tiles.
+// mqa_dram_k:
+//
+//  * grid (ceil(rows / G), slots): block x owns the G-aligned window of rows
+//    [xG, xG + G); runs of one request inside it are scored as one group (a
+//    single run when the decode width is G), so every block works;
+//  * the slots of a window split its live tiles into contiguous runs: long
+//    sequential DRAM streams, the group's q staged in LDS once per run;
+//  * LPK lanes per key (2 or 4: NL = 16 / LPK 16-byte loads per lane and key)
+//    and U keys per lane (1 or 2): every lane keeps 64-256 bytes of keys in
+//    flight per buffer, dot products stay in-lane (log2(LPK) DPP adds per
+//    head and key). One lane per key (no reduction at all) needs 128 VGPRs of
+//    key buffers plus q and spills;
+//  * two key buffers: tile t + 1 is in flight while tile t is scored. A wave
+//    step's 32 / LPK keys share a page (the host requires page_size to be a
+//    multiple of it), so the page lookup is one scalar load, which does not
+//    wait for the vector loads in flight (vmcnt retires in order).
+typedef const __attribute__((address_space(4))) int32_t* scalar_i32;
+
+// Occupancy floor for the register allocator: launch bounds alone let it
+// use 256 VGPRs (4 waves per SIMD) and it then clusters LDS q reads, where a
+// DRAM-bound kernel wants waves in flight: 6 waves (<= 168 VGPRs) with <= 128
+// bytes of keys per lane and buffer in the group shapes (8 makes the G = 3
+// shapes spill; G = 1 allocates below the floor on its own).
+template <int G, int LPK, int U, bool NT>
+__global__ void __launch_bounds__(256)
+    __attribute__((amdgpu_waves_per_eu(G > 1 && U * (16 / LPK) <= 8 ? 6 : 4)))
+    mqa_dram_k(const Args a) {
+  constexpr int NL = kHD / (8 * LPK);
+  constexpr int KPS = 32 / LPK;
+  constexpr int KPW = KPS * U;
+  static_assert(U * NL <= 16, "at most 256 bytes of keys per lane and buffer");
+  __shared__ uint4 s_q[G][kHeads][kHD / 8];
+  const int lane = threadIdx.x & 31;
+  const int wave = threadIdx.x >> 5;
+  const int sub = lane % LPK;
+  const int kc = lane / LPK;
+  const int block_n = (int)(blockDim.x / 32) * KPW;
+  const float neg_inf = __int_as_float(0xff800000);
+  const int w_end = min((int)blockIdx.x * G + G, a.rows);
+  for (int row0 = (int)blockIdx.x * G; row0 < w_end;) {
+    // one run of a request (block-uniform)
+    const int32_t req = a.t2r[row0];
+    int gn = 1;
+    while (row0 + gn < w_end && a.t2r[row0 + gn] == req) ++gn;
+    const bool req_ok = req >= 0 && req < a.requests;
+    // wave-uniform (scalar) table row for the scalar page lookups
+    const int sreq =
+        __builtin_amdgcn_readfirstlane(min(max((int)req, 0), a.requests - 1));
+    const int64_t seq = req_ok ? load_int(a.seq, sreq, a.seq_esz) : 0;
+    int64_t vis[G];
+    int64_t maxvis = 0;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      vis[g] = 0;
+      if (g < gn) {
+        const int64_t p = load_int(a.pos, row0 + g, a.pos_esz);
+        vis[g] = min((p + 1) / a.ratio, seq / a.ratio);
+        maxvis = max(maxvis, vis[g]);
+      }
+    }
+    if (blockIdx.y == 0 && threadIdx.x < (unsigned)gn) {
+#pragma unroll
+      for (int g = 0; g < G; ++g)
+        if (g == (int)threadIdx.x) a.vis_out[row0 + g] = (int32_t)vis[g];
+    }
+    // E3: only the live tiles, split into gridDim.y contiguous runs
+    const int64_t live_end = min(maxvis, (int64_t)a.columns);
+    const int live_tiles = (int)((live_end + block_n - 1) / block_n);
+    const int per = (live_tiles + (int)gridDim.y - 1) / (int)gridDim.y;
+    const int t_begin = (int)blockIdx.y * per;
+    const int t_end = min(live_tiles, t_begin + per);
+    if (t_begin < t_end) {
+      __syncthreads();  // the previous run's q reads are done
+      for (int i = threadIdx.x; i < G * kHeads * (kHD / 8); i += blockDim.x) {
+        const int g = i / (kHeads * (kHD / 8));
+        const int h = (i / (kHD / 8)) % kHeads;
+        const int c = i % (kHD / 8);
+        s_q[g][h][c] =
+            g < gn ? *reinterpret_cast<const uint4*>(
+                         a.q + (int64_t)(row0 + g) * a.q_row +
+                         (int64_t)h * a.q_head + c * 8)
+                   : make_uint4(0, 0, 0, 0);
+      }
+      __syncthreads();
+      const int32_t* trow = a.table + (int64_t)sreq * a.t_req;
+
+      // Tiles at or past t_end (the next tile of the run's last one) load
+      // masked: the loads are issued unconditionally, so the vmcnt state is
+      // the same on every path and scoring tile t waits for tile t only.
+      const auto load = [&](int t, uint4(&kv)[U][NL], bool(&ok)[U]) {
+        const int wcol0 = t * block_n + wave * KPW;
+        const bool in_run = t < t_end;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int col = wcol0 + u * KPS + kc;
+          // the step's KPS keys sit in one page: one scalar lookup (its wait
+          // is lgkmcnt, not the in-order vmcnt of the keys in flight);
+          // branch-free: out-of-range lookups read entry 0 and are masked
+          const int base = __builtin_amdgcn_readfirstlane(wcol0 + u * KPS);
+          const int lp = base / a.page_size;
+          const bool in =
+              in_run && req_ok && lp < a.table_width && base < live_end;
+          int32_t pp = ((scalar_i32)trow)[in ? (int64_t)lp * a.t_page : 0];
+          pp = in ? pp : -1;
+          const bool v = col < live_end && pp >= 0 && pp < a.pages;
+          ok[u] = v;
+          // a masked key loads key row 0 of page 0 (always mapped memory):
+          // its score is replaced by -inf at the store, so no zero fill and
+          // no branch around the loads
+          const half* kp =
+              a.k + sub * 8 +
+              (v ? (int64_t)pp * a.k_block +
+                       (int64_t)(col % a.page_size) * a.k_token
+                 : (int64_t)0);
+#pragma unroll
+          for (int j = 0; j < NL; ++j) {
+            if constexpr (NT) {  // keys are read once: stream them past L2
+              const k16 w = __builtin_nontemporal_load(
+                  reinterpret_cast<const k16*>(kp + 8 * LPK * j));
+              kv[u][j] = make_uint4(w.x, w.y, w.z, w.w);
+            } else {
+              kv[u][j] = *reinterpret_cast<const uint4*>(kp + 8 * LPK * j);
+            }
+          }
+        }
+      };
+
+      const auto score = [&](int t, const uint4(&kv)[U][NL],
+                             const bool(&ok)[U]) {
+        const int tile0 = t * block_n;
+        const int wcol0 = tile0 + wave * KPW;
+        float s[U][G];
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+          for (int g = 0; g < G; ++g) s[u][g] = 0.f;
+        // no branch on gn here (q rows past the run are zeros). The compiler
+        // barrier per (row, head) keeps q in LDS: without it the reads are
+        // hoisted out of the tile loop (and across heads) and q lands in
+        // spilled VGPRs, the cost LDS staging is meant to avoid (mqa_k's LDS
+        // variants compile to the same VGPRs as q in registers).
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+          for (int h = 0; h < kHeads; ++h) {
+            asm volatile("" ::: "memory");
+            float d[U][4];
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+#pragma unroll
+              for (int c = 0; c < 4; ++c) d[u][c] = 0.f;
+#pragma unroll
+            for (int j = 0; j < NL; ++j) {
+              const uint4 qq = s_q[g][h][LPK * j + sub];
+              const qsa_h2v* x = reinterpret_cast<const qsa_h2v*>(&qq);
+#pragma unroll
+              for (int u = 0; u < U; ++u) {
+                const qsa_h2v* y = reinterpret_cast<const qsa_h2v*>(&kv[u][j]);
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                  d[u][i] = __builtin_amdgcn_fdot2(x[i], y[i], d[u][i], false);
+              }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+              s[u][g] += fmaxf(
+                  key_sum<LPK>((d[u][0] + d[u][1]) + (d[u][2] + d[u][3])), 0.f);
+          }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int col = wcol0 + u * KPS + kc;
+          if (col >= a.columns) continue;
+#pragma unroll
+          for (int g = 0; g < G; ++g) {
+            // lane sub stores rows g = sub (mod LPK); a tile at or past this
+            // row's live context is not stored (E3)
+            if (g % LPK != sub || g >= gn || tile0 >= vis[g]) continue;
+            const bool valid = ok[u] && col < vis[g];
+            a.logits[(int64_t)(row0 + g) * a.l_row + col] =
+                valid ? s[u][g] * a.inv_div : neg_inf;
+          }
+        }
+      };
+
+      uint4 ka[U][NL], kb[U][NL];
+      bool oa[U], ob[U];
+      load(t_begin, ka, oa);
+      for (int t = t_begin; t < t_end; t += 2) {
+        load(t + 1, kb, ob);
+        score(t, ka, oa);
+        if (t + 1 >= t_end) break;
+        load(t + 2, ka, oa);
+        score(t + 1, kb, ob);
+      }
+    }
+    row0 += gn;
+  }
+}
+
 }  // namespace qsa_mqa
 
 void mono_qsa_mqa_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
@@ -971,7 +1176,7 @@ void mono_qsa_mqa_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
                         torch::Tensor& logits, torch::Tensor& visible_blocks,
                         int64_t compress_ratio, double score_divisor,
                         int64_t group, int64_t waves_arg, int64_t tiles,
-                        int64_t lanes_per_key, int64_t unroll, bool q_lds) {
+                        int64_t lanes_per_key, int64_t unroll, int64_t mode) {
   using namespace qsa_mqa;
   TORCH_CHECK(q.dim() == 3 && q.size(1) == kHeads && q.size(2) == kHD &&
                   q.scalar_type() == torch::kHalf && q.stride(2) == 1 &&
@@ -1032,6 +1237,52 @@ void mono_qsa_mqa_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
   a.page_size = (int)k_cache.size(1);
   a.ratio = (int)compress_ratio;
   a.inv_div = (float)(1.0 / score_divisor);
+  TORCH_CHECK(mode >= 0 && mode <= 2, "mono_qsa_mqa_rdna2: mode in {0, 1, 2}");
+  a.stream_k = stream_k ? 1 : 0;
+  const dim3 block((unsigned)(waves * 32));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  bool done = false;
+  if (mode == 2) {
+    TORCH_CHECK((lanes_per_key == 2 || lanes_per_key == 4) &&
+                    (unroll == 1 || unroll == 2),
+                "mono_qsa_mqa_rdna2: mode 2 takes lanes_per_key in {2, 4}, "
+                "unroll in {1, 2}");
+    TORCH_CHECK(a.page_size % (32 / lanes_per_key) == 0,
+                "mono_qsa_mqa_rdna2: mode 2 needs page_size % (32 / "
+                "lanes_per_key) == 0");
+    const int block_n = (int)(waves * (32 / lanes_per_key) * unroll);
+    const int all_tiles = (columns + block_n - 1) / block_n;
+    const int windows = (rows + (int)group - 1) / (int)group;
+    // slots per window: |tiles|, 0 = two blocks per CU over the windows
+    int ny;
+    if (tiles != 0) {
+      ny = (int)std::min<int64_t>(std::abs(tiles), all_tiles);
+    } else {
+      const int cus = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+      ny = std::min(all_tiles, std::max(1, (2 * cus + windows - 1) / windows));
+    }
+    const dim3 grid((unsigned)windows, (unsigned)std::max(ny, 1));
+    const auto go = [&](auto kernel) {
+      hipLaunchKernelGGL(kernel, grid, block, 0, stream, a);
+      done = true;
+    };
+#define MQA_D(G_, L_, U_)                                              \
+  if (!done && group == G_ && lanes_per_key == L_ && unroll == U_) {    \
+    if (stream_k)                                                       \
+      go(mqa_dram_k<G_, L_, U_, true>);                                 \
+    else                                                                \
+      go(mqa_dram_k<G_, L_, U_, false>);                                \
+  }
+#define MQA_DG(G_) \
+  MQA_D(G_, 2, 1) MQA_D(G_, 2, 2) MQA_D(G_, 4, 1) MQA_D(G_, 4, 2)
+    MQA_DG(1) MQA_DG(2) MQA_DG(3) MQA_DG(4)
+#undef MQA_DG
+#undef MQA_D
+    TORCH_CHECK(done, "mono_qsa_mqa_rdna2: no kernel for this configuration");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  const bool q_lds = mode == 1;
   TORCH_CHECK((lanes_per_key == 2 || lanes_per_key == 4 || lanes_per_key == 8 ||
                lanes_per_key == 16) &&
                   (unroll == 1 || unroll == 2 || unroll == 4 || unroll == 8) &&
@@ -1044,11 +1295,7 @@ void mono_qsa_mqa_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
   int ny = (columns + block_n - 1) / block_n;
   if (tiles != 0) ny = std::min<int>(ny, (int)std::abs(tiles));
   a.chunked = tiles < 0 ? 1 : 0;
-  a.stream_k = stream_k ? 1 : 0;
   const dim3 grid((unsigned)rows, (unsigned)ny);
-  const dim3 block((unsigned)(waves * 32));
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  bool done = false;
   const auto go = [&](auto kernel) {
     hipLaunchKernelGGL(kernel, grid, block, 0, stream, a);
     done = true;

@@ -160,22 +160,24 @@ def main():
     if has99:
         variants["HIP99+E3"] = "hip99"
     for v in filter(None, a.variants.split(",")):
-        # g<G>w<W>[l<lanes per key>][u<unroll>][t<tile slots>]: t0 = one slot
-        # per tile (no stride); defaults l8 u4 t auto
-        f = dict(re.findall(r"([gwlutc])(\d+)", v))
+        # g<G>w<W>[l<lanes per key>][u<unroll>][t<tile slots>][m<mode>]: t0 =
+        # one slot per tile (no stride); defaults l8 u4 t auto; m2 = the
+        # DRAM-bound group kernel (t/c = slots per window, none = auto)
+        f = dict(re.findall(r"([gwlutcm])(\d+)", v))
         t = f.get("t") or f.get("c")  # c<N>: N contiguous-run slots
         tiles = (1 << 30 if t == "0" else int(t)) if t else 0
         if "c" in f:
             tiles = -tiles
         waves = -int(f["w"]) if v.endswith("n") else int(f["w"])  # n: streamed K
-        q_lds = "q" in v  # q: the group's q rows in LDS
+        # q: the group's q rows in LDS (mode 1)
+        mode = int(f["m"]) if "m" in f else int("q" in v)
         variants[f"HIP {v}"] = (
             int(f["g"]),
             waves,
             tiles,
             int(f.get("l", 8)),
             int(f.get("u", 4)),
-            q_lds,
+            mode,
         )
     print(
         f"{'layout':>6} {'ctx':>6} {'rows':>4} "
