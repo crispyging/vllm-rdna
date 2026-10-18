@@ -86,6 +86,13 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # Dynamic SD: a running decode row scheduled with K=0 drafts is still a
+        # spec row (K in [0, K_max]), so it reads the state the previous verify
+        # accepted (num_accepted - 1) instead of the base snapshot.
+        spec_config = vllm_config.speculative_config
+        self._zero_draft_spec_rows = bool(
+            spec_config and spec_config.uses_dynamic_speculative_decoding()
+        )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
         # kernel reusing the postprocess copy machinery, so the per-step src
@@ -103,9 +110,6 @@ class MambaHybridModelState(DefaultModelState):
             )
             self._mamba_src_off_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
-            )
-            self._mamba_collapse_acceptance_gpu = torch.zeros(
-                self.max_num_reqs, dtype=torch.bool, device=self.device
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
@@ -216,8 +220,8 @@ class MambaHybridModelState(DefaultModelState):
         ctx.bind_block_tables([block_tables[gid] for gid in mamba_group_ids])
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
-        # request unless a block boundary or multi-accept -> K=0 transition
-        # needs a copy. (Skipping the launch entirely
+        # request when src_col < 0 or src_col == dst_col, so no copy happens on
+        # steps that don't cross a block boundary. (Skipping the launch entirely
         # would need a V1-style async-D2H of the actual num_computed, since
         # num_computed_tokens_np is an optimistic mirror under async scheduling;
         # the launch cost is ~0.3% of TPOT, so the GPU fast-exit suffices.)
@@ -234,7 +238,6 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs,
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
-            collapse_acceptance_ptr=self._mamba_collapse_acceptance_gpu,
         )
         ctx.run_fused_precopy(
             num_reqs,
@@ -242,7 +245,6 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu,
             input_batch.idx_mapping,
-            collapse_acceptance_gpu=self._mamba_collapse_acceptance_gpu,
         )
 
     def prepare_attn(
@@ -300,11 +302,17 @@ class MambaHybridModelState(DefaultModelState):
             # need the -1 sentinel rather than a raw zero draft count.
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
-            if num_draft_tokens_per_req is not None:
-                # Test request state, not num_scheduled_tokens == draft_count+1:
-                # adaptive rewrites num_scheduled_tokens to an even split, so that
-                # equality rarely holds and would demote every verify row to decode.
-                is_decode = ~is_prefilling_np & (input_batch.num_scheduled_tokens > 0)
+            # Test request state, not num_scheduled_tokens == draft_count+1:
+            # adaptive rewrites num_scheduled_tokens to an even split, so that
+            # equality rarely holds and would demote every verify row to decode.
+            is_decode = ~is_prefilling_np & (input_batch.num_scheduled_tokens > 0)
+            if self._zero_draft_spec_rows:
+                num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
+                    is_decode,
+                    0 if num_draft_tokens_per_req is None else num_draft_tokens_per_req,
+                    -1,
+                )
+            elif num_draft_tokens_per_req is not None:
                 spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
                     spec_decode_mask, num_draft_tokens_per_req, -1
