@@ -400,11 +400,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-            if num_spec_decodes == 0 or (
-                not self.zero_draft_spec_rows
-                and num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+            if (
+                num_spec_decodes == 0
+                or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
                 == 0
-            ):
+            ) and not (self.zero_draft_spec_rows and num_spec_decodes > 0):
+                # Dynamic SD keeps an all-K=0 batch on the spec path (above).
                 num_spec_decodes = 0
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
