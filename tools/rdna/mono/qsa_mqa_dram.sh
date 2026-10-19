@@ -12,12 +12,15 @@ WHAT=${1:-all}
 VENV=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}
 LOCKDIR=${LOCKDIR:-$HOME/w4a8_runs/port-v031/GPU69.lockdir}
 mkdir -p "$OUT"
+# The lock dir is permanent; its owner file holds the current user's tag
+# (empty = free). Never remove the dir.
 HELD=0
-unlock() { [[ $HELD == 1 ]] && rm -rf "$LOCKDIR"; HELD=0; return 0; }
+unlock() { [[ $HELD == 1 ]] && : > "$LOCKDIR/owner"; HELD=0; return 0; }
 trap unlock EXIT
-until mkdir "$LOCKDIR" 2>/dev/null; do sleep 30; done
+mkdir -p "$LOCKDIR"
+until [[ ! -s $LOCKDIR/owner ]]; do sleep 30; done
 HELD=1
-echo "qsa-mqa-dram: $WHAT" > "$LOCKDIR/owner"
+echo "qsa-mqa-dram: $WHAT $(date +%F_%T)" > "$LOCKDIR/owner"
 for _ in $(seq 1 120); do  # rocm-smi GPU[0-3] are HIP 6-9
     busy=$(rocm-smi -d 0 1 2 3 --showmemuse 2>/dev/null | awk '/VRAM%/{s+=$NF} END{print s+0}')
     [[ $busy -eq 0 ]] && break
@@ -44,7 +47,7 @@ B=tools/rdna/mono/qsa_mqa_bench.py
 # per window, streamed keys) next to today's best group shapes (q in
 # registers, q in LDS) and the G=1 DRAM shape
 MTP=g3w8l2u1m2,g3w8l2u2m2,g3w8l4u2m2,g3w8l4u1m2,g3w4l2u1m2
-MTP+=,g3w8l2u1c9m2,g3w8l2u1c36m2,g3w8l2u1c72m2,g3w8l2u1m2n,g3w8l1u1m2n
+MTP+=,g3w8l2u1c9m2,g3w8l2u1c36m2,g3w8l2u1c72m2,g3w8l2u1m2n
 MTP+=,g3w8l16u2t0,g3w8l8u1q,g1w8l16u2t0
 OWN=g1w8l2u1m2,g1w8l4u1m2,g1w8l2u1m2n,g1w8l16u2t0,g1w4l4u1t8
 for temp in warm cold; do
