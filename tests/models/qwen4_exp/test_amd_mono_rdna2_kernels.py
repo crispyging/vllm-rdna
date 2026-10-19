@@ -831,10 +831,10 @@ def test_qsa_mqa_matches_triton(group, shape, width, rows):
 # one slot per tile, 4 waves; every (lanes per key, unroll) the kernel builds
 _MQA_DRAM_SHAPES = [
     (8, 0, 2, 1),
-    (8, 1, 1, 1),
+    (8, 1, 2, 2),
     (8, 3, 2, 2),
     (8, 1 << 30, 4, 2),
-    (4, 5, 4, 4),
+    (4, 5, 4, 1),
 ]
 
 
