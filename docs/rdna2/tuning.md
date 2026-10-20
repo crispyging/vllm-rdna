@@ -92,6 +92,23 @@ temperature 0, HIP 6–9) measured:
 | FA-RDNA2, two-head BF16 tile | 170.41 tok/s | 36.42 tok/s |
 | FA-RDNA2, four-head BF16 tile (recipe) | 178.19 tok/s | 33.31 tok/s |
 
+The c=8 benchmark summaries also report per-request and aggregate rates,
+mean time to first token (TTFT), and median/mean inter-token latency (ITL):
+
+| Draft attention | Input → output | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Triton | 1,024 → 256 | 945.1 (2164.0) | 26.79 (182.94) | 1.08 s | 64.7 / 89.2 ms |
+| FA-RDNA2 four-head (recipe) | 1,024 → 256 | 864.0 (2131.6) | 25.80 (178.19) | 1.19 s | 68.7 / 92.9 ms |
+| Triton | 16,384 → 512 | 591.3 (1449.3) | 5.05 (31.24) | 27.71 s | 552.8 / 423.6 ms |
+| FA-RDNA2 four-head (recipe) | 16,384 → 512 | 512.2 (1313.7) | 5.72 (33.31) | 31.99 s | 554.8 / 418.6 ms |
+
+Each cell completed 32 requests. Per-request prefill is mean input tokens
+divided by mean TTFT; aggregate prefill estimates one eight-request wave from
+its p99 TTFT. Per-request decode is the inverse of mean time per output token;
+aggregate decode is measured output throughput over the full run. The two
+prefill figures are estimates based on end-to-end latency, not isolated GPU
+prefill timings.
+
 The four-head tile narrows the short-context gap while remaining ahead of
 Triton in this long-context run. Its speculative acceptance rates were 46.85%
 and 46.65%, respectively; all 64 benchmark requests completed without failure.
