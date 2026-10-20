@@ -112,7 +112,7 @@ if ((${#rdse_keys[@]})); then
     for _key in "${rdse_keys[@]}"; do
         case $_key in
             VLLM_* | NCCL_* | RCCL_* | HSA_* | TORCH_* | PYTORCH_* | OMP_* | PYTHON* | \
-                TOKENIZERS_* | FLASH_* | HIP_* | ROCM_* | GPU_* | TRITON_* | HF_* | TRANSFORMERS_*)
+                TOKENIZERS_* | FLASH_* | HIP_* | ROCM_* | RDNA_* | GPU_* | TRITON_* | HF_* | TRANSFORMERS_*)
                 if [[ -v $_key ]]; then export "${_key?}"; fi
                 ;;
         esac
@@ -294,6 +294,9 @@ case $ATTN in
 esac
 
 rdna_mtp_args "${MTP:-0}"
+if [[ -n ${SPEC_CONFIG:-} ]]; then
+    spec_args=(--speculative-config "$SPEC_CONFIG")
+fi
 
 if [[ $EAGER == 1 ]]; then
     comp_config=""
@@ -386,6 +389,7 @@ RDSE_ENV_KEYS=(
     VLLM_USE_RDNA2_FA VLLM_FA_RDNA2_GQA_DECODE VLLM_FA_RDNA2_GQA_MODE
     FLASH_ATTENTION_TRITON_AMD_ENABLE
     VLLM_USE_V2_MODEL_RUNNER VLLM_USE_AOT_COMPILE VLLM_DISABLE_COMPILE_CACHE
+    RDNA_DFLASH2_DRAFT_BF16
     VLLM_USE_BREAKABLE_CUDAGRAPH VLLM_RDNA_FUSED_HC VLLM_RDNA_HC_PREFILL_FUSED
     VLLM_GDN_HIP_PREFILL VLLM_RDNA_FUSED_SE
     VLLM_RDNA_DENSE_INT8 VLLM_RDNA_DENSE_INT8_ONLY VLLM_RDNA_DENSE_GEMV

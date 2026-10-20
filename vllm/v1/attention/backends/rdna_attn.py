@@ -634,7 +634,10 @@ class RdnaAttentionBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC)
+        # The HIP kernels and stride-aware cache writer support a padded block
+        # stride. BLHNC lets hybrid models pack QSA side-caches beside each
+        # attention page without changing the per-layer [B, H, N, C] view.
+        return (KVCacheLayout.LHBNC, KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
 
 
 if is_available():

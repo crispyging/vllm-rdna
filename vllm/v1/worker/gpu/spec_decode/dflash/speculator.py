@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 import torch
@@ -10,6 +11,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -50,6 +52,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             ),
         )
         super().__init__(vllm_config, device)
+
+        # BF16-trained DFlash2 residuals can overflow FP16 even when the
+        # target itself must run in FP16 on RDNA2. Keep only the draft in BF16.
+        if (
+            current_platform.is_rocm()
+            and os.environ.get("RDNA_DFLASH2_DRAFT_BF16") == "1"
+            and "DFlash2DraftModel" in self.draft_model_config.architectures
+        ):
+            self.draft_model_config.dtype = torch.bfloat16
+            self.dtype = torch.bfloat16
+            logger.info("Running the DFlash2 draft in BF16 with an FP16 target")
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -117,8 +130,11 @@ class DFlashSpeculator(DraftModelSpeculator):
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
         config = copy.copy(super().attn_vllm_config)
+        if self.draft_model_config.dtype != config.model_config.dtype:
+            config.model_config = self.draft_model_config
         config.attention_config = replace(
             self.vllm_config.attention_config,
+            backend=self.speculative_config.attention_backend,
             use_non_causal=self.requires_non_causal,
         )
         return config

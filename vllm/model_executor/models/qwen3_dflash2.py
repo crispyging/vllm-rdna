@@ -389,7 +389,10 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().embed_input_ids(input_ids) * self.input_embedding_scale
+        return (
+            super().embed_input_ids(input_ids).to(self.norm.weight.dtype)
+            * self.input_embedding_scale
+        )
 
 
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
@@ -408,8 +411,13 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        head_dtype = self.lm_head.weight.dtype
+        if head_dtype.is_floating_point:
+            hidden_states = hidden_states.to(head_dtype)
         return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
+            self.lm_head,
+            hidden_states,
+            self.model.candidate_selector.top_k,
         )
 
 

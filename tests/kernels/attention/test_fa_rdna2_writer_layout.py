@@ -56,7 +56,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (  # noqa: E402
 )
 
 
-def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False):
+def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False, writer="auto"):
     """Allocate the production [2, nb, H_kv, D, bs] cache and fill it via
     the real writer. Returns (key_cache5d, value_cache5d, block_table,
     per_seq_kv) where per_seq_kv[s] = (K[sl, H_kv, D], V[sl, H_kv, D])
@@ -66,11 +66,16 @@ def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False):
     layout="interleaved": [nb, 2, ...] contiguous permuted to [2, nb, ...]
         (hybrid/mamba-aligned allocation, block stride 2x dense) — the
         Qwen3.8 hybrid server layout.
+    layout="block_major": [nb, 3 layers, 2 K/V slots, ...] with a per-layer
+        view. The block stride spans all three layers, as in BLHNC QSA packing.
     """
     total = sum(seq_lens)
     blocks_per_seq = [(sl + bs - 1) // bs for sl in seq_lens]
     nb = sum(blocks_per_seq) + 2  # 2 spare blocks, never referenced
-    if layout == "interleaved":
+    if layout == "block_major":
+        buf = torch.zeros(nb, 3, 2, H_kv, D, bs, dtype=torch.float16, device="cuda")
+        kv_cache = buf[:, 1].permute(1, 0, 2, 3, 4)
+    elif layout == "interleaved":
         buf = torch.zeros(nb, 2, H_kv, D, bs, dtype=torch.float16, device="cuda")
         kv_cache = buf.permute(1, 0, 2, 3, 4)
     else:
@@ -101,7 +106,11 @@ def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False):
 
     ones = torch.ones(1, dtype=torch.float32, device="cuda")
     # Mirror the production writer selection (rdna_attn.do_kv_cache_update).
-    if bs in (16, 32) and has_native_kv_cache_layout(key_cache, value_cache):
+    if writer == "hip":
+        torch.ops._rocm_C.reshape_and_cache_flash_rdna2(
+            K, V, key_cache, value_cache, slot_mapping
+        )
+    elif bs in (16, 32) and has_native_kv_cache_layout(key_cache, value_cache):
         ops.reshape_and_cache(
             K, V, key_cache, value_cache, slot_mapping, "auto", ones, ones
         )
@@ -114,6 +123,30 @@ def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False):
     if raw:
         return kv_cache, key_cache, value_cache5, block_table.cuda(), per_seq_kv
     return key_cache, value_cache5, block_table.cuda(), per_seq_kv
+
+
+@pytest.mark.parametrize("D", [128, 256])
+def test_block_major_hip_writer_prefill_and_decode(D):
+    """FA-RDNA2 must read HIP-written pages with a padded BLHNC block stride."""
+    sl, bs, H_q, H_kv = 1100, 1024, 8, 2
+    kc, vc, bt, per_seq_kv = _fill_cache(
+        [sl], H_kv, D, bs, seed=D, layout="block_major", writer="hip"
+    )
+    assert kc.stride(0) > kc[0].numel()
+    torch.manual_seed(D)
+    q_prefill = torch.randn(sl, H_q, D, dtype=torch.float16, device="cuda")
+    cu = torch.tensor([0, sl], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([sl], dtype=torch.int32, device="cuda")
+    out_prefill = fa.fa_rdna2_prefill_paged_varlen(
+        q_prefill, kc, vc, bt, cu, seq_lens, bs, 1, 0
+    )
+    ref_prefill = _ref_attention(q_prefill, per_seq_kv, [0, sl], H_kv, causal=True)
+    torch.testing.assert_close(out_prefill, ref_prefill, rtol=2e-2, atol=2e-2)
+
+    q_decode = q_prefill[-1:]
+    out_decode = fa.fa_rdna2_decode_paged(q_decode, kc, vc, bt, seq_lens, bs, 8, 0)
+    ref_decode = _ref_attention(q_decode, per_seq_kv, [0, 1], H_kv, causal=False)
+    torch.testing.assert_close(out_decode, ref_decode, rtol=2e-2, atol=2e-2)
 
 
 def _ref_attention(Q, per_seq_kv, cu_q, H_kv, causal, sliding_window=0, scale=None):

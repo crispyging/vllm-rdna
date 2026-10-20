@@ -40,7 +40,8 @@ actually sets.
 
 | Knob | Values | Effect |
 | --- | --- | --- |
-| `MTP` | 0, 2 | Speculative tokens. Capture ladder becomes `(MTP+1)×{1,2,4,8}`. Keep powers of two (`CG_SIZES` overrides); 9/15/18/21 GPU-fault the 16k cell. |
+| `MTP` | 0, 2, 3 | Speculative tokens. Capture ladder becomes `(MTP+1)×{1,2,4,8}`. Keep powers of two (`CG_SIZES` overrides); 9/15/18/21 GPU-fault the 16k cell. |
+| `SPEC_CONFIG` | JSON | Replace the MTP speculative config while retaining its capture ladder. `flashnext-dflash2` sets `MTP=3` for four verification rows and supplies the DFlash2 config here. |
 | `ATTN` | fa, triton, none | FA-RDNA2 (`RDNA_ATTN` + GQA decode) / Triton AMD FA / leave to vLLM. |
 | `CG_MODE`, `COMPILE_MODE`, `CG_EXTRA`, `EAGER` | | Cudagraph mode, compile mode, extra compilation JSON, eager fallback. |
 | `PLE` | bf16, int4, int4-disk | Flash-Next PLE table, see [PLE modes](#ple-table-flash-next). Needs `PLE_QUANT_DIR` for int4*. |
@@ -56,6 +57,40 @@ actually sets.
 | `HIP_VISIBLE_DEVICES` / `GPUIDS` | | GPUs. Keep a TP group on one PCIe switch. |
 
 ## Modes by subsystem
+
+### Flash-Next with DFlash2
+
+`flashnext-dflash2` serves the Flash-Next AWQ-W4A16 **target** with
+`incoai/Qwen3.8-Flash-Next-DFlash2` as an external draft model. The draft is
+not a standalone language model. The recipe uses three draft tokens, the V2
+runner, TP4/EP4, text-only inputs, and `--monokernel`. Flash-Next's QSA
+attention uses the native HIP sparse decode and indexer paths under MonoKernel;
+the non-causal DFlash2 draft uses Triton attention. The target also uses HIP
+GDN prefill and RDNA2 W4A16 MoE. FA-RDNA2 now accepts block-major `BLHNC`
+pages through its stride-aware HIP kernels and cache writer, but this
+checkpoint's attention layers all use QSA and do not call FA-RDNA2.
+The target remains FP16 on RDNA2; the draft stays BF16 because its residuals
+overflow in FP16 and produce NaN candidates. BF16 draft normalization uses
+PyTorch's RMSNorm since the RDNA AOT RMSNorm kernel accepts FP16 only.
+On 4× V620 with the AWQ target, the 2026-10-20 graph validation passed but
+DFlash2 did not beat the existing native MTP2 recipe in the measured cells.
+Use `flashnext-mtp2` when throughput is the priority on this checkpoint.
+
+Download the draft into the Hugging Face cache before serving (the launcher
+defaults to offline mode), then launch with the target checkpoint as `MODEL`:
+
+```bash
+hf download incoai/Qwen3.8-Flash-Next-DFlash2
+MODEL=/path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
+VENV=/path/to/rocm-venv HIP_VISIBLE_DEVICES=6,7,8,9 \
+  bash tools/rdna/serve_rdna.sh RECIPE=flashnext-dflash2
+```
+
+For a draft stored outside the default cache, override `SPEC_CONFIG` with a
+JSON object whose `model` is its directory. Set `EXTRA_ARGS=` to compare without
+MonoKernel and use `flashnext-mtp2` for a native MTP baseline. The checkpoint's
+five target layer IDs select the completed zero-based layer outputs, averaged
+over the HyperConnection streams to the model's native hidden width.
 
 ### Dynamic MTP graph capture
 
