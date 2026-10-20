@@ -12,14 +12,15 @@ one visible folder per rocBLAS build, selected at launch.
 
 | Profile | rocBLAS | ROCm / torch | `librocblas.so.5` sha256[:12] | rows / rank | Status |
 |---|---|---|---:|---:|---|
-| `rocm7.14-rocblas5.5/` | `5.5.0.cd957402` | `7.14.60850` / `2.12.0+rocm7.14.0` | `f30bb442e9b5` | **1824** | canonical (`venv-7.14.0_0.28.0` and `_0.31.0`) |
+| `rocm7.14-rocblas5.5/` | `5.5.0.cd957402` | `7.14.60850` / `2.12.0+rocm7.14.0` | `f30bb442e9b5` | **1860** | canonical (`venv-7.14.0_0.28.0` and `_0.31.0`) |
 | `rocm10-rocblas5.6/` | `5.6.0.8d1ae90e` | `7.15.26333` / `2.13.0+rocm10.0.0` | `d05939967b5f` | **139** | **qualified for build `d05939967b5f`** (55 prefill + 84 decode/MTP) |
 
 The canonical profile covers these serving families:
 
 * **Flash-Next** — `Qwen3.8-Flash-Next-AWQ-W4A16`, MTP=0 and MTP=2 (includes the
   M ≤ 8 decode shapes and the M = 16/24/32 MTP-verify shapes).
-* **Flash-Next DFlash2** — 58 BF16 regular draft GEMMs captured on HIP 6–9;
+* **Flash-Next DFlash2** — 94 BF16 regular draft GEMMs, including 36 two-token
+  graph shapes tuned independently on HIP 6–9;
   the target remains FP16. Strided-batched BF16 shapes retain rocBLAS defaults.
 * **27B AWQ dense** — the dense projection shapes at the aligned prefill grid.
 * **EXL3 27B** — `Qwen3.8-27B-exl3-3.00bpw` (K = 5120/1536/4352; 0 collisions

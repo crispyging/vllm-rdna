@@ -28,6 +28,26 @@ c=8 runs gave 153.92 and 168.96 tok/s; two tuned c=8 runs gave 229.95 and
 223.81. At 16k/1k c=8, untuned runs ranged 37.98–49.23 and tuned runs
 39.54–46.38 tok/s. This range does not establish a long-context gain.
 
+## DFlash2 two-token graph expansion (2026-10-20)
+
+Added 36 missing BF16 TN keys per rank to this existing profile, bringing it
+to **1860 rows/rank: 1766 FP16 + 94 BF16**. All previous rows and validators
+are preserved byte-for-byte. Each rank uses its own newly tuned solvers;
+the original rows remain shared. The separate ROCm 10 profile is unchanged.
+
+The query widths are M=3/6/12/24 and vocab-head/selector widths M=2/4/8/16.
+Across all four V620s, the 144 isolated measurements beat both canonical
+lookup and the heuristic by more than 3% (minimum 2.354x, median 3.417x,
+maximum 5.347x). Each GPU passed numerical checks and 36/36 lookup hits.
+See the [shape inputs, measurements and reproduction commands](../../../bench_results/2026-10-20_dflash2-spec2-tunableop/README.md).
+
+**End-to-end serving qualification is incomplete.** Three canonical cells
+completed before SSH became unreachable during the last canonical 16k c=8
+cell. Remaining canonical and tuned-arm outcomes are unverified; no serving
+speedup is claimed. Variable auxiliary-FC/mixed-prefill context widths and
+strided-batched BF16 GEMMs are outside this tuning set. The recipe keeps its
+existing draft-depth default.
+
 ## What changed vs the harvested 903-row set
 
 | | rows | file |

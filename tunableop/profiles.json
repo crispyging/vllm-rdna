@@ -7,7 +7,7 @@
       "rocm": "7.14.60850",
       "torch": "2.12.0+rocm7.14.0",
       "lib_sha256": "f30bb442e9b5a3c479f6aa60c4d0d0740f67db2957fc0a5c416253e1bf320262",
-      "rows_per_rank": 1824,
+      "rows_per_rank": 1860,
       "venv": "venv-7.14.0_0.28.0; venv-7.14.0_0.31.0",
       "status": "canonical",
       "covers": [
@@ -16,7 +16,7 @@
         "Qwen3.8-27B-exl3-3.00bpw (MTP=0/2)",
         "Qwen3.6-35B-A3B-GPTQ-Int4 (MTP=0/2)",
         "DeepSeek-V4-Flash-0731-K128-v2",
-        "Qwen3.8-Flash-Next-DFlash2 BF16 draft regular GEMMs (58 measured shapes)"
+        "Qwen3.8-Flash-Next-DFlash2 BF16 draft regular GEMMs (94 measured shapes; includes 36 two-token graph shapes)"
       ]
     },
     "rocm10-rocblas5.6": {

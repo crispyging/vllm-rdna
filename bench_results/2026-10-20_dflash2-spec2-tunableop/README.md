@@ -46,3 +46,18 @@ confirmed 36/36 candidate lookup hits on each GPU.
 Raw tuning and serving artifacts remain under
 `~/w4a8_runs/port-v031/` on `par1-cs25` (`dflash2-spec2-bf16-tune36`,
 `dflash2-spec2-tuned-registry`, and `serve-tune36-*`).
+
+## Shipped profile and serving status
+
+The 36 rows per rank are now appended to the existing
+[`tunableop/rocm7.14-rocblas5.5/`](../../tunableop/rocm7.14-rocblas5.5/)
+profile. Every previous row and validator is preserved; the registry reports
+1860 rows/rank and retains its separate ROCm 10 profile. The new rows are
+rank-specific and require the exact rocBLAS library hash above.
+
+The end-to-end A/B remains incomplete. Three canonical cells completed,
+but SSH became unreachable during canonical 16k/1k c=8. The original
+sequential driver may have continued; remaining canonical and tuned-arm
+results are unverified. These rows have numerical, lookup and isolated
+performance validation; **no tuned serving speedup is claimed**. The recipe
+keeps its existing default of three draft tokens.

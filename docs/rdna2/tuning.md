@@ -78,7 +78,7 @@ The target remains FP16 on RDNA2; the draft stays BF16 because its residuals
 overflow in FP16 and produce NaN candidates. BF16 draft normalization uses
 PyTorch's RMSNorm since the RDNA AOT RMSNorm kernel accepts FP16 only.
 On 4× V620 with the AWQ target, the 2026-10-20 graph validation passed.
-The exact-hash rocBLAS profile now includes 58 BF16 DFlash2 draft GEMM rows;
+The initial exact-hash rocBLAS profile added 58 BF16 DFlash2 draft GEMM rows;
 the four strided-batched BF16 shapes remain on rocBLAS defaults. The final
 tuned run passed greedy, perplexity, prefix, and concurrency probes, with no
 GPU faults. It measured 65.91/223.81 output tok/s at 1k/512 c=1/c=8 and
@@ -258,7 +258,17 @@ current lookup took 8.670/8.772 ms for M=2/16, the heuristic 8.680/8.772 ms,
 and fresh scratch lookup 1.636/1.716 ms. The tuner selected
 `Gemm_Rocblas_-456` for both. This identifies about 7 ms per draft step of
 potential savings; serving throughput with those rows has not been measured.
-The canonical profile was unchanged by this diagnostic.
+The canonical profile was unchanged by this diagnostic. A subsequent offline
+campaign tuned 36 missing spec2 keys independently on all four GPUs and
+added them to the existing `tunableop/rocm7.14-rocblas5.5/` rank files. The
+profile now has 1860 rows/rank (1766 FP16 + 94 BF16), with every previous row
+preserved. All 144 isolated measurements improved by at least 2.354x
+(median 3.417x); 36/36 lookup hits were verified on each GPU. See the
+[measurement evidence](../../bench_results/2026-10-20_dflash2-spec2-tunableop/README.md).
+The serving A/B remains incomplete after SSH became unreachable during the
+last canonical long-context cell; tuned serving gains are unverified.
+Variable auxiliary-FC/mixed-prefill context widths are outside these 36
+keys. The default draft depth remains three pending a fresh depth comparison.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
