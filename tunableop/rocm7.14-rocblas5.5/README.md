@@ -1,10 +1,32 @@
-# FP16 TunableOp rows — profile rocm7.14-rocblas5.5
+# TunableOp rows — profile rocm7.14-rocblas5.5
 
 Build-specific rocBLAS solver rows for the serving stack on 4× V620 (gfx1030),
 captured 2026-09-29 by re-tuning the production Flash-Next shapes with the
 0.28.0 tree. The profile is registered in `../profiles.json`; its
 `lib_sha256` is the `librocblas.so.5` sha256 (see `provenance.json`), and
 `configure_tunableop` matches it against the loaded build.
+
+## DFlash2 BF16 draft (2026-10-20)
+
+The Flash-Next DFlash2 recipe keeps its draft in BF16 on gfx1030 because an
+FP16 draft produced NaN candidates. A four-rank TunableOp census during 1k/512
+and 16k/1k requests found 58 regular BF16 GEMM keys plus four strided-batched
+keys per rank. The regular keys were tuned on a V620 with the profile's exact
+rocBLAS build and added to all four rank files, taking each file from 1766 to
+1824 rows. The strided-batched keys still use rocBLAS defaults.
+
+All 58 regular shapes beat both the previous lookup and the heuristic by more
+than 3% in isolated timing (median previous/new ratio 3.03); a lookup replay
+confirmed 58/58 solver hits on each of the four V620s. The capture and tuning
+files are under
+`~/w4a8_runs/dflash2/{shape-census1,bf16-shapes-tune}/` on `par1-cs25`.
+
+The final recipe validation passed greedy, perplexity (4.85), prefix, and
+concurrency probes, with no GPU faults. For 1k/512 requests, output was
+65.91 tok/s at c=1 and 223.81 aggregate tok/s at c=8. Two earlier untuned
+c=8 runs gave 153.92 and 168.96 tok/s; two tuned c=8 runs gave 229.95 and
+223.81. At 16k/1k c=8, untuned runs ranged 37.98–49.23 and tuned runs
+39.54–46.38 tok/s. This range does not establish a long-context gain.
 
 ## What changed vs the harvested 903-row set
 

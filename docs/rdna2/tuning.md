@@ -72,9 +72,16 @@ checkpoint's attention layers all use QSA and do not call FA-RDNA2.
 The target remains FP16 on RDNA2; the draft stays BF16 because its residuals
 overflow in FP16 and produce NaN candidates. BF16 draft normalization uses
 PyTorch's RMSNorm since the RDNA AOT RMSNorm kernel accepts FP16 only.
-On 4× V620 with the AWQ target, the 2026-10-20 graph validation passed but
-DFlash2 did not beat the existing native MTP2 recipe in the measured cells.
-Use `flashnext-mtp2` when throughput is the priority on this checkpoint.
+On 4× V620 with the AWQ target, the 2026-10-20 graph validation passed.
+The exact-hash rocBLAS profile now includes 58 BF16 DFlash2 draft GEMM rows;
+the four strided-batched BF16 shapes remain on rocBLAS defaults. The final
+tuned run passed greedy, perplexity, prefix, and concurrency probes, with no
+GPU faults. It measured 65.91/223.81 output tok/s at 1k/512 c=1/c=8 and
+49.00/46.38 at 16k/1k c=1/c=8. Repeated 1k c=8 tests improved from
+153.92–168.96 untuned to 223.81–229.95 tuned. The 16k c=8 runs ranged
+37.98–49.23 untuned and 39.54–46.38 tuned, so a long-context gain is not
+established. Prior native MTP2 runs were faster at 16k c=8 (80.52 tok/s),
+though they used a different four-GPU group and are not a controlled A/B.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
@@ -293,9 +300,9 @@ run ~15 % faster than the heuristic, and much faster on skinny shapes.
 rank) plus `tunableop/profiles.json`. Solver IDs only mean something to the
 rocBLAS build that produced them, so one folder per build:
 `rocm7.14-rocblas5.5` is the canonical serving profile and covers Flash-Next
-MTP0/2 (including mixed-step and padded HC shapes), 27B AWQ (W4A8 0/1),
-27B EXL3, Qwen3.6-35B-A3B GPTQ and DeepSeek-V4-Flash. Keep every row for a
-build in that one folder; do not start parallel row sets.
+MTP0/2 (including mixed-step and padded HC shapes), the DFlash2 BF16 draft,
+27B AWQ (W4A8 0/1), 27B EXL3, Qwen3.6-35B-A3B GPTQ and DeepSeek-V4-Flash.
+Keep every row for a build in that one folder; do not start parallel row sets.
 
 **How it is consumed**: the launcher sources `tools/rdna2_028/tunableop_env.sh`,
 which hashes the loaded `librocblas.so.5`. It then picks the profile whose
