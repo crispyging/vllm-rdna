@@ -46,6 +46,7 @@ actually sets.
 | `CG_MODE`, `COMPILE_MODE`, `CG_EXTRA`, `EAGER` | | Cudagraph mode, compile mode, extra compilation JSON, eager fallback. |
 | `PLE` | bf16, int4, int4-disk | Flash-Next PLE table, see [PLE modes](#ple-table-flash-next). Needs `PLE_QUANT_DIR` for int4*. |
 | `W4A8` | 0, 1 | → `VLLM_RDNA2_W4A8_SDOT4`. |
+| `DFLASH_TOKENS` | 3, 2 | Flash-Next DFlash2 draft depth, set in the caller environment: 3 favors 1k/512 c=8; 2 favors 16k/1k c=8 and selects the 24-row verification capture ladder. |
 | `RDNA_AR` | 0, 1 | → `VLLM_RDNA_AR` when the recipe leaves it unset (the flashnext/27B recipes set it to 1; override with `VLLM_RDNA_AR=0`). |
 | `P2P` | 1, 0 | `0` = no PCIe peer-to-peer: `VLLM_RDNA_AR=0` (overrides the recipe) + `NCCL_P2P_DISABLE=1` (RCCL over host shared memory). For hosts where P2P is broken, and to bisect wrong output. Slower decode. |
 | `TUNABLEOP`, `TUNABLEOP_PROFILE` | 1 / name | TunableOp lookup on/off, force a named profile. |
@@ -62,8 +63,9 @@ actually sets.
 
 `flashnext-dflash2` serves the Flash-Next AWQ-W4A16 **target** with
 `incoai/Qwen3.8-Flash-Next-DFlash2` as an external draft model. The draft is
-not a standalone language model. The recipe uses three draft tokens, the V2
-runner, TP4/EP4, text-only inputs, and `--monokernel`. Flash-Next's QSA
+not a standalone language model. The recipe defaults to three draft tokens
+and accepts `DFLASH_TOKENS=2` for the faster long-context c=8 configuration.
+It uses the V2 runner, TP4/EP4, text-only inputs, and `--monokernel`. Flash-Next's QSA
 attention uses the native HIP sparse decode and indexer paths under MonoKernel;
 the BF16 non-causal DFlash2 draft uses FA-RDNA2's GQA prefill kernel with a
 symmetric 2048-token sliding window. Its single-token steps also use that
@@ -109,14 +111,52 @@ aggregate decode is measured output throughput over the full run. The two
 prefill figures are estimates based on end-to-end latency, not isolated GPU
 prefill timings.
 
-The four-head tile narrows the short-context gap while remaining ahead of
-Triton in this long-context run. Its speculative acceptance rates were 46.85%
-and 46.65%, respectively; all 64 benchmark requests completed without failure.
-Greedy, perplexity (4.80), prefix, concurrency, and after-load probes passed,
-with no GPU faults. These are single runs and the 16k cell has shown variance;
-repeat before treating the throughput difference as stable. Prior native MTP2
-runs were faster at 16k c=8 (80.52 tok/s), though they used a different
-four-GPU group and are not a controlled A/B.
+These 256/512-output cells are draft-attention diagnostics, not the standard
+1k/512 and 16k/1k workload used by the merged Flash-Next PRs. Their
+speculative acceptance rates for the four-head tile were 46.85% and 46.65%;
+all 64 benchmark requests completed without failure. Greedy, perplexity
+(4.80), prefix, concurrency, and after-load probes passed, with no GPU faults.
+
+The standard-length, same-GPU comparison (32 requests per c=8 cell,
+temperature 0, HIP 6–9) is:
+
+| Speculative path | Input → output | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
+| --- | --- | ---: | ---: | ---: | ---: |
+| DFlash2, Triton | 1,024 → 512 | 965.7 (2114.3) | 32.30 (227.55) | 1.06 s | 65.4 / 78.5 ms |
+| DFlash2, FA-RDNA2 four-head | 1,024 → 512 | 940.2 (2130.8) | 31.33 (222.47) | 1.09 s | 69.1 / 82.2 ms |
+| DFlash2, FA-RDNA2 two draft tokens | 1,024 → 512 | 915.9 (2086.0) | 23.88 (163.91) | 1.12 s | 82.3 / 92.4 ms |
+| Native MTP2, current branch (BF16 PLE) | 1,024 → 512 | 1045.3 (2206.8) | 32.86 (226.63) | 0.98 s | 53.7 / 63.3 ms |
+| Native MTP2, merged PR #94 (INT4 PLE) | 1,024 → 512 | 1003.2 (2254.8) | 32.54 (228.01) | 1.02 s | 55.9 / 65.7 ms |
+| DFlash2, Triton | 16,384 → 1,024 | 424.4 (933.1) | 6.17 (39.31) | 38.61 s | 551.0 / 394.3 ms |
+| DFlash2, FA-RDNA2 four-head | 16,384 → 1,024 | 369.7 (760.0) | 5.46 (34.98) | 44.32 s | 553.2 / 404.2 ms |
+| DFlash2, FA-RDNA2 two draft tokens | 16,384 → 1,024 | 895.8 (1963.5) | 12.10 (78.29) | 18.29 s | 85.4 / 179.3 ms |
+| Native MTP2, current branch (BF16 PLE) | 16,384 → 1,024 | 952.3 (2059.5) | 14.79 (92.27) | 17.20 s | 55.7 / 156.7 ms |
+| Native MTP2, merged PR #94 (INT4 PLE) | 16,384 → 1,024 | 1459.6 (3585.4) | 14.35 (96.63) | 11.23 s | 58.3 / 160.5 ms |
+
+Merged PR #94 used the same target, TP4, four V620s on HIP 6–9, 32 requests
+per c=8 cell, and these standard lengths. It used INT4 PLE; the current-branch
+runs used BF16 PLE. Native MTP2 speculative acceptance at 16k was 65.3% on
+this branch versus 66.0% in PR #94. The current branch retains earlier native
+MTP2 decode speed; the DFlash2 long-context gap is specific to its
+drafting/verification path. The native control's 16k mean TTFT was 17.20 s
+versus PR #94's 11.23 s, but their medians were 8.70 and 9.00 s. The mean
+difference comes from the slow tail (p99 63.64 versus 36.56 s), so the
+prefill-rate estimates in the table do not establish a prefill-kernel
+regression. Queueing and tail variability remain under investigation.
+
+All standard-length benchmark requests completed without GPU faults. Triton
+and the two-token FA-RDNA2 configuration passed their concurrency probes. The
+three-token FA-RDNA2 arm had two strong output divergences in that probe
+despite passing greedy, perplexity, prefix, and after-load checks; revalidation
+is pending. At 16k/1k, the three-token FA-RDNA2 draft accepted about 40.3% of
+speculative tokens versus about 47.7% for Triton. Reducing to two draft
+tokens raised FA-RDNA2 acceptance to about 58.6% and kept accepted output per
+target verification step nearly unchanged (2.17 versus 2.21 tokens). It also
+reduced the c=8 verification batch from 32 to 24 rows, restoring MonoKernel
+K1, and lifted aggregate output from 34.98 to 78.29 tok/s. At 1k/512, two
+tokens fell from 222.47 to 163.91 tok/s, so the better depth depends on the
+workload. These are single runs and the 16k cell has shown variance; repeat
+before treating small FA-RDNA2/Triton differences as stable.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
@@ -125,6 +165,16 @@ defaults to offline mode), then launch with the target checkpoint as `MODEL`:
 hf download incoai/Qwen3.8-Flash-Next-DFlash2
 MODEL=/path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
 VENV=/path/to/rocm-venv HIP_VISIBLE_DEVICES=6,7,8,9 \
+  bash tools/rdna/serve_rdna.sh RECIPE=flashnext-dflash2
+```
+
+For the measured 16k/1k c=8 profile, set `DFLASH_TOKENS=2` in the caller
+environment before invoking the same recipe. The recipe then also selects the
+24-row verification capture ladder:
+
+```bash
+MODEL=/path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
+VENV=/path/to/rocm-venv HIP_VISIBLE_DEVICES=6,7,8,9 DFLASH_TOKENS=2 \
   bash tools/rdna/serve_rdna.sh RECIPE=flashnext-dflash2
 ```
 
