@@ -117,19 +117,30 @@ speculative acceptance rates for the four-head tile were 46.85% and 46.65%;
 all 64 benchmark requests completed without failure. Greedy, perplexity
 (4.80), prefix, concurrency, and after-load probes passed, with no GPU faults.
 
-The standard-length, same-GPU comparison (32 requests per c=8 cell,
+The three-token FA-RDNA2 recipe also completed the standard c=1 cells on
+HIP 6–9 (eight requests per cell, temperature 0):
+
+| Input → output | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
+| --- | ---: | ---: | ---: | ---: |
+| 1,024 → 512 | 2208.9 (2133.5) | 71.59 (67.35) | 0.464 s | 32.5 / 32.6 ms |
+| 16,384 → 1,024 | 2056.2 (2045.5) | 73.66 (46.85) | 7.97 s | 34.3 / 34.3 ms |
+
+The standard-length, same-GPU c=8 comparison (32 requests per cell,
 temperature 0, HIP 6–9) is:
 
 | Speculative path | Input → output | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
 | --- | --- | ---: | ---: | ---: | ---: |
 | DFlash2, Triton | 1,024 → 512 | 965.7 (2114.3) | 32.30 (227.55) | 1.06 s | 65.4 / 78.5 ms |
 | DFlash2, FA-RDNA2 four-head | 1,024 → 512 | 940.2 (2130.8) | 31.33 (222.47) | 1.09 s | 69.1 / 82.2 ms |
+| DFlash2, FA-RDNA2 three tokens, interval 4 | 1,024 → 512 | 833.3 (2097.9) | 30.47 (220.24) | 1.23 s | 69.5 / 81.9 ms |
 | DFlash2, FA-RDNA2 two draft tokens | 1,024 → 512 | 915.9 (2086.0) | 23.88 (163.91) | 1.12 s | 82.3 / 92.4 ms |
 | Native MTP2, current branch (BF16 PLE) | 1,024 → 512 | 1045.3 (2206.8) | 32.86 (226.63) | 0.98 s | 53.7 / 63.3 ms |
 | Native MTP2, merged PR #94 (INT4 PLE) | 1,024 → 512 | 1003.2 (2254.8) | 32.54 (228.01) | 1.02 s | 55.9 / 65.7 ms |
 | DFlash2, Triton | 16,384 → 1,024 | 424.4 (933.1) | 6.17 (39.31) | 38.61 s | 551.0 / 394.3 ms |
 | DFlash2, FA-RDNA2 four-head | 16,384 → 1,024 | 369.7 (760.0) | 5.46 (34.98) | 44.32 s | 553.2 / 404.2 ms |
+| DFlash2, FA-RDNA2 three tokens, interval 4 | 16,384 → 1,024 | 624.4 (1525.8) | 11.84 (70.24) | 26.24 s | 71.5 / 202.0 ms |
 | DFlash2, FA-RDNA2 two draft tokens | 16,384 → 1,024 | 895.8 (1963.5) | 12.10 (78.29) | 18.29 s | 85.4 / 179.3 ms |
+| DFlash2, FA-RDNA2 two tokens, interval 4 | 16,384 → 1,024 | 778.4 (1914.9) | 12.41 (75.44) | 21.05 s | 85.1 / 173.5 ms |
 | Native MTP2, current branch (BF16 PLE) | 16,384 → 1,024 | 952.3 (2059.5) | 14.79 (92.27) | 17.20 s | 55.7 / 156.7 ms |
 | Native MTP2, merged PR #94 (INT4 PLE) | 16,384 → 1,024 | 1459.6 (3585.4) | 14.35 (96.63) | 11.23 s | 58.3 / 160.5 ms |
 
@@ -142,25 +153,39 @@ drafting/verification path. The native control's 16k mean TTFT was 17.20 s
 versus PR #94's 11.23 s, but their medians were 8.70 and 9.00 s. The mean
 difference comes from the slow tail (p99 63.64 versus 36.56 s), so the
 prefill-rate estimates in the table do not establish a prefill-kernel
-regression. Queueing and tail variability remain under investigation.
+regression; they include queueing and the slow tail.
 
 All standard-length c=8 benchmark requests completed, with no GPU faults
-recorded before the server became unreachable after the matrix. Triton
-and the two-token FA-RDNA2 configuration passed their concurrency probes. The
-three-token FA-RDNA2 arm had two strong output divergences in that probe
-despite passing greedy, perplexity, prefix, and after-load checks; revalidation
-is pending. At 16k/1k, the three-token FA-RDNA2 draft accepted about 40.3% of
-speculative tokens versus about 47.7% for Triton. Reducing to two draft
-tokens raised FA-RDNA2 acceptance to about 58.6% and kept accepted output per
-target verification step nearly unchanged (2.17 versus 2.21 tokens). It also
-reduced the c=8 verification batch from 32 to 24 rows, restoring MonoKernel
-K1, and lifted aggregate output from 34.98 to 78.29 tok/s. At 1k/512, two
-tokens fell from 222.47 to 163.91 tok/s, so the better depth depends on the
-workload. These are single runs and the 16k cell has shown variance; repeat
-before treating small FA-RDNA2/Triton differences as stable. Current FA-RDNA2
-c=1 standard-length cells, fixed-prompt concurrency rechecks, and phase
-timings remain pending because `par1-cs25` stopped responding to SSH after the
-completed runs; its availability and later GPU logs could not be verified.
+recorded during the runs. Triton and the two-token FA-RDNA2 configuration
+passed their concurrency probes. The first three-token FA-RDNA2 probe had two
+strong output divergences despite passing greedy, perplexity, prefix, and
+after-load checks; after a server reboot, its repeat probe passed with zero
+strong failures across 48 checks. A fixed eight-prompt FA-RDNA2/Triton
+comparison found no systematic high-margin wrong-token pattern; first
+candidate differences were in both backends' top-five lists. The cause of the
+server reboot remains unknown. At 16k/1k, the three-token FA-RDNA2 draft
+accepted about 40.3% of speculative tokens versus about 47.7% for Triton.
+Reducing to two draft tokens raised FA-RDNA2 acceptance to about 58.6% and
+kept accepted output per target verification step nearly unchanged (2.17
+versus 2.21 tokens). It also reduced the c=8 verification batch from 32 to 24
+rows, restoring MonoKernel K1, and lifted aggregate output from 34.98 to
+78.29 tok/s. At 1k/512, two tokens fell from 222.47 to 163.91 tok/s, so the
+better depth depends on the workload. These are single runs and the 16k cell
+has shown variance; repeat before treating small FA-RDNA2/Triton differences
+as stable. An instrumented c=8 phase run with eight 16k/1k requests recorded
+286 mixed 1024-token prefill/decode steps averaging 551.5 ms, versus 418
+pure decode steps averaging 51.6 ms. Mixed target forward consumed about
+517.7 ms per step;
+draft work consumed 30.9 ms and the inter-step gap 1.5 ms. These groups
+account for most of the run's 193.2-second wall time. Its absolute throughput
+is not directly comparable to the 32-request matrix.
+
+`PREFILL_INTERVAL=4` raised the three-token 16k/1k c=8 aggregate output from
+34.98 to 70.24 tok/s and reduced mean TTFT from 44.32 to 26.24 s. It did
+not improve 1k/512 c=8 (222.47 versus 220.24 tok/s) or the two-token 16k
+configuration (78.29 versus 75.44 tok/s, with TTFT rising 18.29 to 21.05 s).
+The recommended settings are therefore the recipe defaults for short
+contexts, and `DFLASH_TOKENS=2` for the measured long-context workload.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
