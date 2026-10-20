@@ -144,6 +144,44 @@ temperature 0, HIP 6–9) is:
 | Native MTP2, current branch (BF16 PLE) | 16,384 → 1,024 | 952.3 (2059.5) | 14.79 (92.27) | 17.20 s | 55.7 / 156.7 ms |
 | Native MTP2, merged PR #94 (INT4 PLE) | 16,384 → 1,024 | 1459.6 (3585.4) | 14.35 (96.63) | 11.23 s | 58.3 / 160.5 ms |
 
+To isolate the drafter choice, a subsequent same-recipe A/B used
+`flashnext-dflash2` for both arms, switching only the speculative config
+between native MTP2 and BF16 DFlash2. Both used two draft tokens, the 24-row
+capture ladder at c=8, the same AWQ target snapshot, BF16 PLE, MonoKernel,
+FA-RDNA2 selection, TP4/EP4 on HIP 6–9, temperature 0, seed 12345, and
+`--ignore-eos`. Each arm ran c=1 (eight requests) then c=8 (32 requests) at
+1k/512 and 16k/1k. The dry-run commands and actual API arguments matched
+after accounting for the speculative config and port:
+
+| Drafter | Workload | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Native MTP2 | 1,024 → 512, c=1 | 2221.2 (2176.3) | 81.74 (76.27) | 0.46 s | 23.8 / 23.9 ms |
+| DFlash2, two tokens | 1,024 → 512, c=1 | 2091.2 (1953.3) | 43.59 (41.92) | 0.49 s | 49.6 / 49.6 ms |
+| Native MTP2 | 1,024 → 512, c=8 | 1012.4 (2193.3) | 32.30 (233.38) | 1.01 s | 53.9 / 64.2 ms |
+| DFlash2, two tokens | 1,024 → 512, c=8 | 885.9 (2096.6) | 23.62 (172.25) | 1.16 s | 82.0 / 92.6 ms |
+| Native MTP2 | 16,384 → 1,024, c=1 | 2111.3 (2095.1) | 96.45 (55.75) | 7.76 s | 24.3 / 24.3 ms |
+| DFlash2, two tokens | 16,384 → 1,024, c=1 | 1999.2 (1986.3) | 41.50 (31.18) | 8.20 s | 51.1 / 51.1 ms |
+| Native MTP2 | 16,384 → 1,024, c=8 | 1558.7 (5363.9) | 15.31 (102.59) | 10.51 s | 55.7 / 142.7 ms |
+| DFlash2, two tokens | 16,384 → 1,024, c=8 | 1706.1 (7356.6) | 12.53 (87.32) | 9.60 s | 85.7 / 168.3 ms |
+
+All paired benchmark requests completed. DFlash2's aggregate output was
+45.0%, 26.2%, 44.1%, and 14.9% below native MTP2 in table order. The long
+c=8 cells followed long c=1 cells with prefix caching enabled; native and
+DFlash2 reported 13.6% and 15.5% cache hit rates by the end, respectively.
+Their large aggregate prefill estimates and TTFT differences include cache
+effects and do not establish a prefill-kernel advantage. The earlier cold c=8
+runs likewise showed about a 15% long-context output gap between two-token
+DFlash2 (78.29 tok/s) and native MTP2 (92.27 tok/s).
+
+Native MTP2 passed its paired concurrency probe. The paired DFlash2 probe and
+an isolated recheck each flagged one divergence after the same completed
+haiku and generated `<|endoftext|>` while forcing continuation with
+`ignore_eos=True`. Saved solo/concurrent tokens match through the end-of-text
+token; a separate normal-EOS probe was not run. Greedy, perplexity, prefix,
+and after-load probes passed, and no V620 compute fault was recorded. The
+native arm's dmesg delta contained corrected PCIe AER on a separate W7800
+at startup, not an amdgpu compute fault on HIP 6–9.
+
 Merged PR #94 used the same target, TP4, four V620s on HIP 6–9, 32 requests
 per c=8 cell, and these standard lengths. It used INT4 PLE; the current-branch
 runs used BF16 PLE. Native MTP2 speculative acceptance at 16k was 65.3% on
@@ -155,12 +193,13 @@ difference comes from the slow tail (p99 63.64 versus 36.56 s), so the
 prefill-rate estimates in the table do not establish a prefill-kernel
 regression; they include queueing and the slow tail.
 
-All standard-length c=8 benchmark requests completed, with no GPU faults
-recorded during the runs. Triton and the two-token FA-RDNA2 configuration
-passed their concurrency probes. The first three-token FA-RDNA2 probe had two
-strong output divergences despite passing greedy, perplexity, prefix, and
-after-load checks; after a server reboot, its repeat probe passed with zero
-strong failures across 48 checks. A fixed eight-prompt FA-RDNA2/Triton
+All standard-length c=8 benchmark requests completed, with no V620 compute
+faults recorded during the runs. Triton and an earlier two-token FA-RDNA2 run
+passed their concurrency probes; the later strict paired two-token run had the
+post-end-of-text failures described above. The first three-token FA-RDNA2
+probe had two strong output divergences despite passing greedy, perplexity,
+prefix, and after-load checks. After a server reboot, its repeat probe passed
+with zero strong failures across 48 checks. A fixed eight-prompt FA-RDNA2/Triton
 comparison found no systematic high-margin wrong-token pattern; first
 candidate differences were in both backends' top-five lists. The cause of the
 server reboot remains unknown. At 16k/1k, the three-token FA-RDNA2 draft
