@@ -97,6 +97,15 @@ Prefill per request is mean input tokens / mean TTFT. The aggregate prefill
 estimate is min(concurrency, completed) × mean input / p99 TTFT; it is a
 wave proxy including latency effects. Decode per request is 1000 / mean
 TPOT in ms. Aggregate output is measured output tokens / total run duration.
+ITL uses streamed chunk intervals; speculative decoding can emit multiple
+tokens per chunk, so ITL is not normalized per token. TPOT provides that
+normalization.
+
+[per_request_latency.csv](per_request_latency.csv) retains each saved request's
+end-to-end latency and queue time. The tuning/depth cells used `--save-result`
+without `--save-detailed`; individual TTFT, ITL, TPOT and token counts were not
+saved. The table's tok/s/req uses cell means, rather than averaging separately
+measured request rates. The sample index is the benchmark's saved array index.
 
 ### Correctness and provenance
 
@@ -115,5 +124,102 @@ differences. The full saved-token/logprob audit remains with the raw artifacts.
 Worker filename/provenance checks confirm the selected files; process-title
 rewriting limits what `/proc` exposes, as documented in the fork's port notes.
 
-The recipe's default depth remains three while the fresh short-context
-control and the separate native MTP2 comparison are completed.
+## Fresh short-context depth control
+
+After the tuning A/B, depth three used the same expanded profile, source,
+model, boot and settings, with only draft depth/capture sizes changed to
+three/[4,8,16,32]. Both short cells completed (40 requests), with both cache
+resets, greedy, PPL (4.79), prefix, normal-EOS (0 failures / 48 checks) and
+after-load gates passing. No serve or new amdgpu faults were recorded.
+[depth_control.csv](depth_control.csv) and [depth_audit.json](depth_audit.json)
+record the measurements and independent audit.
+
+| Depth | Workload | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 2 | 1,024 → 512, c=1 | 2160.9 (2094.7) | 68.60 (64.62) | 0.47 s | 31.2 / 31.3 ms |
+| 2 | 1,024 → 512, c=8 | 963.2 (2154.2) | 29.67 (208.78) | 1.06 s | 63.4 / 74.0 ms |
+| 3 | 1,024 → 512, c=1 | 2162.6 (2089.5) | 74.45 (69.78) | 0.47 s | 32.7 / 32.7 ms |
+| 3 | 1,024 → 512, c=8 | 884.6 (2111.0) | 29.72 (213.38) | 1.16 s | 69.6 / 81.9 ms |
+
+Depth three increased aggregate output by 8.0% at c=1 and 2.2% at c=8,
+with acceptance length up 13.7%/10.9%. Depth two had lower median ITL by
+1.5/6.2 ms; at c=8 its TTFT was 1.06 versus 1.16 s. Keep depth three as the
+short-context throughput default; depth two offers lower streaming latency
+and is the tested long-context c=8 setting when explicitly selected. These are single paired runs;
+no fresh long-context depth-three cell was run. Cross-depth normal-EOS
+comparison had no matching-prefix premature stop; outputs were not identical.
+
+## Fresh native MTP2 comparison
+
+The native MTP2 arm ran after the depth control, on the same boot, source,
+expanded profile, target snapshot, GPUs and settings as tuned DFlash2 spec2.
+API arguments match except port and speculative configuration. Both use two
+draft tokens and captures [3,6,12,24]. Native MTP is FP16; DFlash2 is BF16.
+Every cell resets prefix caching. The native client adds `--save-detailed`
+for result retention; the completed DFlash2 cells did not use that flag.
+[drafter_control.csv](drafter_control.csv) and [drafter_audit.json](drafter_audit.json)
+contain the paired measurements and independent audit.
+
+| Drafter | Workload | Prefill tok/s/req (agg estimate) | Decode tok/s/req (agg output) | Mean TTFT | ITL median / mean |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Native MTP2 | 1,024 → 512, c=1 | 2218.7 (2162.9) | 98.92 (90.98) | 0.46 s | 23.9 / 24.0 ms |
+| DFlash2 tuned | 1,024 → 512, c=1 | 2160.9 (2094.7) | 68.60 (64.62) | 0.47 s | 31.2 / 31.3 ms |
+| Native MTP2 | 1,024 → 512, c=8 | 1020.4 (2183.3) | 33.88 (236.85) | 1.00 s | 54.3 / 65.0 ms |
+| DFlash2 tuned | 1,024 → 512, c=8 | 963.2 (2154.2) | 29.67 (208.78) | 1.06 s | 63.4 / 74.0 ms |
+| Native MTP2 | 16,384 → 1,024, c=1 | 2104.0 (2088.3) | 100.99 (57.15) | 7.79 s | 24.4 / 24.4 ms |
+| DFlash2 tuned | 16,384 → 1,024, c=1 | 2051.1 (2038.6) | 65.44 (43.35) | 7.99 s | 32.7 / 32.7 ms |
+| Native MTP2 | 16,384 → 1,024, c=8 | 996.6 (2053.9) | 14.50 (91.92) | 16.44 s | 55.4 / 156.2 ms |
+| DFlash2 tuned | 16,384 → 1,024, c=8 | 978.8 (2020.4) | 13.31 (85.60) | 16.74 s | 67.3 / 163.5 ms |
+
+Native MTP2 remains faster in all four cells: tuned DFlash2 aggregate output
+is 29.0%, 11.9%, 24.1% and 6.9% lower for short c=1/c=8 and long c=1/c=8. The tuning closes much
+of the earlier gap, but does not establish a performance win over native MTP.
+At short c=8 acceptance lengths are almost equal (2.205 native / 2.199
+DFlash2), indicating additional total iteration cost. At long c=1, both
+acceptance (2.468 / 2.140) and overall iteration rate contribute. These
+iteration rates include drafting, verification, prefill and queueing; they
+do not isolate a target kernel. All figures are single paired runs.
+
+The native arm completed 80/80 requests, all four cache resets, greedy,
+PPL (4.79), prefix, normal-EOS (0 failures / 48 checks) and after-load gates.
+There were no serve or new amdgpu faults; source/profile hashes were unchanged.
+Native→DFlash2 normal-EOS outputs were identical in 19/48 comparisons; four
+stopping differences followed earlier divergence, with zero matching-prefix
+premature stops. Every first changed token was in native's top five within
+one nat. This supports the sampled correctness checks, not bit identity.
+
+[native_per_request_detailed.csv](native_per_request_detailed.csv) retains all
+80 native requests' token counts, TTFT, derived TPOT/rates and streamed
+inter-chunk latency summaries. [per_request_latency.csv](per_request_latency.csv)
+contains end-to-end latency and queue time for all 280 benchmark requests
+across the tuning A/B, short depth control and native control.
+
+## Reproduce the serving cells
+
+Use the already-built ROCm venv and the same target snapshot. The drafter must
+be downloaded before the offline launcher starts. Run arms sequentially on
+idle HIP 6–9; keep the same source, library and profile hashes. For the old
+arm, extract the complete `tunableop/` tree from `ccb38749e2` into a separate
+registry and set `TUNABLEOP_ROOT` to it. Do not use the expanded profile as
+its own baseline. Leave `TUNABLEOP_ROOT` unset for the shipped profile.
+
+```bash
+export MODEL=/path/to/target/snapshot VENV=/path/to/rocm-venv
+export RECIPE=flashnext-dflash2 GPUS=6,7,8,9 PLE=bf16 DFLASH_TOKENS=2
+export CELLS='1024:512:1:8 1024:512:8:32 16384:1024:1:8 16384:1024:8:32'
+export BENCH_EXTRA='--temperature 0'
+export RESET_PREFIX_CACHE=1 VLLM_SERVER_DEV_MODE=1
+export CONC_PROBE_ARGS='--no-ignore-eos --max-tokens 128'
+unset VLLM_RDNA_PHASE_TIMING VLLM_RDNA_OP_TIMING
+unset PYTORCH_TUNABLEOP_RECORD_UNTUNED PYTORCH_TUNABLEOP_UNTUNED_FILENAME
+TAG=dflash2-spec2 PORT=18163 bash tools/rdna/port_v031/serve_validate.sh
+```
+
+For native MTP2 with the same recipe frame, export `SPEC_CONFIG=''` and
+`BENCH_EXTRA='--temperature 0 --save-detailed'`, then run with a new
+`TAG`/port plus trailing `MTP=2`. For the short depth-three control,
+leave `SPEC_CONFIG` unset, set `DFLASH_TOKENS=3`, and restrict `CELLS` to the
+two 1k/512 cells. Inspect the actual launch configuration and all four
+worker profile filenames before using the results. `--save-detailed` keeps
+individual timing/token arrays for future runs; the earlier DFlash cells
+only retained the per-request latency/queue arrays described above.

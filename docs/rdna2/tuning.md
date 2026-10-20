@@ -250,14 +250,14 @@ draft span. GPU-event spans can include stream idle time; the torch-profiler
 traces on this runtime contained CPU events only.
 
 The observed head shapes are BF16 `M=2/16, N=62080, K=2560` at c=1/c=8.
-Those keys and the two-token query widths `M=3/6/12/24` are absent from the
-58 committed BF16 rows, which cover the three-token capture widths. Missing
-rows use the rocBLAS heuristic. An isolated exact-shape comparison on HIP 6
+Those keys and the two-token query widths `M=3/6/12/24` were absent from the
+initial 58 BF16 rows, which cover the three-token capture widths. Missing
+rows used the rocBLAS heuristic. An isolated exact-shape comparison on HIP 6
 (five warmups, 30 repetitions, same library hash) confirmed the head gap:
 current lookup took 8.670/8.772 ms for M=2/16, the heuristic 8.680/8.772 ms,
 and fresh scratch lookup 1.636/1.716 ms. The tuner selected
 `Gemm_Rocblas_-456` for both. This identifies about 7 ms per draft step of
-potential savings; serving throughput with those rows has not been measured.
+potential savings, subsequently tested in the serving A/B below.
 The canonical profile was unchanged by this diagnostic. A subsequent offline
 campaign tuned 36 missing spec2 keys independently on all four GPUs and
 added them to the existing `tunableop/rocm7.14-rocblas5.5/` rank files. The
@@ -276,7 +276,28 @@ evidence includes per-request/aggregate prefill and decode, TTFT, ITL,
 acceptance and provenance. These are one paired run per cell. An earlier
 interrupted pre-reboot run is excluded from this comparison.
 Variable auxiliary-FC/mixed-prefill context widths are outside these 36
-keys. The default draft depth remains three pending a fresh depth comparison.
+keys. A subsequent same-boot short-context depth control with this profile
+measured 69.78/213.38 aggregate output tok/s at depth three, versus
+64.62/208.78 at depth two (c=1/c=8). Depth two had lower median ITL
+31.2/63.4 ms versus 32.7/69.6 ms, and c=8 TTFT 1.06 versus 1.16 s.
+Depth three remains the short-context throughput default; depth two is an
+option for lower streaming latency and the explicitly selected long-context setting.
+The 40 depth-three requests and all probes passed (PPL 4.79, normal-EOS
+0 failures/48 checks, no recorded GPU faults). These are single paired runs.
+
+The fresh native MTP2 control used the same boot, source, expanded profile,
+target, GPUs, two draft tokens and captures [3,6,12,24]. With a verified cache
+reset before each cell, native aggregate output was 90.98/236.85 tok/s at
+1k/512 c=1/c=8 and 57.15/91.92 at 16k/1k. Tuned DFlash2 was 29.0%, 11.9%,
+24.1% and 6.9% slower, respectively. Native median ITL was 23.9/54.3/24.4/55.4 ms
+versus DFlash2's 31.2/63.4/32.7/67.3 ms. All native 80 benchmark requests,
+four cache resets and probes passed (PPL 4.79, normal-EOS 0 failures/48,
+no recorded GPU faults). Native versus DFlash2 had no matching-prefix
+premature stops; near-tie token/stopping differences remain. Native added
+client `--save-detailed`; server arguments matched except drafter and port.
+The linked evidence contains all four cells' full metrics and retained
+request data. These single paired runs establish an improvement from tuning,
+while native MTP2 remains faster than this external drafter.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:

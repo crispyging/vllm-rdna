@@ -161,6 +161,24 @@
                 "16384x1024-c8": -21.035497890631195
             },
             "conditions": "Same target snapshot, source/API arguments except port, GPUs, two draft tokens, temperature0, seed12345; profiling/online tuning off; prefix reset per cell; n8/n32/n8/n32. One paired run per cell. Acceptance varies; modest long-c8 gain has no repeat-derived precision estimate."
+        },
+        "depth_control": {
+            "metrics": "bench_results/2026-10-20_dflash2-spec2-tunableop/depth_control.csv",
+            "audit": "bench_results/2026-10-20_dflash2-spec2-tunableop/depth_audit.json",
+            "status": "Passed same-boot spec2/spec3 short control; 40 depth-three benchmark requests, both prefix resets and all probes passed; PPL4.79, normal-EOS0 failures/48 checks, no recorded GPU faults.",
+            "decision": "Keep existing depth3 short-context throughput default: aggregate output +7.99% c1/+2.20% c8; depth2 has lower median ITL and c8 TTFT. One paired run per cell; no fresh long-context depth3 cell."
+        },
+        "native_mtp2_control": {
+            "metrics": "bench_results/2026-10-20_dflash2-spec2-tunableop/drafter_control.csv",
+            "audit": "bench_results/2026-10-20_dflash2-spec2-tunableop/drafter_audit.json",
+            "status": "Passed same-boot four-cell control, 80 native requests, all four prefix resets and all probes; PPL4.79, normal-EOS0 failures/48, no recorded GPU faults. Both arms use shipped1860 profile; source/rank hashes unchanged.",
+            "native_aggregate_output_tok_s": [
+                90.98128514040744,
+                236.852503188938,
+                57.150543475560596,
+                91.91884229568082
+            ],
+            "conclusion": "Native MTP2 faster in all four cells; tuned DFlash2 output is 28.98%,11.85%,24.15%,6.87% lower. One paired run per cell. Native alone uses client --save-detailed for result retention."
         }
     }
 }
