@@ -8,7 +8,7 @@ ROCM dispatcher cannot touch FA-RDNA2. Kernels live in
 ``vllm/v1/attention/ops/fa_rdna2_backend.py`` via ``load_inline``.
 
 Selected on gfx1030 when VLLM_USE_RDNA2_FA=1 (see platforms/rocm.py).
-Coverage: head_size {128, 256}, fp16, non-quantized KV cache; anything
+Coverage: head_size {128, 256}, fp16 or bf16, non-quantized KV cache; anything
 else is rejected by validate_configuration and the selector falls back
 to ROCM_ATTN/TRITON_ATTN.
 """
@@ -274,7 +274,9 @@ class RdnaAttentionImpl(AttentionImpl):
     ) -> bool:
         if not is_available():
             return False
-        if query.dtype != torch.float16:
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             return False
         if key_cache.dim() != 5 or value_cache.dim() != 5:
             return False
@@ -350,7 +352,24 @@ class RdnaAttentionImpl(AttentionImpl):
             else torch.empty(out.shape, dtype=out.dtype, device=out.device)
         )
 
-        if max_seqlen_q <= 1:
+        if query.dtype == torch.bfloat16 or not attn_metadata.causal:
+            # The GQA prefill kernel handles bf16 and symmetric non-causal
+            # windows. Split-K decode and the other prefill kernels are fp16
+            # causal paths; a single query still uses GQA prefill here.
+            self._forward_prefill(
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                attn_metadata.query_start_loc,
+                seqused_k,
+                attn_metadata.max_seq_len,
+                paged_block_size,
+                sliding_window,
+                dst,
+                causal=attn_metadata.causal,
+            )
+        elif max_seqlen_q <= 1:
             # hippihx V1 (VLLM_HIPPIHX=1): writes straight into `output`
             # when its attention.fa_fdot2 plan is ready; otherwise the
             # extras kernel below runs unchanged.
@@ -387,8 +406,6 @@ class RdnaAttentionImpl(AttentionImpl):
                 out=dst,
             )
         else:
-            if not attn_metadata.causal:
-                raise NotImplementedError("RDNA_ATTN: non-causal prefill not supported")
             nd = attn_metadata.num_decodes
             nd_tok = attn_metadata.num_decode_tokens
             if nd_tok and nd_tok * self.num_heads <= _SPLIT_DECODE_MAX_ROWS:
@@ -450,6 +467,7 @@ class RdnaAttentionImpl(AttentionImpl):
         paged_block_size: int,
         sliding_window: int,
         dst: torch.Tensor,
+        causal: bool = True,
     ) -> None:
         fa = _get_fa_rdna2_module()
         _num_seqs = seqused_k.size(0)
@@ -457,11 +475,11 @@ class RdnaAttentionImpl(AttentionImpl):
         if (
             self.num_kv_heads
             and self.num_heads % self.num_kv_heads == 0
-            and _gqa_mode() == "subgroup"
+            and (_gqa_mode() == "subgroup" or q.dtype == torch.bfloat16 or not causal)
         ):
-            # O and the softmax in registers, 16 query rows per CTA: 2 heads
-            # of a GQA group for even groups, 1 head otherwise. Any other
-            # VLLM_FA_RDNA2_GQA_MODE value falls back to the kernels below.
+            # O and softmax stay in registers. BF16 groups of four use four
+            # heads per CTA; FP16 keeps its existing two-head or one-head
+            # tiles. Other FP16 GQA modes use the kernels below.
             fa.fa_rdna2_prefill_paged_varlen_gqa(
                 q,
                 key_cache,
@@ -470,7 +488,7 @@ class RdnaAttentionImpl(AttentionImpl):
                 cu_seqlens_q,
                 seqused_k,
                 paged_block_size,
-                causal=True,
+                causal=causal,
                 sliding_window=sliding_window,
                 scale=self.scale,
                 out=dst,
@@ -579,8 +597,12 @@ class RdnaAttentionImpl(AttentionImpl):
 
 
 class RdnaAttentionBackend(AttentionBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "float16"]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+    ]
 
     forward_includes_kv_cache_update: bool = False
 
@@ -610,6 +632,10 @@ class RdnaAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
         return True
 
     @classmethod

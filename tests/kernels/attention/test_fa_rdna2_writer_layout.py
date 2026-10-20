@@ -56,7 +56,17 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (  # noqa: E402
 )
 
 
-def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False, writer="auto"):
+def _fill_cache(
+    seq_lens,
+    H_kv,
+    D,
+    bs,
+    seed,
+    layout="dense",
+    raw=False,
+    writer="auto",
+    dtype=torch.float16,
+):
     """Allocate the production [2, nb, H_kv, D, bs] cache and fill it via
     the real writer. Returns (key_cache5d, value_cache5d, block_table,
     per_seq_kv) where per_seq_kv[s] = (K[sl, H_kv, D], V[sl, H_kv, D])
@@ -73,18 +83,18 @@ def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False, writer="
     blocks_per_seq = [(sl + bs - 1) // bs for sl in seq_lens]
     nb = sum(blocks_per_seq) + 2  # 2 spare blocks, never referenced
     if layout == "block_major":
-        buf = torch.zeros(nb, 3, 2, H_kv, D, bs, dtype=torch.float16, device="cuda")
+        buf = torch.zeros(nb, 3, 2, H_kv, D, bs, dtype=dtype, device="cuda")
         kv_cache = buf[:, 1].permute(1, 0, 2, 3, 4)
     elif layout == "interleaved":
-        buf = torch.zeros(nb, 2, H_kv, D, bs, dtype=torch.float16, device="cuda")
+        buf = torch.zeros(nb, 2, H_kv, D, bs, dtype=dtype, device="cuda")
         kv_cache = buf.permute(1, 0, 2, 3, 4)
     else:
-        kv_cache = torch.zeros(2, nb, H_kv, D, bs, dtype=torch.float16, device="cuda")
+        kv_cache = torch.zeros(2, nb, H_kv, D, bs, dtype=dtype, device="cuda")
     key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache, H_kv, D)
 
     g = torch.Generator(device="cuda").manual_seed(seed)
-    K = torch.randn(total, H_kv, D, dtype=torch.float16, device="cuda", generator=g)
-    V = torch.randn(total, H_kv, D, dtype=torch.float16, device="cuda", generator=g)
+    K = torch.randn(total, H_kv, D, dtype=dtype, device="cuda", generator=g)
+    V = torch.randn(total, H_kv, D, dtype=dtype, device="cuda", generator=g)
 
     # Scrambled physical block order to exercise block_table indirection.
     perm = torch.randperm(nb, generator=torch.Generator().manual_seed(seed))
@@ -177,10 +187,12 @@ def _ref_attention(Q, per_seq_kv, cu_q, H_kv, causal, sliding_window=0, scale=No
                 mask |= ki[None, :] > qi[:, None]
             if sliding_window > 0:
                 mask |= qi[:, None] - ki[None, :] >= sliding_window
+                if not causal:
+                    mask |= ki[None, :] - qi[:, None] >= sliding_window
             sc = sc.masked_fill(mask[:, None, :], float("-inf"))
             p = sc.softmax(dim=-1)
             o_ref[q0 + c0 : q0 + c1] = torch.einsum("qhk,khd->qhd", p, Vf)
-    return o_ref.half()
+    return o_ref.to(Q.dtype)
 
 
 def _max_rel_err(out, ref):
@@ -362,6 +374,39 @@ def test_prefill_gqa_multiseq(D, H_q, H_kv, bs, layout):
     ref = _ref_attention(Q, per_seq_kv, cu_l, H_kv, causal=True)
     err = _max_rel_err(out, ref)
     assert err < 5e-3, f"gqa multiseq D={D} {H_q}/{H_kv} {layout}: {err}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_len", [1, 4])
+@pytest.mark.parametrize("full,bs,window", [(96, 32, 32), (2080, 1024, 2048)])
+def test_prefill_gqa_dflash_window(dtype, causal, q_len, full, bs, window):
+    """DFlash2 geometry: GQA, BF16 cache, short noncausal draft steps."""
+    H_q, H_kv, D = 8, 2, 128
+    kc, vc, bt, per_seq_kv = _fill_cache([full], H_kv, D, bs, seed=38, dtype=dtype)
+    Q = torch.randn(q_len, H_q, D, dtype=dtype, device="cuda")
+    cu = torch.tensor([0, q_len], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([full], dtype=torch.int32, device="cuda")
+    out = fa.fa_rdna2_prefill_paged_varlen_gqa(
+        Q,
+        kc,
+        vc,
+        bt,
+        cu,
+        seq_lens,
+        bs,
+        causal=causal,
+        sliding_window=window,
+    )
+    ref = _ref_attention(
+        Q,
+        per_seq_kv,
+        [0, q_len],
+        H_kv,
+        causal=causal,
+        sliding_window=window,
+    )
+    torch.testing.assert_close(out, ref, rtol=0.04, atol=0.04)
 
 
 # Sliding window: query q attends keys k with q - k < window, in every

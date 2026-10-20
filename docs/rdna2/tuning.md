@@ -65,10 +65,12 @@ actually sets.
 not a standalone language model. The recipe uses three draft tokens, the V2
 runner, TP4/EP4, text-only inputs, and `--monokernel`. Flash-Next's QSA
 attention uses the native HIP sparse decode and indexer paths under MonoKernel;
-the non-causal DFlash2 draft uses Triton attention. The target also uses HIP
-GDN prefill and RDNA2 W4A16 MoE. FA-RDNA2 now accepts block-major `BLHNC`
-pages through its stride-aware HIP kernels and cache writer, but this
-checkpoint's attention layers all use QSA and do not call FA-RDNA2.
+the BF16 non-causal DFlash2 draft uses FA-RDNA2's GQA prefill kernel with a
+symmetric 2048-token sliding window. Its single-token steps also use that
+kernel because the split-K decode path remains FP16 and causal. The target
+also uses HIP GDN prefill and RDNA2 W4A16 MoE. FA-RDNA2 accepts block-major
+`BLHNC` pages through its stride-aware HIP kernels and cache writer. The
+target's QSA attention does not call FA-RDNA2.
 The target remains FP16 on RDNA2; the draft stays BF16 because its residuals
 overflow in FP16 and produce NaN candidates. BF16 draft normalization uses
 PyTorch's RMSNorm since the RDNA AOT RMSNorm kernel accepts FP16 only.
@@ -80,8 +82,24 @@ GPU faults. It measured 65.91/223.81 output tok/s at 1k/512 c=1/c=8 and
 49.00/46.38 at 16k/1k c=1/c=8. Repeated 1k c=8 tests improved from
 153.92–168.96 untuned to 223.81–229.95 tuned. The 16k c=8 runs ranged
 37.98–49.23 untuned and 39.54–46.38 tuned, so a long-context gain is not
-established. Prior native MTP2 runs were faster at 16k c=8 (80.52 tok/s),
-though they used a different four-GPU group and are not a controlled A/B.
+established. These figures used the earlier Triton draft route. A controlled
+same-GPU comparison on the new FA-RDNA2 route (32 requests per c=8 cell,
+temperature 0, HIP 6–9) measured:
+
+| Draft attention | 1k in / 256 out c=8 | 16k in / 512 out c=8 |
+| --- | ---: | ---: |
+| Triton | 182.94 tok/s | 31.24 tok/s |
+| FA-RDNA2, two-head BF16 tile | 170.41 tok/s | 36.42 tok/s |
+| FA-RDNA2, four-head BF16 tile (recipe) | 178.19 tok/s | 33.31 tok/s |
+
+The four-head tile narrows the short-context gap while remaining ahead of
+Triton in this long-context run. Its speculative acceptance rates were 46.85%
+and 46.65%, respectively; all 64 benchmark requests completed without failure.
+Greedy, perplexity (4.80), prefix, concurrency, and after-load probes passed,
+with no GPU faults. These are single runs and the 16k cell has shown variance;
+repeat before treating the throughput difference as stable. Prior native MTP2
+runs were faster at 16k c=8 (80.52 tok/s), though they used a different
+four-GPU group and are not a controlled A/B.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
@@ -94,8 +112,10 @@ VENV=/path/to/rocm-venv HIP_VISIBLE_DEVICES=6,7,8,9 \
 ```
 
 For a draft stored outside the default cache, override `SPEC_CONFIG` with a
-JSON object whose `model` is its directory. Set `EXTRA_ARGS=` to compare without
-MonoKernel and use `flashnext-mtp2` for a native MTP baseline. The checkpoint's
+JSON object whose `model` is its directory. Use
+`"attention_backend":"TRITON_ATTN"` in that object for a draft-attention
+comparison. Set `EXTRA_ARGS=` to compare without MonoKernel and use
+`flashnext-mtp2` for a native MTP baseline. The checkpoint's
 five target layer IDs select the completed zero-based layer outputs, averaged
 over the HyperConnection streams to the model's native hidden width.
 
