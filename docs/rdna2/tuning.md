@@ -50,6 +50,7 @@ actually sets.
 | `RDNA_AR` | 0, 1 | → `VLLM_RDNA_AR` when the recipe leaves it unset (the flashnext/27B recipes set it to 1; override with `VLLM_RDNA_AR=0`). |
 | `P2P` | 1, 0 | `0` = no PCIe peer-to-peer: `VLLM_RDNA_AR=0` (overrides the recipe) + `NCCL_P2P_DISABLE=1` (RCCL over host shared memory). For hosts where P2P is broken, and to bisect wrong output. Slower decode. |
 | `TUNABLEOP`, `TUNABLEOP_PROFILE` | 1 / name | TunableOp lookup on/off, force a named profile. |
+| `TUNABLEOP_ROOT` | directory | Optional alternate profile registry and rank files for a serving A/B; defaults to the fork's `tunableop/`. The same rocBLAS hash validation applies. |
 | `TUNED_CONFIG` | 0, 1 | Use `tuned-moe/` MoE configs (`VLLM_TUNED_CONFIG_FOLDER`). |
 | `SEQS`, `MAXBAT`, `MAXLEN`, `KV`, `GMEM`, `BLOCK_SIZE`, `LPTH`, `PREFILL_INTERVAL` | | `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len`, `--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--block-size`, `--long-prefill-token-threshold`, `--prefill-schedule-interval`. `KV=auto` (needs `GMEM`) drops `--kv-cache-memory-bytes` so vLLM sizes the cache after profiling. |
 | `PP`, `PP_PARTITION` | | `--pipeline-parallel-size`; layers per stage → `VLLM_PP_LAYER_PARTITION`. See [Pipeline parallel](#pipeline-parallel-3-or-4-cards). |

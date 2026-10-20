@@ -255,8 +255,9 @@ rdse_tunableop_report() {
     # shellcheck source=tools/rdna2_028/tunableop_env.sh
     source "$source_dir/tools/rdna2_028/tunableop_env.sh"
     local lib=$ROCM_SDK_LIB/librocblas.so.5 requested=${TUNABLEOP_PROFILE:-}
+    local rows_root=${TUNABLEOP_ROOT:-$source_dir/tunableop}
     if [[ -n $requested ]]; then
-        if _tunableop_profiles "$source_dir/tunableop/profiles.json" |
+        if _tunableop_profiles "$rows_root/profiles.json" |
             awk -F'\t' -v n="$requested" '$1 == n { found = 1 } END { exit !found }'; then
             rdse_profile_line="$requested (requested; validated against the loaded library at launch)"
         else
@@ -268,7 +269,7 @@ rdse_tunableop_report() {
         local sha match
         sha=$(sha256sum -- "$lib")
         sha=${sha:0:12}
-        match=$(_tunableop_profiles "$source_dir/tunableop/profiles.json" |
+        match=$(_tunableop_profiles "$rows_root/profiles.json" |
             awk -F'\t' -v h="$sha" 'substr($3, 1, 12) == h { print $1; exit }')
         if [[ -n $match ]]; then
             rdse_profile_line="$match (auto-selected for librocblas.so.5 $sha)"
