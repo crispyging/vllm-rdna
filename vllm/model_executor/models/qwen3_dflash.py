@@ -38,6 +38,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.gpu.phase_timer import phase_timer
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -282,7 +283,17 @@ class DFlashQwen3Attention(nn.Module):
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
+        timer = (
+            phase_timer
+            if phase_timer is not None
+            and not torch.compiler.is_compiling()
+            and phase_timer.cur is not None
+            and not torch.cuda.is_current_stream_capturing()
+            else None
+        )
         qkv, _ = self.qkv_proj(hidden_states)
+        if timer is not None:
+            timer.mark("dflash_qkv")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Per-head RMSNorm
@@ -295,11 +306,17 @@ class DFlashQwen3Attention(nn.Module):
         ).view(k_shape)
 
         q, k = self.rotary_emb(positions, q, k)
+        if timer is not None:
+            timer.mark("dflash_qk_norm_rope")
 
         if self.v_scale is not None:
             v = v * self.v_scale
         attn_output = self.attn(q, k, v)
+        if timer is not None:
+            timer.mark("dflash_attention")
         output, _ = self.o_proj(attn_output)
+        if timer is not None:
+            timer.mark("dflash_attn_out")
         return output
 
 

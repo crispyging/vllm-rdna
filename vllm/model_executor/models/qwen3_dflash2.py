@@ -13,6 +13,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.gpu.phase_timer import phase_timer
 
 from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
@@ -270,20 +271,44 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        timer = (
+            phase_timer
+            if phase_timer is not None
+            and not torch.compiler.is_compiling()
+            and phase_timer.cur is not None
+            and not torch.cuda.is_current_stream_capturing()
+            else None
+        )
+        if timer is not None:
+            timer.mark("dflash_layer_prep")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if timer is not None:
+            timer.mark("dflash_input_norm")
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
+        if timer is not None:
+            timer.mark("dflash_attn_conv_prepare")
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+        if timer is not None:
+            timer.mark("dflash_attn_conv_finish")
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if timer is not None:
+            timer.mark("dflash_post_attn_norm")
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
+        if timer is not None:
+            timer.mark("dflash_mlp_conv_prepare")
         hidden_states = self.mlp(hidden_states)
+        if timer is not None:
+            timer.mark("dflash_mlp")
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
+        if timer is not None:
+            timer.mark("dflash_mlp_conv_finish")
         return hidden_states, residual
 
 

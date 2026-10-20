@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.cp_utils import cp_local_slot
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.phase_timer import phase_timer
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -397,6 +398,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
         self.prepare_context_anchor(input_batch, num_rejected)
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_context")
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -480,6 +483,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp = (
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_inputs")
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # The graph stores the first num_context context rows.
@@ -498,6 +503,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._precompute_context_kv(num_context, num_target_tokens)
         else:
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_context_kv")
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -517,6 +524,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # DFlash processes all speculative tokens in one forward pass,
         # so the real token count is num_query_tokens.
         self._prepare_eplb_forward(num_query_tokens)
+        if phase_timer is not None and not dummy_run:
+            phase_timer.mark("dflash_metadata")
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None

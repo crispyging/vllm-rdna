@@ -226,6 +226,39 @@ configuration (78.29 versus 75.44 tok/s, with TTFT rising 18.29 to 21.05 s).
 The recommended settings are therefore the recipe defaults for short
 contexts, and `DFLASH_TOKENS=2` for the measured long-context workload.
 
+Profiling the two-token path with `VLLM_RDNA_PHASE_TIMING=50` separates its
+context preparation from draft graph replay. At 1k/512, steady c=1 steps
+averaged 48.24 ms: target forward 18.94 ms and drafting 28.36 ms, including
+2.79 ms context processing and 25.53 ms replay (200 sampled steps). At c=8,
+250 pure-decode steps averaged 77.36 ms: target forward 43.78 ms and
+drafting 31.94 ms, including 29.08 ms replay. Input preparation and metadata
+were small. At 16k/1k c=8, pure-decode steps averaged 80.81 ms, while 69 mixed
+prefill/decode steps averaged 547.02 ms, including 492.10 ms target forward
+and 53.27 ms drafting. These bounded profiling cells used one c=8 wave,
+not the 32-request throughput matrix above.
+
+A separate eager diagnostic used finer GPU-event markers. The BF16 draft
+LM-head GEMM consumed 9.98 ms at c=1 and 9.69 ms at c=8; local top-k took
+0.07/0.09 ms, candidate gather 0.19/0.21 ms, and the selector 0.43/0.42 ms.
+The five draft layers took about 15.01/18.03 ms, including 5.73/5.96 ms in
+MLP blocks and 1.69/4.09 ms in attention. Thus the full-vocabulary BF16 head
+is the largest individual draft stage; top-k and candidate communication
+are small. The eager model is not a production throughput baseline. Its
+model/head/selector/context totals agree approximately with the graph-mode
+draft span. GPU-event spans can include stream idle time; the torch-profiler
+traces on this runtime contained CPU events only.
+
+The observed head shapes are BF16 `M=2/16, N=62080, K=2560` at c=1/c=8.
+Those keys and the two-token query widths `M=3/6/12/24` are absent from the
+58 committed BF16 rows, which cover the three-token capture widths. Missing
+rows use the rocBLAS heuristic. An isolated exact-shape comparison on HIP 6
+(five warmups, 30 repetitions, same library hash) confirmed the head gap:
+current lookup took 8.670/8.772 ms for M=2/16, the heuristic 8.680/8.772 ms,
+and fresh scratch lookup 1.636/1.716 ms. The tuner selected
+`Gemm_Rocblas_-456` for both. This identifies about 7 ms per draft step of
+potential savings; serving throughput with those rows has not been measured.
+The canonical profile was unchanged by this diagnostic.
+
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
 
