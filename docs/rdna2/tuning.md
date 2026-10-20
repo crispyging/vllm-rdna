@@ -144,7 +144,8 @@ difference comes from the slow tail (p99 63.64 versus 36.56 s), so the
 prefill-rate estimates in the table do not establish a prefill-kernel
 regression. Queueing and tail variability remain under investigation.
 
-All standard-length benchmark requests completed without GPU faults. Triton
+All standard-length c=8 benchmark requests completed, with no GPU faults
+recorded before the server became unreachable after the matrix. Triton
 and the two-token FA-RDNA2 configuration passed their concurrency probes. The
 three-token FA-RDNA2 arm had two strong output divergences in that probe
 despite passing greedy, perplexity, prefix, and after-load checks; revalidation
@@ -156,7 +157,10 @@ reduced the c=8 verification batch from 32 to 24 rows, restoring MonoKernel
 K1, and lifted aggregate output from 34.98 to 78.29 tok/s. At 1k/512, two
 tokens fell from 222.47 to 163.91 tok/s, so the better depth depends on the
 workload. These are single runs and the 16k cell has shown variance; repeat
-before treating small FA-RDNA2/Triton differences as stable.
+before treating small FA-RDNA2/Triton differences as stable. Current FA-RDNA2
+c=1 standard-length cells, fixed-prompt concurrency rechecks, and phase
+timings remain pending because `par1-cs25` stopped responding to SSH after the
+completed runs; its availability and later GPU logs could not be verified.
 
 Download the draft into the Hugging Face cache before serving (the launcher
 defaults to offline mode), then launch with the target checkpoint as `MODEL`:
