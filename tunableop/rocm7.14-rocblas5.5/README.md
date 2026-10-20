@@ -41,12 +41,15 @@ lookup and the heuristic by more than 3% (minimum 2.354x, median 3.417x,
 maximum 5.347x). Each GPU passed numerical checks and 36/36 lookup hits.
 See the [shape inputs, measurements and reproduction commands](../../../bench_results/2026-10-20_dflash2-spec2-tunableop/README.md).
 
-**End-to-end serving qualification is incomplete.** Three canonical cells
-completed before SSH became unreachable during the last canonical 16k c=8
-cell. Remaining canonical and tuned-arm outcomes are unverified; no serving
-speedup is claimed. Variable auxiliary-FC/mixed-prefill context widths and
-strided-batched BF16 GEMMs are outside this tuning set. The recipe keeps its
-existing draft-depth default.
+The full same-boot old1824/new1860 serving A/B passed all four standard
+cells (80 benchmark requests per arm), greedy/PPL/prefix/normal-EOS/after-load
+gates, and all eight prefix resets, with zero recorded GPU fault markers.
+Aggregate output improved 57.7% / 20.1% at 1k/512 c=1/c=8 and 28.8% / 10.8%
+at 16k/1k c=1/c=8; median ITL fell 37.2% / 22.6% and 36.1% / 21.0%.
+The linked evidence reports all four metrics per cell, acceptance, and the
+single-pair precision limitation for the modest long-c8 throughput gain.
+Variable auxiliary-FC/mixed-prefill context widths and strided-batched BF16
+GEMMs are outside this tuning set. The recipe keeps its existing depth default.
 
 ## What changed vs the harvested 903-row set
 

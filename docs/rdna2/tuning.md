@@ -265,8 +265,16 @@ profile now has 1860 rows/rank (1766 FP16 + 94 BF16), with every previous row
 preserved. All 144 isolated measurements improved by at least 2.354x
 (median 3.417x); 36/36 lookup hits were verified on each GPU. See the
 [measurement evidence](../../bench_results/2026-10-20_dflash2-spec2-tunableop/README.md).
-The serving A/B remains incomplete after SSH became unreachable during the
-last canonical long-context cell; tuned serving gains are unverified.
+A full same-boot serving A/B then completed all four standard cells with
+eight c=1 or 32 c=8 requests per cell. Tuned aggregate output was 64.62 /
+208.78 tok/s at 1k/512 c=1/c=8 and 43.35 / 85.60 at 16k/1k, versus 40.99 /
+173.83 and 33.66 / 77.28 for the old profile: gains of 57.7%, 20.1%, 28.8%
+and 10.8%. Median ITL fell 37.2%, 22.6%, 36.1% and 21.0%. Greedy, PPL
+(4.81 old / 4.87 new), prefix, normal-EOS and after-load probes passed;
+all eight cache resets passed and no GPU faults were recorded. The linked
+evidence includes per-request/aggregate prefill and decode, TTFT, ITL,
+acceptance and provenance. These are one paired run per cell. An earlier
+interrupted pre-reboot run is excluded from this comparison.
 Variable auxiliary-FC/mixed-prefill context widths are outside these 36
 keys. The default draft depth remains three pending a fresh depth comparison.
 
