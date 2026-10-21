@@ -155,6 +155,7 @@ in the first case. **They are not V620 measurements.**
 | **`int4_fp16_block` k=16, packed zp** | **22.694** | **23.238** | **5.000** |
 | `int4_e4m3_block` k=16 + global | 20.043 | 21.369 | 4.500 |
 | NVFP4 (E2M1 + E4M3/16 + global) | 21.724 | 20.472 | 4.500 |
+| FP8 e4m3, per-tensor scale (shipped, measured) | 32.968 | 31.646 | 8.000 |
 | `int8_e8m0_block` k=32 (MXINT8) | 36.587 | 41.940 | 8.250 |
 | `int8_fp16_block` k=32 | 39.475 | 45.594 | 8.500 |
 
@@ -180,6 +181,8 @@ Reading it:
   reverses and the proposal is ahead of NVFP4 (21.815 vs 20.472 dB). Whether
   the element type should be INT4 or E2M1 is therefore an open question, not
   a settled one.
+- **Below 8 bits/value the proposal is the best format in the table**, and
+  above it FP8 already wins - see *Why INT8 is not the answer at this budget*.
 
 ## What we lose
 
@@ -188,8 +191,9 @@ proposal at `k=32`, 4.500 bits/value, 20.302 dB on outlier rows:
 
 | Against | We lose | We gain |
 | --- | --- | --- |
-| INT8 + E8M0 (MXINT8, 8.250 bits/value) | 16.29 dB on outlier rows, 20.13 dB on clean rows | we use 54.5 % of the memory; the other way round, INT8 buys 1.83x the context length at a fixed budget |
-| INT8 + FP16 (8.500 bits/value) | 19.17 dB / 23.78 dB | we use 52.9 % of the memory; INT8 buys 1.89x the context length |
+| FP8 e4m3 per-tensor (8.000 bits/value) | 12.67 dB on outlier rows, 9.83 dB on clean rows | 1.78x the context length at a fixed budget |
+| INT8 + E8M0 (MXINT8, 8.250 bits/value) | 16.29 dB on outlier rows, 20.13 dB on clean rows | 1.83x the context length at a fixed budget |
+| INT8 + FP16 (8.500 bits/value) | 19.17 dB / 23.78 dB | 1.89x the context length at a fixed budget |
 | E4M3 scale at the same 4.500 bits/value | 0.32 dB / 0.48 dB | no scale conversion on the read path, 10 mantissa bits, no subnormal risk |
 | E8M0 scale at the same 4.500 bits/value | 2.02 dB / 4.04 dB | no global scale ever needed, one byte per block |
 
@@ -207,6 +211,51 @@ Two further costs that do not show up in an SNR table:
   bits/value more than a one-byte scale, i.e. 5.6 % more KV DRAM traffic than
   `int4_e8m0_block` k=32 and 0.25 bits/value less than the shipped format's
   row-level FP32 scale at `k=64`.
+
+### Why INT8 is not the answer at this budget
+
+The 8-bit end of the table is worth reading carefully, because it is where
+the fork's evidence is strongest and where a new format is least needed.
+
+FP8 e4m3 with a per-tensor scale costs **8.000 bits/value**. It is
+`--kv-cache-dtype fp8`, it needs no new kernel, and it is the only KV cache
+dtype with a measurement on the V620: about 2x the memory saved and +0.1 PPL
+(`QUAL_FORMATS.md:479`, `:483`, `:587`, `:695`).
+
+`int8_e8m0_block` - the OCP MXINT8 geometry - costs **8.250 bits/value**. It
+is 3 % *more* memory than the FP8 that already ships, it needs a new element
+width and a new scale format, and it needs a kernel. Its advantage is 3.6 dB
+of synthetic SNR over FP8.
+
+That advantage is not a reason to build it. The one measured data point we
+have says the SNR ordering does not predict the PPL ordering: FP8 scores
+32.968 dB on the synthetic rows and costs +0.1 PPL in reality, and the table
+puts INT8 3.6 dB above it. A format that is bigger, slower to land, and
+unmeasured should not displace one that is smaller, already shipping and
+already measured on the strength of a synthetic dB figure.
+
+So the honest summary of the whole table:
+
+- **At the 8-bit budget, FP8 already wins** and the proposal should not
+  compete there.
+- **Below 8 bits/value, the proposal is the best format in the table** at
+  every budget it can occupy, and it is the only one that buys a second
+  factor of two.
+
+For Qwen3.8-27B (65,536 B/token at FP16) at a 128k context:
+
+| Format | bits/value | B/token | 128k KV cache |
+| --- | --- | --- | --- |
+| FP16 | 16.000 | 65,536 | 8.00 GiB |
+| FP8 e4m3 per-tensor (shipped, measured) | 8.000 | 32,768 | 4.00 GiB |
+| `int8_e8m0_block` k=32 | 8.250 | 33,792 | 4.12 GiB |
+| **`int4_fp16_block` k=32, packed zp (proposal)** | **4.500** | **18,432** | **2.25 GiB** |
+| `int4_per_token_head` (shipped) | 4.250 | 17,408 | 2.12 GiB |
+
+That is the whole case for a 4-bit KV cache on RDNA2: it is the second factor
+of two, on top of the FP8 that already exists. Whether that is worth the PPL
+is the question H1 has to answer on captured activations, and the answer has
+to be a perplexity number, not an SNR number.
 
 ## The E8M0 question
 
