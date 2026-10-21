@@ -71,9 +71,12 @@ __all__ = [
     "unpack_int4",
     "quantize_int4_per_token_head",
     "quantize_int4_fp16_block",
+    "quantize_int4_fp16_block_packed",
     "quantize_int4_fp16_block_g",
     "quantize_int4_e4m3_block_g",
     "quantize_int4_e8m0_block",
+    "quantize_int8_e8m0_block",
+    "quantize_int8_fp16_block",
     "quantize_nvfp4",
     "snr_db",
     "bits_per_value",
@@ -112,6 +115,38 @@ def f16_round(x: float) -> float:
 def f16_is_normal(x: float) -> bool:
     """Return True when ``x`` is a normal (non-zero, non-subnormal) FP16."""
     return x != 0.0 and abs(x) >= FP16_MIN_NORMAL
+
+
+def f16_bits(x: float) -> int:
+    """Return the 16 raw bits of an FP16 value."""
+    return struct.unpack("<H", struct.pack("<e", x))[0]
+
+
+def f16_from_bits(bits: int) -> float:
+    """Return the FP16 value held in 16 raw bits."""
+    return struct.unpack("<e", struct.pack("<H", bits & 0xFFFF))[0]
+
+
+def f16_ceil_6(x: float) -> float:
+    """Return the smallest FP16 whose low 4 mantissa bits are zero, >= ``x``.
+
+    This is the scale grid a 4-bit zero-point can live in: the zero-point
+    takes the low 4 bits of the FP16 mantissa, which leaves a 6-bit mantissa
+    for the scale itself.
+
+    Args:
+        x: The value to round up onto the grid.
+
+    Returns:
+        The grid value, never below ``x``.
+
+    """
+    bits = f16_bits(x)
+    if bits & 0xF:
+        bits = (bits & ~0xF) + 0x10
+    if bits > 0x7BFF:
+        bits = 0x7BFF
+    return f16_from_bits(bits)
 
 
 def e4m3_is_normal(x: float) -> bool:
@@ -211,6 +246,12 @@ INT4_MAX = 7.0
 INT4_MIN = -8
 #: Exponent of the largest normal INT4 value (7 = 1.75 * 2**2).
 INT4_EMAX = 2
+#: Largest positive value of the symmetric INT8 element type.
+INT8_MAX = 127.0
+#: Smallest value of the symmetric INT8 element type.
+INT8_MIN = -128
+#: Exponent of the largest normal INT8 value (127 = 1.984375 * 2**6).
+INT8_EMAX = 6
 
 
 def e8m0_decode(code: int) -> float:
@@ -265,26 +306,30 @@ def _log2_ceil(x: float) -> int:
     return exponent - 1 if mantissa == 0.5 else exponent
 
 
-def _int4_no_saturation_exponent(amax: float) -> int:
-    """Return the smallest exponent whose INT4 scale cannot saturate.
+def _no_saturation_exponent(amax: float, qmax: float) -> int:
+    """Return the smallest exponent whose scale cannot saturate.
 
-    The scale must satisfy ``7 * 2**e >= amax`` so that every element maps
-    into ``[-7, 7]``. Writing ``amax = m * 2**p`` with ``m`` in ``[0.5, 1)``,
-    the answer is ``p - 2`` when ``amax <= 1.75 * 2**p`` and ``p - 1``
+    The scale must satisfy ``qmax * 2**e >= amax`` so that every element
+    maps into the element format's range. Writing ``amax = m * 2**p`` with
+    ``m`` in ``[0.5, 1)`` and ``qmax = f * 2**k`` with ``f`` in ``[1, 2)``,
+    the answer is ``p - k`` when ``amax <= f * 2**p`` and ``p - k + 1``
     otherwise. The comparison is exact, so this never loses a bit to a
     floating-point log.
 
     Args:
         amax: The largest absolute value in the block.
+        qmax: The largest magnitude the element format can represent.
 
     Returns:
         The unbiased exponent of the scale.
 
     """
     exponent = _log2_floor(amax)
-    if amax <= 1.75 * (2.0**exponent):
-        return exponent - 2
-    return exponent - 1
+    qmax_exponent = _log2_floor(qmax)
+    mantissa = qmax / (2.0**qmax_exponent)
+    if amax <= mantissa * (2.0**exponent):
+        return exponent - qmax_exponent
+    return exponent - qmax_exponent + 1
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +498,149 @@ def quantize_int4_fp16_block(
 
 
 # ---------------------------------------------------------------------------
+# Scheme B2: int4_fp16_block_packed (asymmetric, zero-point in the scale)
+# ---------------------------------------------------------------------------
+
+
+def quantize_int4_fp16_block_packed(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+) -> TensorResult:
+    """Quantize rows asymmetrically, with the zero-point inside the scale.
+
+    The zero-point is 4 bits and rides in the low 4 bits of the FP16 scale's
+    mantissa, the same trick ``int4_per_token_head`` plays with an FP32
+    scale. The scale is snapped up onto the resulting 6-bit-mantissa grid so
+    that the block's range still fits in 16 codes and nothing saturates.
+
+    The cost is that the scale keeps only 6 mantissa bits instead of 10, so
+    it carries up to 1.5 % relative error. The benefit is a second level: 16
+    codes per block instead of 8, which is worth more than the scale loses.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+
+    Returns:
+        The round-trip result. ``scales`` holds the packed 16-bit words, so
+        the format on the wire is exactly one uint16 per block.
+
+    """
+    reconstructed: list[list[float]] = []
+    scales: list[list[int]] = []
+    clipped = 0
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[int] = []
+        for _, block in _blocks(row, k):
+            lo = min(block)
+            hi = max(block)
+            ideal = max((hi - lo) / 15.0, 1e-6)
+            scale = f16_ceil_6(ideal)
+            zp = max(0, min(15, _round_half_away(-lo / scale)))
+            codes: list[int] = []
+            for value in block:
+                code = _round_half_away(value / scale) + zp
+                if code < 0 or code > 15:
+                    clipped += 1
+                codes.append(max(0, min(15, code)))
+            packed = (f16_bits(scale) & ~0xF) | zp
+            stored_scale = f16_from_bits(packed & ~0xF)
+            stored_zp = packed & 0xF
+            row_scales.append(packed)
+            out.extend((code - stored_zp) * stored_scale for code in codes)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales, clipped_blocks=clipped)
+
+
+# ---------------------------------------------------------------------------
+# Scheme F: int8 baselines (MXINT8 and friends)
+# ---------------------------------------------------------------------------
+
+
+def quantize_int8_e8m0_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+    rule: str = "rceil",
+) -> TensorResult:
+    """Quantize rows with symmetric INT8 and an E8M0 block scale.
+
+    This is the OCP MXINT8 geometry and the natural "one byte of scale"
+    baseline for the INT4 proposal.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+        rule: ``"rceil"`` (no saturation) or ``"floor"`` (the OCP MX rule).
+
+    Returns:
+        The round-trip result.
+
+    """
+    if rule not in ("rceil", "floor"):
+        raise ValueError(f"unknown E8M0 rule {rule!r}")
+    reconstructed: list[list[float]] = []
+    scales: list[list[float]] = []
+    clipped = 0
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[float] = []
+        for _, block in _blocks(row, k):
+            amax = max(abs(v) for v in block)
+            if amax == 0.0:
+                code = 0
+            elif rule == "rceil":
+                code = _e8m0_code(_no_saturation_exponent(amax, INT8_MAX))
+            else:
+                code = _e8m0_code(_log2_floor(amax) - INT8_EMAX)
+            scale = e8m0_decode(code)
+            codes: list[int] = []
+            for value in block:
+                code_value = _round_half_even(value / scale)
+                if code_value > INT8_MAX or code_value < INT8_MIN:
+                    clipped += 1
+                codes.append(max(INT8_MIN, min(INT8_MAX, code_value)))
+            row_scales.append(scale)
+            out.extend(code_value * scale for code_value in codes)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales, clipped_blocks=clipped)
+
+
+def quantize_int8_fp16_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+) -> TensorResult:
+    """Quantize rows with symmetric INT8 and an FP16 block scale.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+
+    Returns:
+        The round-trip result.
+
+    """
+    reconstructed: list[list[float]] = []
+    scales: list[list[float]] = []
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[float] = []
+        for _, block in _blocks(row, k):
+            scale = f16_round(max(max(abs(v) for v in block) / INT8_MAX, 1e-6))
+            codes = [
+                max(INT8_MIN, min(INT8_MAX, _round_half_even(value / scale)))
+                for value in block
+            ]
+            row_scales.append(scale)
+            out.extend(code * scale for code in codes)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales)
+
+
+# ---------------------------------------------------------------------------
 # Scheme E: int4_e8m0_block (the MX-style alternative)
 # ---------------------------------------------------------------------------
 
@@ -504,7 +692,7 @@ def quantize_int4_e8m0_block(
                 # quantizes to 0, so the block reconstructs exactly.
                 code = 0
             elif rule == "rceil":
-                code = _e8m0_code(_int4_no_saturation_exponent(amax))
+                code = _e8m0_code(_no_saturation_exponent(amax, INT4_MAX))
             else:
                 code = _e8m0_code(_log2_floor(amax) - INT4_EMAX)
             scale = e8m0_decode(code)
@@ -879,6 +1067,24 @@ def run_comparison(
             "symmetric, one FP16 scale per 16 values, single level",
         ),
         measure(
+            "int4_fp16_block_packed k=64",
+            lambda r: quantize_int4_fp16_block_packed(r, k=64),
+            bits_per_value(4, 16, 64),
+            "asymmetric, FP16 scale with 4-bit zp packed in its mantissa",
+        ),
+        measure(
+            "int4_fp16_block_packed k=32 (proposal)",
+            lambda r: quantize_int4_fp16_block_packed(r, k=32),
+            bits_per_value(4, 16, 32),
+            "asymmetric, FP16 scale with 4-bit zp packed in its mantissa",
+        ),
+        measure(
+            "int4_fp16_block_packed k=16",
+            lambda r: quantize_int4_fp16_block_packed(r, k=16),
+            bits_per_value(4, 16, 16),
+            "asymmetric, FP16 scale with 4-bit zp packed in its mantissa",
+        ),
+        measure(
             "int4_fp16_block k=32 asym",
             lambda r: quantize_int4_fp16_block(r, k=32, symmetric=False),
             bits_per_value(4, 16, 32, zero_point_bits=4),
@@ -939,6 +1145,24 @@ def run_comparison(
             "symmetric, E4M3 block scale / FP32 global (NVFP4 geometry)",
         ),
         measure(
+            "int8_e8m0_block k=32 (MXINT8, rceil)",
+            lambda r: quantize_int8_e8m0_block(r, k=32),
+            bits_per_value(8, 8, 32),
+            "symmetric INT8, one E8M0 scale per 32 values",
+        ),
+        measure(
+            "int8_e8m0_block k=16 (MXINT8, rceil)",
+            lambda r: quantize_int8_e8m0_block(r, k=16),
+            bits_per_value(8, 8, 16),
+            "symmetric INT8, one E8M0 scale per 16 values",
+        ),
+        measure(
+            "int8_fp16_block k=32",
+            lambda r: quantize_int8_fp16_block(r, k=32),
+            bits_per_value(8, 16, 32),
+            "symmetric INT8, one FP16 scale per 32 values",
+        ),
+        measure(
             "nvfp4 (E2M1 + E4M3/16)",
             quantize_nvfp4,
             bits_per_value(4, 8, 16),
@@ -982,7 +1206,7 @@ def _self_check() -> None:
     # The no-saturation exponent is exact and minimal: the chosen scale never
     # lets an element exceed the INT4 maximum, and halving it would.
     for amax in (0.1, 0.5, 1.0, 3.0, 3.6, 7.0, 14.0, 100.0):
-        exponent = _int4_no_saturation_exponent(amax)
+        exponent = _no_saturation_exponent(amax, INT4_MAX)
         scale = 2.0**exponent
         assert 7.0 * scale >= amax, f"scale {scale} saturates amax {amax}"
         assert 7.0 * (scale / 2.0) < amax, f"scale {scale} is not minimal"
@@ -991,6 +1215,20 @@ def _self_check() -> None:
     rows = [[0.5 * i for i in range(64)]]
     assert quantize_int4_e8m0_block(rows, k=32, rule="rceil").clipped_blocks == 0
     assert quantize_int4_e8m0_block(rows, k=32, rule="floor").clipped_blocks > 0
+
+    # The packed zero-point really is free: the stored word is one uint16 and
+    # it carries both the scale and the zero-point.
+    packed = quantize_int4_fp16_block_packed([[0.5 * i for i in range(64)]], k=32)
+    assert len(packed.scales[0]) == 2
+    for word in packed.scales[0]:
+        assert 0 <= word <= 0xFFFF
+        assert f16_from_bits(word & ~0xF) > 0.0
+        assert 0 <= (word & 0xF) <= 15
+
+    # Snapping the scale up onto the 6-bit-mantissa grid never drops below
+    # the requested value, so the block range still fits in 16 codes.
+    for value in (1e-4, 0.1, 1.0, 3.3, 7.7, 100.0, 1000.0):
+        assert f16_ceil_6(value) >= value
 
     # The proposal's stored scale really is FP16-representable.
     rows = [[0.5 * i for i in range(64)]]
