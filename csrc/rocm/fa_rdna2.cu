@@ -62,6 +62,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 #include <vector>
 
 #include <torch/all.h>
@@ -70,6 +71,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 
 #include "rdna2_scratch.cuh"
 
@@ -144,11 +146,13 @@ __device__ __forceinline__ int fa_swz_d(int d, int k) {
   return d ^ ((k & 7) << 4);
 }
 
-// vLLM sliding-window semantics (FlashAttention window (w - 1, 0)): query
-// position q attends key position k iff k <= q and q - k < w.
+// Causal windows include [q-w+1, q]; non-causal windows include
+// [q-w+1, q+w-1], matching Triton's symmetric DFlash mask.
 __device__ __forceinline__ bool fa_masked(int q, int k, int causal,
                                           int sliding_window) {
-  return (causal && k > q) || (sliding_window > 0 && q - k >= sliding_window);
+  return (causal && k > q) ||
+         (sliding_window > 0 &&
+          (q - k >= sliding_window || (!causal && k - q >= sliding_window)));
 }
 
 // Clips the K/V tile walk [lo, hi) (tiles at lo + i * tile) of a CTA whose
@@ -161,6 +165,7 @@ __device__ __forceinline__ void fa_clip_kv_walk(int& lo, int& hi, int q_first,
                                                 int sliding_window, int tile) {
   if (causal) hi = min(hi, q_first + rows);
   if (sliding_window > 0) {
+    if (!causal) hi = min(hi, q_first + rows - 1 + sliding_window);
     const int first = q_first - sliding_window + 1;
     if (first > lo) lo += (first - lo) / tile * tile;
   }
@@ -230,6 +235,8 @@ __device__ __forceinline__ half fa_kv_load(const KV_T* ptr, float scale) {
   if constexpr (IS_FP8) {
     return __hmul(fp8_e4m3_to_half(static_cast<uint8_t>(*ptr)),
                   __float2half(scale));
+  } else if constexpr (std::is_same_v<KV_T, __hip_bfloat16>) {
+    return __float2half_rn(__bfloat162float(*ptr));
   } else {
     return *ptr;
   }
@@ -2943,13 +2950,13 @@ static bool fa_gqa_decode_enabled() {
   return enabled;
 }
 
-// The fp16 entry points write the attention output straight into the
-// caller's buffer: no staging tensor and no copy kernel afterwards.
+// The entry points write the attention output straight into the caller's
+// buffer: no staging tensor and no copy kernel afterwards.
 static void fa_check_io(const torch::Tensor& Q, const torch::Tensor& out) {
   TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous [num_tokens, H_q, D]");
-  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kHalf &&
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == Q.scalar_type() &&
                   out.is_contiguous() && out.sizes() == Q.sizes(),
-              "out must be a contiguous fp16 tensor shaped like Q");
+              "out must be a contiguous tensor with Q's dtype and shape");
 }
 
 // =====================================================================
@@ -3806,16 +3813,16 @@ void fa_rdna2_prefill_paged_varlen_splitk(
 // and sliding-window masks, matching fa_prefill_paged_varlen_kernel_256.
 //
 template <int HEAD_DIM, int HEADS_PER_CTA, int BR_STEP, typename KV_T,
-          bool IS_FP8, bool IS_INT8 = false>
+          bool IS_FP8, bool IS_INT8 = false, typename IO_T = half>
 __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
-    const half* __restrict__ Q, const KV_T* __restrict__ key_cache,
+    const IO_T* __restrict__ Q, const KV_T* __restrict__ key_cache,
     const KV_T* __restrict__ value_cache, const int* __restrict__ block_table,
     const int* __restrict__ cu_query_lens, const int* __restrict__ seq_lens,
     const int stride_kc0, const int stride_kc1, const int stride_kc2,
     const int stride_kc3, const int stride_kc4, const int stride_vc0,
     const int stride_vc1, const int stride_vc2, const int stride_vc3,
     const int stride_vc4, const int max_blocks, const int block_size,
-    const int x_dim, const int num_seqs, half* __restrict__ O, const int H_q,
+    const int x_dim, const int num_seqs, IO_T* __restrict__ O, const int H_q,
     const int H_kv, const int kv_group_num, const float scale, const int causal,
     const int sliding_window, const float k_scale, const float v_scale,
     const float* __restrict__ k_scale_per_tok,
@@ -3849,8 +3856,13 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
       const int qh_i = i / (br_size * HEAD_DIM);
       const int qr = (i / HEAD_DIM) % br_size;
       const int gt = seq_query_start + q_start_in_seq + qr;
-      O[(gt * H_q + q_head_start + qh_i) * HEAD_DIM + i % HEAD_DIM] =
-          __float2half(0.0f);
+      if constexpr (std::is_same_v<IO_T, __hip_bfloat16>) {
+        O[(gt * H_q + q_head_start + qh_i) * HEAD_DIM + i % HEAD_DIM] =
+            __float2bfloat16(0.0f);
+      } else {
+        O[(gt * H_q + q_head_start + qh_i) * HEAD_DIM + i % HEAD_DIM] =
+            __float2half(0.0f);
+      }
     }
     return;
   }
@@ -3893,9 +3905,16 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
     half* dst = &sQ[(qh_i * BR + qr) * HEAD_DIM + d8 * 8];
     if (qr < br_size) {
       const int gt = seq_query_start + q_start_in_seq + qr;
-      const half* src =
+      const IO_T* src =
           Q + (gt * H_q + q_head_start + qh_i) * HEAD_DIM + d8 * 8;
-      *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+      if constexpr (std::is_same_v<IO_T, __hip_bfloat16>) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          dst[j] = __float2half_rn(__bfloat162float(src[j]));
+        }
+      } else {
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+      }
     } else {
       *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
     }
@@ -3927,9 +3946,9 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
     }
     __syncthreads();
 
-    const bool kv_vec_ok = (sizeof(KV_T) == 2) && (!IS_FP8) && (!IS_INT8) &&
-                           stride_kc4 == 1 && stride_vc3 == 1 && x_dim == 8 &&
-                           ((block_size & 7) == 0);
+    const bool kv_vec_ok = std::is_same_v<KV_T, half> && (!IS_FP8) &&
+                           (!IS_INT8) && stride_kc4 == 1 && stride_vc3 == 1 &&
+                           x_dim == 8 && ((block_size & 7) == 0);
     if (kv_vec_ok) {
       constexpr int NX = HEAD_DIM / 8;
       for (int i = t; i < BC * NX; i += THREADS) {
@@ -4083,16 +4102,20 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
     const int o_qr = o_row % BR;
     const float inv_l = 1.0f / l_run;
     const int gt = seq_query_start + q_start_in_seq + o_qr;
-    half* o_dst = O + (gt * H_q + q_head_start + o_qh) * HEAD_DIM + o_d0;
+    IO_T* o_dst = O + (gt * H_q + q_head_start + o_qh) * HEAD_DIM + o_d0;
 #pragma unroll
-    for (int j = 0; j < RDS / 2; ++j) {
-      *reinterpret_cast<half2*>(o_dst + 2 * j) =
-          __floats2half2_rn(o_acc[2 * j] * inv_l, o_acc[2 * j + 1] * inv_l);
+    for (int j = 0; j < RDS; ++j) {
+      if constexpr (std::is_same_v<IO_T, __hip_bfloat16>) {
+        o_dst[j] = __float2bfloat16(o_acc[j] * inv_l);
+      } else if (j % 2 == 0) {
+        *reinterpret_cast<half2*>(o_dst + j) =
+            __floats2half2_rn(o_acc[j] * inv_l, o_acc[j + 1] * inv_l);
+      }
     }
   }
 }
 
-template <int HEAD_DIM, int HEADS_PER_CTA, int BR_STEP>
+template <int HEAD_DIM, int HEADS_PER_CTA, int BR_STEP, typename IO_T = half>
 void fa_rdna2_prefill_paged_varlen_gqa_impl(
     torch::Tensor Q, torch::Tensor key_cache, torch::Tensor value_cache,
     torch::Tensor block_table, torch::Tensor cu_query_lens,
@@ -4103,11 +4126,13 @@ void fa_rdna2_prefill_paged_varlen_gqa_impl(
   TORCH_CHECK(
       block_table.is_cuda() && cu_query_lens.is_cuda() && seq_lens.is_cuda(),
       "block_table/cu_query_lens/seq_lens must be on HIP device");
-  TORCH_CHECK(Q.scalar_type() == torch::kHalf, "Q must be fp16");
-  TORCH_CHECK(key_cache.scalar_type() == torch::kHalf,
-              "key_cache must be fp16");
-  TORCH_CHECK(value_cache.scalar_type() == torch::kHalf,
-              "value_cache must be fp16");
+  constexpr auto dtype =
+      std::is_same_v<IO_T, half> ? torch::kHalf : torch::kBFloat16;
+  TORCH_CHECK(Q.scalar_type() == dtype, "Q has wrong dtype for GQA prefill");
+  TORCH_CHECK(key_cache.scalar_type() == dtype,
+              "key_cache must match Q dtype");
+  TORCH_CHECK(value_cache.scalar_type() == dtype,
+              "value_cache must match Q dtype");
   TORCH_CHECK(block_table.scalar_type() == torch::kInt32,
               "block_table must be int32");
   TORCH_CHECK(cu_query_lens.scalar_type() == torch::kInt32,
@@ -4155,13 +4180,13 @@ void fa_rdna2_prefill_paged_varlen_gqa_impl(
   hipFuncSetAttribute(
       reinterpret_cast<const void*>(
           fa_prefill_paged_varlen_gqa_kernel<HEAD_DIM, HEADS_PER_CTA, BR_STEP,
-                                             half, false>),
+                                             IO_T, false, false, IO_T>),
       hipFuncAttributeMaxDynamicSharedMemorySize, smem);
-  fa_prefill_paged_varlen_gqa_kernel<HEAD_DIM, HEADS_PER_CTA, BR_STEP, half,
-                                     false>
+  fa_prefill_paged_varlen_gqa_kernel<HEAD_DIM, HEADS_PER_CTA, BR_STEP, IO_T,
+                                     false, false, IO_T>
       <<<grid, block, smem, stream.stream()>>>(
-          (const half*)Q.data_ptr(), (const half*)key_cache.data_ptr(),
-          (const half*)value_cache.data_ptr(),
+          (const IO_T*)Q.data_ptr(), (const IO_T*)key_cache.data_ptr(),
+          (const IO_T*)value_cache.data_ptr(),
           (const int*)block_table.data_ptr(),
           (const int*)cu_query_lens.data_ptr(), (const int*)seq_lens.data_ptr(),
           (int)key_cache.stride(0), (int)key_cache.stride(1),
@@ -4169,7 +4194,7 @@ void fa_rdna2_prefill_paged_varlen_gqa_impl(
           (int)key_cache.stride(4), (int)value_cache.stride(0),
           (int)value_cache.stride(1), (int)value_cache.stride(2),
           (int)value_cache.stride(3), (int)value_cache.stride(4), max_blocks,
-          (int)block_size, x_dim, num_seqs, (half*)out.data_ptr(), H_q, H_kv,
+          (int)block_size, x_dim, num_seqs, (IO_T*)out.data_ptr(), H_q, H_kv,
           kv_group_num, scale, (int)causal, (int)sliding_window, 0.0f, 0.0f,
           nullptr, nullptr);
   hipError_t err = hipGetLastError();
@@ -4186,18 +4211,46 @@ void fa_rdna2_prefill_paged_varlen_gqa(
               "Q must be [num_tokens, H_q, D] and key_cache 5D");
   TORCH_CHECK(Q.size(2) == 128 || Q.size(2) == 256,
               "GQA prefill supports D=128 and D=256");
-  // Two q-heads per CTA for even GQA groups, one (16 query rows) otherwise.
-  const bool even_group = (Q.size(1) / key_cache.size(1)) % 2 == 0;
+  TORCH_CHECK(Q.scalar_type() == torch::kHalf ||
+                  Q.scalar_type() == torch::kBFloat16,
+              "GQA prefill supports fp16 and bf16");
+  // A BF16 group of four draft heads shares one KV tile. With four query
+  // rows per CTA this fills all 16 register/softmax rows for draft q_len=4,
+  // and halves redundant KV reads for single-token draft steps.
+  const int kv_group_num = Q.size(1) / key_cache.size(1);
+  const bool group_of_four = kv_group_num % 4 == 0;
+  const bool even_group = kv_group_num % 2 == 0;
   auto run = [&](auto kernel_impl) {
     kernel_impl(Q, key_cache, value_cache, block_table, cu_query_lens, seq_lens,
                 block_size, causal, sliding_window, scale, out);
   };
+  const bool bf16 = Q.scalar_type() == torch::kBFloat16;
   if (Q.size(2) == 128) {
-    even_group ? run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 2, 8>)
-               : run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 1, 16>);
+    if (bf16 && group_of_four) {
+      run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 4, 4, __hip_bfloat16>);
+    } else if (bf16) {
+      even_group
+          ? run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 2, 8,
+                                                       __hip_bfloat16>)
+          : run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 1, 16,
+                                                       __hip_bfloat16>);
+    } else {
+      even_group ? run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 2, 8>)
+                 : run(fa_rdna2_prefill_paged_varlen_gqa_impl<128, 1, 16>);
+    }
   } else {
-    even_group ? run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 2, 8>)
-               : run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 1, 16>);
+    if (bf16 && group_of_four) {
+      run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 4, 4, __hip_bfloat16>);
+    } else if (bf16) {
+      even_group
+          ? run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 2, 8,
+                                                       __hip_bfloat16>)
+          : run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 1, 16,
+                                                       __hip_bfloat16>);
+    } else {
+      even_group ? run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 2, 8>)
+                 : run(fa_rdna2_prefill_paged_varlen_gqa_impl<256, 1, 16>);
+    }
   }
 }
 

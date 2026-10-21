@@ -4,8 +4,9 @@
 
 Thin wrappers over the ``torch.ops._rocm_C.fa_rdna2_*`` ops built from
 ``csrc/rocm/fa_rdna2.cu``. Each op writes the attention output into ``out``
-([num_tokens, H_q, D] fp16, contiguous); when ``out`` is omitted a new tensor
-is allocated. ``scale`` defaults to ``D ** -0.5``.
+([num_tokens, H_q, D], contiguous); when ``out`` is omitted a new tensor
+with Q's dtype is allocated. The GQA prefill op accepts FP16 or BF16 Q/KV/O;
+the other ops remain FP16. ``scale`` defaults to ``D ** -0.5``.
 
 Usage:
     from vllm.v1.attention.ops import fa_rdna2_backend as fa
@@ -215,9 +216,10 @@ def fa_rdna2_prefill_paged_varlen_gqa(
 ) -> torch.Tensor:
     """Varlen prefill (HEAD_DIM 128/256) with O and the softmax in registers.
 
-    A CTA takes 16 query rows: 8 rows of 2 q-heads of one GQA group for even
-    group sizes, 16 rows of one q-head otherwise. Arguments and return value
-    as fa_rdna2_prefill_paged_varlen.
+    A CTA takes 16 query rows. BF16 groups divisible by four use four heads
+    and four query positions per CTA; FP16 uses two heads and eight positions
+    for even groups, or one head and 16 positions for odd groups. BF16 Q/KV/O
+    and non-causal symmetric sliding windows are supported.
     """
     scale, out = _prepare(Q, scale, out)
     torch.ops._rocm_C.fa_rdna2_prefill_paged_varlen_gqa(

@@ -16,7 +16,7 @@
 >   bash tools/rdna/serve_rdna.sh RECIPE=flashnext-mtp2
 > ```
 >
-> - Recipes: [`tools/rdna/recipes/`](tools/rdna/recipes/) (`flashnext`, `flashnext-mtp0`, `flashnext-mtp2`, `flashnext-pp3`, `flashnext-pp3-mtp2`, `27b-awq`, `27b-exl3`, `dsv4-flash`, `full`)
+> - Recipes: [`tools/rdna/recipes/`](tools/rdna/recipes/) (`flashnext`, `flashnext-mtp0`, `flashnext-mtp2`, `flashnext-dflash2`, `flashnext-pp3`, `flashnext-pp3-mtp2`, `27b-awq`, `27b-exl3`, `dsv4-flash`, `full`)
 > - Dry-run: `PRINT=1 bash tools/rdna/serve_rdna.sh RECIPE=<name>`
 > - Extra vLLM flags: `EXTRA_ARGS='...'` (for example `EXTRA_ARGS=--monokernel`)
 > - Wiki (host venv, troubleshooting, privacy-safe recipes): https://blivioniag.github.io/gfx1030-wiki/
