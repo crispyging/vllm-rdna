@@ -462,7 +462,7 @@ accumulate, not the scalar-FMA fallback the shipped format lands on.
 | --- | --- | --- | --- | --- |
 | H1 | Block-granular scales with a packed zero-point beat the shipped per-row scale on real KV | capture real K/V activations from a V620 decode run, run the reference codec over them, and score **attention output error**, not round-trip SNR | attention output error improves against `int4_per_token_head`, and the packed-zero-point variant is within 0.5 dB of the variant that spends its own 4 bits on the zero-point | stop: the format is not worth a new dtype, keep the shipped one |
 | H2 | Dequantising to FP16 puts the dot on `v_dot2_f32_f16` instead of the scalar FMA path | A/B the decode kernel on the V620, FP16 operands against FP32 operands | decode tok/s at c=1 improves, prefill within noise | keep FP16 for the memory and accuracy, drop the speed claim |
-| H3 | The format lands in the RDNA2 backend at all | revive the legacy INT8 FA-RDNA2 dispatch (`3baecdb516`, see *Prior work*), then swap the format inside it | a decode run completes with the new dtype and the cache size matches the byte-budget arithmetic | stop: the Triton path is the only viable target and the design must be re-scoped for it |
+| H3 | The format lands in the RDNA2 backend at all | revive the INT8 FA-RDNA2 dispatch (see *The INT8 backport*), then swap the format inside it | a decode run completes with the new dtype and the cache size matches the byte-budget arithmetic | stop: the Triton path is the only viable target and the design must be re-scoped for it |
 | H4 | An FP16 block scale does not need a global scale | replay the H1 capture with the global on and off | SNR identical to within 0.01 dB | the global becomes mandatory and the format needs a per-tensor side buffer, which is a much larger change |
 | H5 | The zero-point really is free | compare the packed variant against the variant that spends 0.125 bits/value on its own zero-point, on captured activations | within 0.5 dB | store the zero-point separately and pay 0.125 bits/value for it |
 
@@ -486,6 +486,64 @@ The Triton backend already lists `int4_per_token_head`
 question: whether the RDNA2 backend is the target, or whether the Triton path
 is.
 
+## The INT8 backport: what it actually costs
+
+"Classic INT8 KV support" means reviving the INT8 FA-RDNA2 path that was
+built in the `humanwork-legacy` tree and never landed. The port was mapped
+against this tree, and the headline is better than expected: **the HIP
+kernels are already here.** `origin/rdna_extras` carries
+`fa_prefill_paged_varlen_int8`, `fa_rdna2_decode_paged_int8`,
+`reshape_and_cache_int8_rdna2` and the `int8` split-K prefill kernels with
+byte-identical C++ signatures. The port is Python and binding wiring, not
+kernel work.
+
+What is missing, and what is wrong:
+
+1. **The ops are not registered.** `fa_rdna2_prefill_paged_varlen_int8` and
+   `fa_rdna2_decode_paged_int8` are not in `csrc/rocm/torch_bindings.cpp`.
+   Only the writer is, and its comment says why. The legacy tree reached the
+   kernels through a `load_inline` JIT build; this tree loads them through
+   `torch.ops._rocm_C`, so the registration and the
+   `vllm/v1/attention/ops/fa_rdna2_backend.py` shim both have to change.
+2. **The writer has a real defect, and it is in this tree already.**
+   `csrc/rocm/fa_rdna2.cu:4628` writes the four bytes of a slot's FP32 scale
+   at `HEAD_DIM * block_size + slot_in_block + d`. With the declared
+   `[num_blocks, H_kv, HEAD_DIM+4, block_size]` layout and
+   `stride_d = block_size`, that address is *not* `(HEAD_DIM + d) *
+   block_size + slot_in_block`. Two consequences: slot `s`'s byte `d` lands
+   on slot `s+d`'s byte 0, so the four bytes of one slot are spread across
+   four slots and race with them; and the scale planes `HEAD_DIM+1 ..
+   HEAD_DIM+3` are **never written at all**. The correct offset is
+   `(HEAD_DIM + d) * block_size + slot_in_block`.
+3. **The legacy Python reader is not the inverse of the writer.** It does
+   `kv_cache[0, :, :, hs:hs+4, :].view(torch.float32)`, which reinterprets
+   the *slot* dimension as bytes, not the byte dimension. Even with the
+   writer fixed, the legacy split does not recover the scales.
+4. **The scale index convention differs three ways.** The kernels index the
+   scale by *logical sequence position*; the legacy Python produced
+   *physical* `(block, slot)`; the canonical Triton layout in this tree is
+   *physical* `(block, slot, head)`. A port has to pick one and make the
+   writer, the reader and the cache spec agree.
+5. **The legacy end-to-end evidence is a throughput number.**
+   `.omo/plans/rdna2-int8-isa-benchmark/e2e-int8-bench.log` reports 2.93
+   output tok/s against a 2.91 tok/s FP16 baseline at 5.89 GiB of KV cache.
+   That measurement cannot distinguish a correct scale from a corrupted one,
+   and no test in the legacy tree exercises the writer-to-reader path. So
+   the legacy path's *numerical* correctness was never established, and the
+   port has to be treated as new work with a new correctness test, not as a
+   re-application of something that worked.
+6. Smaller items the port has to handle: the int8 ops return a `Tensor`
+   while every other `fa_rdna2` op writes into `out`; the writer takes an
+   int32 `slot_mapping` where vLLM passes int64; `csrc/rocm/ops.h`
+   declares `reshape_and_cache_int8_rdna2` twice; and the int8 work is a
+   seven-commit chain, not one commit.
+
+The practical conclusion: reviving INT8 support is a **Python-and-wiring
+job of maybe a day, plus a kernel fix and a correctness test that never
+existed**. That is the cheapest path to a quantised KV cache in the RDNA2
+backend, and it is the host this proposal assumes for H3 - but it should be
+landed and measured on its own before this format rides on it.
+
 ## Prior work, and why this is not a duplicate
 
 Two things already exist in this area and neither is superseded by this
@@ -507,16 +565,14 @@ document:
   `RdnaAttentionBackend._can_run_fa_rdna2` rejects every quantised KV dtype
   (`vllm/v1/attention/backends/rdna_attn.py:281`).
 
-  That work is this proposal's most likely *host*. H3 assumes the INT8
-  dispatch is revived first and this format is swapped inside it, because the
-  alternative - a Triton-only implementation - cannot use `v_dot2_f32_f16` at
-  all and would leave the arithmetic on the scalar-FMA path that this
-  document set out to escape.
-
-  It is also this proposal's clearest benchmark: the INT8 path's own
-  measurements are in `.omo/plans/rdna2-int8-isa-benchmark/` on the parent
-  project (2.93 output tok/s at 5.89 GiB of KV cache, against a 2.91 tok/s
-  FP16 baseline).
+  That work is this proposal's most likely *host*, and the port is mapped in
+  *The INT8 backport* above. It is also this proposal's clearest benchmark:
+  the INT8 path's own measurements are in
+  `.omo/plans/rdna2-int8-isa-benchmark/` on the parent project (2.93 output
+  tok/s at 5.89 GiB of KV cache, against a 2.91 tok/s FP16 baseline), and
+  the ISA study in `isa-report.md` is where the gfx1030 dequant patterns
+  come from - the packed-dword load, the sign-extend, the scale multiply
+  and the FP16 convert that the v3 variant beats every other on.
 
 ## What this PR contains
 
