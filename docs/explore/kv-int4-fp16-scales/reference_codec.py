@@ -555,6 +555,72 @@ def quantize_int4_fp16_block_packed(
 
 
 # ---------------------------------------------------------------------------
+# Scheme G: fp8_e4m3 (what the fork already ships and has measured)
+# ---------------------------------------------------------------------------
+
+
+def quantize_fp8_e4m3_per_tensor(
+    rows: Sequence[Sequence[float]],
+) -> TensorResult:
+    """Quantize rows with FP8 e4m3 elements and one per-tensor scale.
+
+    This is what ``--kv-cache-dtype fp8`` does, and it is the only KV cache
+    dtype with a measurement on the V620.
+
+    Args:
+        rows: The rows to quantize.
+
+    Returns:
+        The round-trip result.
+
+    """
+    amax = max((abs(value) for row in rows for value in row), default=0.0)
+    global_scale = max(amax / E4M3_MAX, 1e-6)
+    reconstructed: list[list[float]] = []
+    for row in rows:
+        out: list[float] = []
+        for value in row:
+            code = e4m3_encode(value / global_scale)
+            out.append(e4m3_decode(code) * global_scale)
+        reconstructed.append(out)
+    return TensorResult(reconstructed, [[global_scale]])
+
+
+def quantize_fp8_e4m3_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+) -> TensorResult:
+    """Quantize rows with FP8 e4m3 elements and one E4M3 scale per block.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+
+    Returns:
+        The round-trip result.
+
+    """
+    reconstructed: list[list[float]] = []
+    scales: list[list[float]] = []
+    underflowed = 0
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[float] = []
+        for _, block in _blocks(row, k):
+            amax = max(abs(value) for value in block)
+            scale = max(amax / E4M3_MAX, 1e-6)
+            stored = e4m3_decode(e4m3_encode(scale))
+            if not e4m3_is_normal(stored):
+                underflowed += 1
+            row_scales.append(stored)
+            for value in block:
+                out.append(e4m3_decode(e4m3_encode(value / stored)) * stored)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales, underflowed_blocks=underflowed)
+
+
+# ---------------------------------------------------------------------------
 # Scheme F: int8 baselines (MXINT8 and friends)
 # ---------------------------------------------------------------------------
 
@@ -1161,6 +1227,18 @@ def run_comparison(
             lambda r: quantize_int8_fp16_block(r, k=32),
             bits_per_value(8, 16, 32),
             "symmetric INT8, one FP16 scale per 32 values",
+        ),
+        measure(
+            "fp8_e4m3 per-tensor (shipped, measured)",
+            quantize_fp8_e4m3_per_tensor,
+            bits_per_value(8, 0, 1),
+            "FP8 e4m3 elements, one per-tensor scale: --kv-cache-dtype fp8",
+        ),
+        measure(
+            "fp8_e4m3 k=32 block scale",
+            lambda r: quantize_fp8_e4m3_block(r, k=32),
+            bits_per_value(8, 8, 32),
+            "FP8 e4m3 elements, one E4M3 scale per 32 values",
         ),
         measure(
             "nvfp4 (E2M1 + E4M3/16)",

@@ -80,6 +80,7 @@ needs no GPU, only the dumps from Step 1.
 | `int4_e4m3_block` k=16, no global | | | | 4.500 |
 | `int4_e8m0_block` k=32, round-up | | | | 4.250 |
 | `int4_e8m0_block` k=32, OCP floor | | | | 4.250 |
+| FP8 e4m3, per-tensor scale | | | | 8.000 |
 | `int8_e8m0_block` k=32 | | | | 8.250 |
 
 Acceptance for H1: the `k=32` packed row beats the shipped row by at least
@@ -172,6 +173,20 @@ perplexity number on the pruned DeepSeek-V4 checkpoint.
 | A (fp16) | | - | baseline |
 | B (`int4_per_token_head`) | | | |
 | C (`int4_fp16_block` k=32, packed zp) | | | |
+| D (`fp8`, per-tensor e4m3) | | | shipped today; the 8-bit reference point |
+
+Arm D is not optional. FP8 KV is the only KV cache dtype with a V620
+measurement (about 2x the memory saved, +0.1 PPL), and it is the reference
+that says what a dB of SNR is worth in perplexity. With arms D and C the
+capture has two points on the SNR-to-PPL curve instead of one, which is the
+only way to tell whether the 12.67 dB between FP8 and the proposal is worth
+the 1.78x memory.
+
+Without arm D the only measured KV data point in the fork sits at 32.968 dB
+synthetic SNR and +0.1 PPL, and the proposal's 20.302 dB has to be
+extrapolated from it with no second point. That extrapolation is not
+available, because the table's own FP8 row shows the SNR ordering and the
+PPL ordering do not have to agree.
 
 ## Records
 
