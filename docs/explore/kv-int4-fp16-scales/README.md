@@ -76,7 +76,7 @@ than it costs:
 
 The reference codec measures both halves. At `k=32`:
 
-| Variant | SNR dB (outliers) | SNR dB (clean) | bits/value |
+| Variant | SNR dB (K-side) | SNR dB (no outliers) | bits/value |
 | --- | --- | --- | --- |
 | symmetric FP16 scale, no zero-point | 18.326 | 20.341 | 4.500 |
 | asymmetric, zero-point in its own 4 bits | 20.341 | 21.867 | 4.625 |
@@ -109,10 +109,10 @@ modelled at its most favourable value, the tensor maximum:
 
 | | FP16 block scale | E4M3 block scale |
 | --- | --- | --- |
-| SNR, no global (outlier rows) | 18.326 dB | 19.984 dB |
-| SNR, with a global (outlier rows) | 18.326 dB | 20.043 dB |
-| SNR, no global (clean rows) | 20.341 dB | 21.331 dB |
-| SNR, with a global (clean rows) | 20.341 dB | 21.369 dB |
+| SNR, no global (K-side) | 18.326 dB | 19.984 dB |
+| SNR, with a global (K-side) | 18.326 dB | 20.043 dB |
+| SNR, no global (no outliers) | 20.341 dB | 21.331 dB |
+| SNR, with a global (no outliers) | 20.341 dB | 21.369 dB |
 | Blocks whose stored scale went subnormal, of 512 (with a global) | 0 | 15 |
 
 So for an FP16 block scale the global scale **buys nothing**: the SNR is the
@@ -136,66 +136,173 @@ calibrate against, and a single FP16 block scale has the range to not need it.
 
 `reference_codec.py` in this directory implements all of the above in pure
 Python and prints the table below. The numbers are arithmetic on synthetic
-rows - 64 rows of `N(0, 0.5)`, `head_size=128`, with two channels scaled 40x
-in the first case. **They are not V620 measurements.**
+rows - 64 rows of `N(0, 0.5)`, `head_size=128`. **They are not V620
+measurements.**
 
-| Scheme | SNR dB (outliers) | SNR dB (clean) | bits/value |
+The harness runs every scheme against two outlier modes, because the two
+tensors behave differently and the difference decides the design:
+
+- **K-side** - two *channels* of every row are scaled 40x. This is KIVI's
+  observation about K: a few channels carry much larger values, consistently
+  across tokens.
+- **V-side** - two whole *tokens* are scaled 40x. This is KIVI's observation
+  about V: whole tokens occasionally carry much larger values.
+
+| Scheme | K-side dB | V-side dB | bits/value |
 | --- | --- | --- | --- |
 | `int4_per_token_head` (shipped) | 14.570 | 20.035 | 4.250 |
 | `int4_fp16_block` k=64, symmetric | 15.475 | 19.495 | 4.250 |
-| **`int4_fp16_block` k=64, packed zp** | **17.429** | **20.881** | **4.250** |
-| `int4_e8m0_block` k=32 | 16.938 | 16.902 | 4.250 |
-| `int4_e4m3_block` k=32 | 18.158 | 20.276 | 4.250 |
+| **`int4_fp16_block` k=64, packed zp** | **17.429** | **20.882** | **4.250** |
+| `int4_e8m0_block` k=32 | 16.938 | 16.934 | 4.250 |
+| `int4_e4m3_block` k=32 | 18.158 | 20.273 | 4.250 |
 | `int4_fp16_block` k=32, symmetric | 18.326 | 20.341 | 4.500 |
-| `int4_e8m0_block` k=16 | 18.281 | 17.780 | 4.500 |
+| `int4_e8m0_block` k=16 | 18.281 | 17.800 | 4.500 |
 | `int4_e4m3_block` k=16 | 19.984 | 21.331 | 4.500 |
-| **`int4_fp16_block` k=32, packed zp (proposal)** | **20.302** | **21.815** | **4.500** |
+| **`int4_fp16_block` k=32, packed zp (proposal)** | **20.302** | **21.814** | **4.500** |
+| `int4_fp16_block` k=32, token-axis groups | **21.778** | 4.829 | 4.500 |
 | `int4_fp16_block` k=32, asymmetric, separate zp | 20.341 | 21.867 | 4.625 |
+| `int4_fp32_block` k=32, packed zp | 20.342 | 21.867 | 5.000 |
+| NVFP4 (E2M1 + E4M3/16 + global) | 21.724 | 20.334 | 4.500 |
 | `int4_fp16_block` k=16, symmetric | 20.322 | 21.442 | 5.000 |
-| **`int4_fp16_block` k=16, packed zp** | **22.694** | **23.238** | **5.000** |
-| `int4_e4m3_block` k=16 + global | 20.043 | 21.369 | 4.500 |
-| NVFP4 (E2M1 + E4M3/16 + global) | 21.724 | 20.472 | 4.500 |
-| FP8 e4m3, per-tensor scale (shipped, measured) | 32.968 | 31.646 | 8.000 |
-| `int8_e8m0_block` k=32 (MXINT8) | 36.587 | 41.940 | 8.250 |
+| **`int4_fp16_block` k=16, packed zp** | **22.694** | **23.237** | **5.000** |
+| FP8 e4m3, per-tensor scale (shipped, measured) | 32.968 | 31.569 | 8.000 |
+| `int8_e8m0_block` k=32 (MXINT8) | 36.587 | 41.913 | 8.250 |
+| `int8_e4m3_block` k=32 | 35.952 | 35.304 | 8.250 |
 | `int8_fp16_block` k=32 | 39.475 | 45.594 | 8.500 |
+| `int8_fp32_block` k=32 | 39.476 | 45.593 | 9.000 |
 
 Reading it:
 
-- **The proposal beats the shipped format by 5.73 dB on outlier-heavy rows**
-  and 1.78 dB on clean rows, for 5.9 % more memory (4.500 vs 4.250
-  bits/value). It is a replacement candidate for `int4_per_token_head` on
-  RDNA2, not an additional dtype. The shipped format's zero-point is hidden
-  in the low mantissa bits of its FP32 scale, so it costs no extra bytes and
-  its true cost is 4.250.
+- **The proposal beats the shipped format by 5.73 dB on the K side** and
+  1.78 dB on the V side, for 5.9 % more memory (4.500 vs 4.250 bits/value).
+  It is a replacement candidate for `int4_per_token_head` on RDNA2, not an
+  additional dtype. The shipped format's zero-point is hidden in the low
+  mantissa bits of its FP32 scale, so it costs no extra bytes and its true
+  cost is 4.250.
+- **The shipped format is 5.5 dB weaker on K than on V**, and that is exactly
+  the channel-outlier failure: one row-level scale, one loud channel. The
+  proposal is nearly symmetric (20.302 vs 21.814), which is what a block
+  scale is supposed to buy.
 - **At the same 4.500 bits/value, the proposal beats every one-byte scale.**
-  Against `int4_e4m3_block` k=16 it is +0.32 dB (outliers) and +0.48 dB
-  (clean); against `int4_e8m0_block` k=16, +2.02 dB and +4.04 dB.
+  Against `int4_e4m3_block` k=16 it is +0.32 dB (K) and +0.48 dB (V);
+  against `int4_e8m0_block` k=16, +2.02 dB and +4.01 dB.
 - **`k=64` with a packed zero-point costs exactly what ships today**
-  (4.250 bits/value) and buys +2.86 dB on outlier rows and +0.85 dB on clean
-  rows over the shipped format. Only `int4_e4m3_block` k=32 beats it there,
-  and only on outlier rows.
-- **NVFP4's own element format beats the proposal on outlier rows** (21.724 vs
+  (4.250 bits/value) and buys +2.86 dB on the K side and +0.85 dB on the V
+  side over the shipped format.
+- **NVFP4's own element format beats the proposal on the K side** (21.724 vs
   20.302 dB at the same 4.5 bits/value): E2M1's non-uniform levels - 0.5, 1,
   1.5, 2, 3, 4, 6 - spend their precision near zero, which is where a
-  zero-centred activation distribution lives. On clean rows the ordering
-  reverses and the proposal is ahead of NVFP4 (21.815 vs 20.472 dB). Whether
+  zero-centred activation distribution lives. On the V side the ordering
+  reverses and the proposal is ahead of NVFP4 (21.814 vs 20.334 dB). Whether
   the element type should be INT4 or E2M1 is therefore an open question, not
   a settled one.
 - **Below 8 bits/value the proposal is the best format in the table**, and
   above it FP8 already wins - see *Why INT8 is not the answer at this budget*.
 
+### Grouping: the axis matters more than the scale format
+
+There are two axes a scale can be shared along, and the table above measures
+both:
+
+- **Head-dimension grouping** (what the proposal uses): one scale per `k`
+  contiguous values inside one token's row. The scale count per token per head
+  is `head_size / k`.
+- **Token-axis grouping** (KIVI's axis): one scale per `k` tokens inside one
+  channel. The scale count per token per head is also `head_size / k`.
+
+**They cost the same memory.** What differs is which outliers they isolate,
+and the crossover is sharp:
+
+| Grouping | K-side dB | V-side dB |
+| --- | --- | --- |
+| head-dimension, `k=32`, packed zp | 20.302 | 21.814 |
+| token-axis, `k=32` tokens | **21.778** | 4.829 |
+
+Token-axis grouping is **1.48 dB better on K** and **catastrophic on V**. The
+reason is mechanical: a token outlier scales a whole row by 40x, and in
+token-axis grouping that one token's values set the scale shared with the
+other 31 tokens in its group, so they are crushed to zero. Head-dimension
+grouping gives every token its own scale and is immune.
+
+KIVI's observation therefore maps onto the measurement exactly: **K wants the
+token axis, V wants the head-dimension axis**, and the same scale layout
+cannot serve both.
+
+The proposal keeps head-dimension grouping for both anyway, for a reason that
+is not about accuracy: **a token-axis scale spans `k` tokens, so it cannot be
+finalised until all `k` of them have been written.** A paged KV cache with
+chunked prefill can land a chunk boundary inside a page, so the scale would
+have to be recomputed after the fact and the already-quantised data
+re-quantised - and the original FP16 values are gone by then. Head-dimension
+grouping has no such problem: a token's row is complete the moment it is
+written. That is why every per-token-head format upstream is
+head-dimension granular, and it is why 1.48 dB is left on the table.
+
+Making the K side use the token axis is therefore a real option, but it is a
+*cache-management* change, not a kernel change: the group must not span pages,
+and the partial-page problem needs an answer. It is the most promising
+follow-up to this document, not part of this proposal.
+
+### Do we need FP32 scales?
+
+No, and the measurement is unambiguous:
+
+| Elements and layout | Scale | bits/value | K-side dB | V-side dB |
+| --- | --- | --- | --- | --- |
+| INT4 `k=32`, symmetric | FP16 | 4.500 | 18.326 | 20.341 |
+| INT4 `k=32`, symmetric | FP32 | 5.000 | 18.326 | 20.341 |
+| INT4 `k=32`, packed zp | FP16 | 4.500 | 20.302 | 21.814 |
+| INT4 `k=32`, packed zp | FP32 | 5.000 | 20.342 | 21.867 |
+| INT8 `k=32` | FP16 | 8.500 | 39.475 | 45.594 |
+| INT8 `k=32` | FP32 | 9.000 | 39.476 | 45.593 |
+
+**FP32 buys between 0.000 and 0.05 dB and costs 0.5 bits/value - 11 % more
+memory.** The shipped format's FP32 scale is not there for precision. It is
+there because an FP32 scale has 23 mantissa bits, so the 4-bit zero-point can
+hide inside them for free. A 6-bit-mantissa FP16 scale hides the same
+zero-point for 0.04 dB, at half the bytes. So the zero-point trick removes
+the only reason to prefer FP32, and **an FP32-scale variant should not be
+added**.
+
+### The INT8 family
+
+If INT8 is on the table at all, the scale format is forced:
+
+| INT8 format | bits/value | K-side dB | V-side dB | block scales subnormal (of 256) |
+| --- | --- | --- | --- | --- |
+| `int8_fp16_block` k=32 | 8.500 | **39.475** | **45.594** | 0 |
+| `int8_fp32_block` k=32 | 9.000 | 39.476 | 45.593 | 0 |
+| `int8_e8m0_block` k=32 | 8.250 | 36.587 | 41.913 | 0 |
+| `int8_e4m3_block` k=32 | 8.250 | 35.952 | 35.304 | 190 |
+
+- **INT8 + FP16 is the best INT8 format measured**, and it needs no second
+  level: FP16's exponent range is wide enough that no block scale underflows.
+- **E4M3 cannot hold an INT8 block scale.** The scale is `absmax / 127`,
+  which lands in E4M3's subnormal range for 190 of 256 blocks, and the SNR
+  falls off a cliff on the V side (35.304 dB). This is the same narrow-range
+  problem that forces NVFP4's global scale, and it is worse for INT8 than for
+  INT4 because the scale itself is smaller.
+- **E8M0 costs 2.9 to 3.7 dB against FP16** for 3 % less memory, for the
+  same power-of-two reason as at 4 bits.
+- **FP32 is again pointless**: 0.001 dB for 0.5 bits/value.
+
+And then the budget question decides whether any of this is worth building -
+see the next section.
+
 ## What we lose
 
 The honest trade, at the same memory budget. "Loss" is measured against the
-proposal at `k=32`, 4.500 bits/value, 20.302 dB on outlier rows:
+proposal at `k=32`, 4.500 bits/value, 20.302 dB on the K side and 21.814 dB
+on the V side:
 
 | Against | We lose | We gain |
 | --- | --- | --- |
-| FP8 e4m3 per-tensor (8.000 bits/value) | 12.67 dB on outlier rows, 9.83 dB on clean rows | 1.78x the context length at a fixed budget |
-| INT8 + E8M0 (MXINT8, 8.250 bits/value) | 16.29 dB on outlier rows, 20.13 dB on clean rows | 1.83x the context length at a fixed budget |
+| FP8 e4m3 per-tensor (8.000 bits/value) | 12.67 dB on the K side, 9.75 dB on the V side | 1.78x the context length at a fixed budget |
+| INT8 + E8M0 (MXINT8, 8.250 bits/value) | 16.29 dB on the K side, 20.10 dB on the V side | 1.83x the context length at a fixed budget |
 | INT8 + FP16 (8.500 bits/value) | 19.17 dB / 23.78 dB | 1.89x the context length at a fixed budget |
 | E4M3 scale at the same 4.500 bits/value | 0.32 dB / 0.48 dB | no scale conversion on the read path, 10 mantissa bits, no subnormal risk |
-| E8M0 scale at the same 4.500 bits/value | 2.02 dB / 4.04 dB | no global scale ever needed, one byte per block |
+| E8M0 scale at the same 4.500 bits/value | 2.02 dB / 4.01 dB | no global scale ever needed, one byte per block |
+| Token-axis grouping instead of head-dimension, on the K side | nothing on the K side, **17.0 dB on the V side** | 1.48 dB on the K side |
 
 Two further costs that do not show up in an SNR table:
 
@@ -287,7 +394,7 @@ That is the reason E8M0 is not the proposal here:
 - **E4M3 is the same one byte and strictly better.** E4M3 has 3 mantissa
   bits, so its step is essentially exact; E8M0 has none. At 4.500
   bits/value, E4M3 k=16 scores 19.984 dB against E8M0's 18.281 dB on
-  outlier rows, with the same byte count. E8M0's only advantages over E4M3
+  K-side rows, with the same byte count. E8M0's only advantages over E4M3
   are the wider exponent range (so no global scale) and the cheaper read
   path.
 - **E8M0's power-of-two-ness cannot be repaired by a second level.** A
@@ -439,7 +546,7 @@ python3 docs/explore/kv-int4-fp16-scales/reference_codec.py
 
 The script runs its own self-check first (FP16, E4M3 and E8M0 round-trip,
 INT4 packing, the zero-point packing, and the scale-format invariants) and
-prints the two tables above.
+prints the three tables above.
 
 ## AI assistance
 
