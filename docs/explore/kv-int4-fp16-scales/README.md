@@ -5,12 +5,13 @@ implementation. No dtype is added, no backend changes, nothing changes by
 default. The kernels, the backend hook and the measurement on the V620 are all
 still to be written.
 
-The question this document answers: *if the fork wants a 4-bit KV cache on
-gfx1030, what should the scale format be?* The short version is that the
-scale format the fork already ships is the wrong granularity, that NVFP4's
-narrow block scale is a Blackwell constraint rather than an accuracy optimum,
-and that the second (global) level NVFP4 carries buys nothing for activation
-data, so it can be dropped.
+The question this document answers: *if the fork wants its own 4-bit KV cache
+on gfx1030, what should the format be, and what does it cost?* The short
+version: the scale format the fork already ships has the wrong granularity and
+the wrong arithmetic path; the zero-point can be carried inside the scale for
+free; a one-byte scale (E8M0 or E4M3) is not the accuracy optimum at the
+memory budget that matters; and the second (global) level NVFP4 carries buys
+nothing for activation data, so it can be dropped.
 
 ## The question
 
@@ -18,14 +19,13 @@ data, so it can be dropped.
 (`vllm/config/cache.py:53`). It is the only 4-bit KV cache dtype here, and on
 gfx1030 it is the wrong shape for two independent reasons.
 
-**Its granularity is a whole head row.** The scale is
-`(max - min) / 15` over all `head_size` values of a row, with a 4-bit
-zero-point hidden in the low mantissa bits of the FP32 scale
-(`vllm/v1/attention/ops/int4_per_token_head.py:158`, write side; `:550`, read
-side). One channel with a large magnitude therefore sets the step size for
-every other channel in the row. The reference codec measures the cost of that
-on synthetic rows with two channels scaled 40x: **14.57 dB**, against
-**20.03 dB** for the same rows without outliers.
+**Its granularity is a whole head row.** The scale is `(max - min) / 15` over
+all `head_size` values of a row, with a 4-bit zero-point hidden in the low
+mantissa bits of the FP32 scale (`vllm/v1/attention/ops/int4_per_token_head.py:158`,
+write side; `:550`, read side). One channel with a large magnitude therefore
+sets the step size for every other channel in the row. The reference codec
+measures the cost of that on synthetic rows with two channels scaled 40x:
+**14.570 dB**, against **20.035 dB** for the same rows without outliers.
 
 **Its dequant lands on the wrong hardware path.** The cached values are
 unpacked to FP32 and multiplied against an FP32 query
@@ -38,26 +38,57 @@ only for deployments this fork does not target.
 
 ## The proposal
 
-A new KV dtype, `int4_fp16_block`:
+A new KV dtype, `int4_fp16_block`, asymmetric, with the zero-point carried
+inside the scale:
 
 | Field | Value |
 | --- | --- |
-| Element | INT4, signed two's complement, symmetric (no zero point) |
+| Element | INT4, unsigned, `q` in `[0, 15]` |
 | Packing | 2 elements per byte, low nibble first (same as `int4_per_token_head`) |
 | Block scale | FP16 (E5M10), one per `k` values along the head dimension |
+| Zero-point | 4 bits, packed into the low 4 bits of the scale's mantissa |
 | Global scale | none (see *Two levels* below) |
 | Bits/value | `4 + 16/k`; at `k=32` that is **4.500** |
-| Dequant | `x_hat = q * scale`, in FP16 |
+| Dequant | `x_hat = (q - zp) * scale`, in FP16 |
 
-The scale cache would be `[num_blocks, block_size, num_kv_heads,
-head_size/k]` FP16, mirroring the shape of the existing
+The scale cache would be `[num_blocks, block_size, num_kv_heads, head_size/k]`
+FP16, mirroring the shape of the existing
 `[num_blocks, block_size, num_kv_heads]` FP32 scale cache
 (`vllm/v1/attention/backends/triton_attn.py:405`, `_ensure_scale_caches`).
 
 `k=32` is the proposal's baseline because it is the granularity KIVI measured
-as best for the value tensor, and because it costs exactly the same
-4.5 bits/value as NVFP4 while giving the scale 10 mantissa bits instead of
-E4M3's 3.
+as best for the value tensor, because it costs exactly the same 4.5 bits/value
+as NVFP4, and because it is the block size the MX family standardised on.
+
+### The zero-point is free
+
+The shipped format already hides a 4-bit zero-point in the low mantissa bits of
+its FP32 scale. The same trick works with an FP16 scale, and it is worth more
+than it costs:
+
+- An FP16 scale has 10 mantissa bits. Stealing the low 4 leaves 6 bits of
+  mantissa for the scale itself, so the scale carries up to 1.5 % relative
+  error. That is well below the INT4 quantisation error and costs about half a
+  dB.
+- In exchange the block gets **16 codes instead of 8**, because the
+  quantiser is asymmetric: `q = round(x / scale) + zp` spans the block's
+  `[min, max]` rather than `[-absmax, +absmax]`.
+
+The reference codec measures both halves. At `k=32`:
+
+| Variant | SNR dB (outliers) | SNR dB (clean) | bits/value |
+| --- | --- | --- | --- |
+| symmetric FP16 scale, no zero-point | 18.326 | 20.341 | 4.500 |
+| asymmetric, zero-point in its own 4 bits | 20.341 | 21.867 | 4.625 |
+| **asymmetric, zero-point packed in the scale** | **20.302** | **21.815** | **4.500** |
+
+The packed variant gives up 0.04 dB against the version that spends its own
+0.125 bits/value on the zero-point, and gives up nothing else. **The
+zero-point is free**, and the block gets its second level of range for it.
+
+The scale is snapped *up* onto the 6-bit-mantissa grid before use, so the
+block's range always fits in 16 codes and nothing saturates: the reference
+codec counts 0 clipped elements in 512 blocks.
 
 ### Two levels
 
@@ -111,45 +142,173 @@ in the first case. **They are not V620 measurements.**
 | Scheme | SNR dB (outliers) | SNR dB (clean) | bits/value |
 | --- | --- | --- | --- |
 | `int4_per_token_head` (shipped) | 14.570 | 20.035 | 4.250 |
-| `int4_fp16_block` k=64 | 15.475 | 19.495 | 4.250 |
-| **`int4_fp16_block` k=32 (proposal)** | **18.326** | **20.341** | **4.500** |
-| `int4_fp16_block` k=16 | 20.322 | 21.442 | 5.000 |
-| `int4_fp16_block` k=32, asymmetric | 20.341 | 21.867 | 4.625 |
-| `int4_fp16_block` k=32 + global | 18.326 | 20.341 | 4.500 |
-| `int4_e4m3_block` k=16, no global | 19.984 | 21.331 | 4.500 |
+| `int4_fp16_block` k=64, symmetric | 15.475 | 19.495 | 4.250 |
+| **`int4_fp16_block` k=64, packed zp** | **17.429** | **20.881** | **4.250** |
+| `int4_e8m0_block` k=32 | 16.938 | 16.902 | 4.250 |
+| `int4_e4m3_block` k=32 | 18.158 | 20.276 | 4.250 |
+| `int4_fp16_block` k=32, symmetric | 18.326 | 20.341 | 4.500 |
+| `int4_e8m0_block` k=16 | 18.281 | 17.780 | 4.500 |
+| `int4_e4m3_block` k=16 | 19.984 | 21.331 | 4.500 |
+| **`int4_fp16_block` k=32, packed zp (proposal)** | **20.302** | **21.815** | **4.500** |
+| `int4_fp16_block` k=32, asymmetric, separate zp | 20.341 | 21.867 | 4.625 |
+| `int4_fp16_block` k=16, symmetric | 20.322 | 21.442 | 5.000 |
+| **`int4_fp16_block` k=16, packed zp** | **22.694** | **23.238** | **5.000** |
 | `int4_e4m3_block` k=16 + global | 20.043 | 21.369 | 4.500 |
 | NVFP4 (E2M1 + E4M3/16 + global) | 21.724 | 20.472 | 4.500 |
+| `int8_e8m0_block` k=32 (MXINT8) | 36.587 | 41.940 | 8.250 |
+| `int8_fp16_block` k=32 | 39.475 | 45.594 | 8.500 |
 
 Reading it:
 
-- **The proposal beats the shipped format by 3.76 dB on outlier-heavy rows**
-  for 5.9 % more memory (4.500 vs 4.250 bits/value). It is a replacement
-  candidate for `int4_per_token_head` on RDNA2, not an additional dtype.
-  The shipped format's zero-point is hidden in the low mantissa bits of its
-  FP32 scale, so it costs no extra bytes and its true cost is 4.250.
-- **`k=64` costs exactly what ships today** (4.250 bits/value) and buys
-  +0.90 dB on outlier rows, but it is 0.54 dB *worse* than the shipped
-  format on clean rows. The accuracy that block granularity buys arrives
-  sharply between `k=64` and `k=32`. `k=16` is the other end of the
-  frontier and costs 5.000 bits/value.
+- **The proposal beats the shipped format by 5.73 dB on outlier-heavy rows**
+  and 1.78 dB on clean rows, for 5.9 % more memory (4.500 vs 4.250
+  bits/value). It is a replacement candidate for `int4_per_token_head` on
+  RDNA2, not an additional dtype. The shipped format's zero-point is hidden
+  in the low mantissa bits of its FP32 scale, so it costs no extra bytes and
+  its true cost is 4.250.
+- **At the same 4.500 bits/value, the proposal beats every one-byte scale.**
+  Against `int4_e4m3_block` k=16 it is +0.32 dB (outliers) and +0.48 dB
+  (clean); against `int4_e8m0_block` k=16, +2.02 dB and +4.04 dB.
+- **`k=64` with a packed zero-point costs exactly what ships today**
+  (4.250 bits/value) and buys +2.86 dB on outlier rows and +0.85 dB on clean
+  rows over the shipped format. Only `int4_e4m3_block` k=32 beats it there,
+  and only on outlier rows.
 - **NVFP4's own element format beats the proposal on outlier rows** (21.724 vs
-  18.326 dB at the same 4.5 bits/value): E2M1's non-uniform levels - 0.5, 1,
+  20.302 dB at the same 4.5 bits/value): E2M1's non-uniform levels - 0.5, 1,
   1.5, 2, 3, 4, 6 - spend their precision near zero, which is where a
   zero-centred activation distribution lives. On clean rows the ordering
-  reverses and the proposal is ahead of NVFP4 (20.341 vs 20.472 dB). Whether
+  reverses and the proposal is ahead of NVFP4 (21.815 vs 20.472 dB). Whether
   the element type should be INT4 or E2M1 is therefore an open question, not
   a settled one.
-- **The asymmetric variant is the accuracy winner on clean rows** (21.867 dB
-  at 4.625 bits/value) but costs more memory than the proposal.
+
+## What we lose
+
+The honest trade, at the same memory budget. "Loss" is measured against the
+proposal at `k=32`, 4.500 bits/value, 20.302 dB on outlier rows:
+
+| Against | We lose | We gain |
+| --- | --- | --- |
+| INT8 + E8M0 (MXINT8, 8.250 bits/value) | 16.29 dB on outlier rows, 20.13 dB on clean rows | we use 54.5 % of the memory; the other way round, INT8 buys 1.83x the context length at a fixed budget |
+| INT8 + FP16 (8.500 bits/value) | 19.17 dB / 23.78 dB | we use 52.9 % of the memory; INT8 buys 1.89x the context length |
+| E4M3 scale at the same 4.500 bits/value | 0.32 dB / 0.48 dB | no scale conversion on the read path, 10 mantissa bits, no subnormal risk |
+| E8M0 scale at the same 4.500 bits/value | 2.02 dB / 4.04 dB | no global scale ever needed, one byte per block |
+
+Two further costs that do not show up in an SNR table:
+
+- **Arithmetic per byte goes up, not down.** INT8's proven gfx1030 pattern
+  (`v_cvt_f32_i32` -> `v_mul_f32` -> `v_cvt_f16_f32`) is about 3 ops per
+  element on 1 byte per element. INT4 is about 2.5 ops per element but on
+  0.5 byte per element, because unpacking a nibble pair costs a shift and a
+  mask. Per *byte* that is roughly twice the arithmetic. On a bandwidth-bound
+  decode that is the right trade - the V620's 896 GB/s is the limit - but on a
+  compute-bound prefill it may not be, and that is a measurement, not an
+  argument.
+- **The scale costs 2 bytes per block, not 1.** At `k=32` that is 0.25
+  bits/value more than a one-byte scale, i.e. 5.6 % more KV DRAM traffic than
+  `int4_e8m0_block` k=32 and 0.25 bits/value less than the shipped format's
+  row-level FP32 scale at `k=64`.
+
+## The E8M0 question
+
+E8M0 is the OCP MX shared scale: an unsigned biased exponent, 8 bits, no
+sign, no mantissa, no zero and no infinity. The code is the FP32 exponent
+field with bias 127, so code 0 is `2^-127`, code 254 is `2^127` and code 255
+is the one reserved NaN. It is stored as one raw byte per block, and it is
+already in the fork for MXFP8 weights and activations
+(`vllm/model_executor/layers/quantization/utils/mxfp8_utils.py`,
+`vllm/scalar_type.py:330`).
+
+It is attractive for a KV cache for three reasons: it is one byte, its
+exponent range never needs a global scale, and decoding it to FP32 is a shift
+(`code << 23`) rather than a conversion. The reference codec models both
+rounding rules:
+
+| Rule | Behaviour |
+| --- | --- |
+| OCP MX v1.0 "floor" | `shared_exp = floor(log2(amax)) - emax_elem`. The block maximum lands in `[4, 8)` and **saturates** at 7 whenever the fractional part of `log2(amax)` exceeds `log2(7/4)`. |
+| Round-up ("rceil") | The smallest power of two with `7 * scale >= amax`. Nothing saturates. This is what the fork's own MXFP8 code does (`mxfp8_utils.py:62`, `input_quant_fp8.py:249`, `per_token_group_fp8_quant.py:155`). |
+
+Measured: the floor rule clipped 17 of 256 blocks at `k=32` and 33 of 256 at
+`k=16`. The round-up rule never clips, and costs about 3 dB against an FP16
+scale of the same block size - a power-of-two scale has no mantissa, so its
+step is up to twice the ideal one.
+
+That is the reason E8M0 is not the proposal here:
+
+- **E4M3 is the same one byte and strictly better.** E4M3 has 3 mantissa
+  bits, so its step is essentially exact; E8M0 has none. At 4.500
+  bits/value, E4M3 k=16 scores 19.984 dB against E8M0's 18.281 dB on
+  outlier rows, with the same byte count. E8M0's only advantages over E4M3
+  are the wider exponent range (so no global scale) and the cheaper read
+  path.
+- **E8M0's power-of-two-ness cannot be repaired by a second level.** A
+  per-row global multiplies every block's scale by the same constant, so the
+  per-block rounding error stays in `[1, 2)`. Nor can it be repaired by
+  halving the block size: the rounding loss is scale-invariant, so a finer
+  block does not buy back what the power-of-two step costs.
+- **The floor rule's clipping is invisible to the metric.** The floor rule
+  scores *higher* SNR than the safe round-up rule (17.341 vs 16.938 dB at
+  `k=32`) while clipping 17 blocks, because row-RMS SNR barely punishes one
+  clipped element out of 32 while the round-up rule degrades every value.
+  A KV cache cannot be accepted on SNR alone: a clipped K value perturbs an
+  entire attention logit row. H1 therefore has to be measured on attention
+  output error, not on round-trip SNR.
+
+If the fork later wants a one-byte scale, E4M3 at `k=32` is the better buy
+than E8M0, and it is the one the codec already models.
+
+## How it would run on gfx1030
+
+The format is only worth having if the kernel is native. Three decisions
+follow from the hardware, and none of them are the MX defaults.
+
+**Apply the block scale per element, not per partial dot.** The MX idiom is
+to promote the block scale to the matrix-multiplication boundary and scale
+each partial accumulator. That is a tensor-core idiom, and gfx1030 has no
+matrix instruction. Here the two options cost:
+
+- per element: `head_size` packed FP16 ops per (token, head)
+- per partial dot: `(head_size/k)` blocks times `head_size` accumulator ops,
+  i.e. `head_size^2 / k`
+
+At `head_size=128, k=32` that is 128 against 512 ops; at `head_size=256,
+k=32` it is 256 against 2048. The real target is `head_size=256` (Qwen3.8-27B
+has 256-dim heads), where per-element application is 8x cheaper. The
+dequantised values are converted to FP16 in registers and fed straight into
+`v_dot2_f32_f16`, exactly like the proven INT8 pattern in
+`csrc/rocm/fa_rdna2.cu` - a packed dword load, a sign-extend, a scale
+multiply and an FP16 convert, with the dequant living in VGPRs and no
+materialised FP16 workspace.
+
+**Hoist the zero-point out of the element loop.** With `x_hat = (q - zp) * s`
+the subtraction can be taken out of the inner loop entirely:
+
+- QK side: `QK_b = s_b * (dot(Q_b, c_b) - zp_b * sum(Q_b))`. The correction
+  term uses the sum of the *query* values in the block, a per-block scalar
+  over the query rather than over the cache, so it costs one FMA per
+  (query, block) and nothing per element. This is the same correction the
+  shipped Triton kernel already applies
+  (`int4_per_token_head.py:570-572`).
+- PV side: `out_b = s_b * (dot(P_b, c_b) - zp_b * sum(P_b))`. The per-block
+  probability mass is needed anyway, because per-block value scales already
+  force a segmented PV accumulation.
+
+So the per-element work is unpack, convert and one multiply - about 2.5 ops
+per element - and the zero-point is free.
+
+**Keep the dot in FP16.** The scale is applied to the dequantised values
+before the dot, so the inner product stays `v_dot2_f32_f16` with FP32
+accumulate, not the scalar-FMA fallback the shipped format lands on.
 
 ## Hypotheses and kill criteria
 
 | # | Hypothesis | Check | Holds if | If not |
 | --- | --- | --- | --- | --- |
-| H1 | Block-granular FP16 scales beat the shipped per-row scale on real KV | capture real K/V activations from a V620 decode run, run the reference codec over them | SNR gain over `int4_per_token_head` >= 2 dB | stop: the format is not worth a new dtype, keep the shipped one |
+| H1 | Block-granular scales with a packed zero-point beat the shipped per-row scale on real KV | capture real K/V activations from a V620 decode run, run the reference codec over them, and score **attention output error**, not round-trip SNR | attention output error improves against `int4_per_token_head`, and the packed-zero-point variant is within 0.5 dB of the variant that spends its own 4 bits on the zero-point | stop: the format is not worth a new dtype, keep the shipped one |
 | H2 | Dequantising to FP16 puts the dot on `v_dot2_f32_f16` instead of the scalar FMA path | A/B the decode kernel on the V620, FP16 operands against FP32 operands | decode tok/s at c=1 improves, prefill within noise | keep FP16 for the memory and accuracy, drop the speed claim |
-| H3 | The format lands in the RDNA2 backend at all | wire `int4_fp16_block` into `RdnaAttentionBackend.supported_kv_cache_dtypes` (`vllm/v1/attention/backends/rdna_attn.py:583`, currently `["auto", "float16"]`) | a decode run completes with the new dtype and the cache size matches the byte-budget arithmetic | stop: the Triton path is the only viable target and the design must be re-scoped for it |
+| H3 | The format lands in the RDNA2 backend at all | revive the legacy INT8 FA-RDNA2 dispatch (`3baecdb516`, see *Prior work*), then swap the format inside it | a decode run completes with the new dtype and the cache size matches the byte-budget arithmetic | stop: the Triton path is the only viable target and the design must be re-scoped for it |
 | H4 | An FP16 block scale does not need a global scale | replay the H1 capture with the global on and off | SNR identical to within 0.01 dB | the global becomes mandatory and the format needs a per-tensor side buffer, which is a much larger change |
+| H5 | The zero-point really is free | compare the packed variant against the variant that spends 0.125 bits/value on its own zero-point, on captured activations | within 0.5 dB | store the zero-point separately and pay 0.125 bits/value for it |
 
 ## Where it would plug in
 
@@ -171,6 +330,38 @@ The Triton backend already lists `int4_per_token_head`
 question: whether the RDNA2 backend is the target, or whether the Triton path
 is.
 
+## Prior work, and why this is not a duplicate
+
+Two things already exist in this area and neither is superseded by this
+document:
+
+- **The shipped `int4_per_token_head`** (`vllm/v1/attention/ops/int4_per_token_head.py`).
+  This document argues for replacing it on RDNA2, not for adding a second
+  4-bit dtype beside it. Its FP32 row-level scale and FP32 dot are the two
+  things this proposal changes.
+- **A FA-RDNA2 INT8 KV cache**, drafted as
+  [PR #71](https://github.com/opengfx1030/vllm-rdna/pull/71) and implemented
+  in the `humanwork-legacy` tree at commit `3baecdb516` ("feat(rocm): fp8 +
+  int8 KV cache decode and prefill for fa_rdna2"). It is a *different* format:
+  symmetric INT8 with a per-(token, head) **FP32** scale, native INT8 prefill
+  and decode kernels in `csrc/rocm/fa_rdna2.cu`, and an INT8 writer
+  (`reshape_and_cache_int8_rdna2`). In this tree it is not reachable:
+  `fa_rdna2_prefill_paged_varlen_int8` and `fa_rdna2_decode_paged_int8` are
+  not registered in `csrc/rocm/torch_bindings.cpp`, and
+  `RdnaAttentionBackend._can_run_fa_rdna2` rejects every quantised KV dtype
+  (`vllm/v1/attention/backends/rdna_attn.py:281`).
+
+  That work is this proposal's most likely *host*. H3 assumes the INT8
+  dispatch is revived first and this format is swapped inside it, because the
+  alternative - a Triton-only implementation - cannot use `v_dot2_f32_f16` at
+  all and would leave the arithmetic on the scalar-FMA path that this
+  document set out to escape.
+
+  It is also this proposal's clearest benchmark: the INT8 path's own
+  measurements are in `.omo/plans/rdna2-int8-isa-benchmark/` on the parent
+  project (2.93 output tok/s at 5.89 GiB of KV cache, against a 2.91 tok/s
+  FP16 baseline).
+
 ## What this PR contains
 
 - `docs/explore/kv-int4-fp16-scales/README.md` - this document.
@@ -188,6 +379,8 @@ is.
   on synthetic data.
 - No element-format decision. INT4 and E2M1 are both in the table above and
   the choice is open.
+- No claim about a one-byte scale. E8M0 and E4M3 are measured and rejected
+  at the 4.500 bits/value budget, not dismissed.
 
 ## Reproducing the numbers
 
@@ -195,8 +388,9 @@ is.
 python3 docs/explore/kv-int4-fp16-scales/reference_codec.py
 ```
 
-The script runs its own self-check first (FP16 and E4M3 round-trip, INT4
-packing, and the scale-format invariants) and prints the two tables above.
+The script runs its own self-check first (FP16, E4M3 and E8M0 round-trip,
+INT4 packing, the zero-point packing, and the scale-format invariants) and
+prints the two tables above.
 
 ## AI assistance
 
