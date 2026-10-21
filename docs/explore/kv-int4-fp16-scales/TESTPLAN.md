@@ -9,19 +9,31 @@ The format under test is specified in `README.md`. The reference codec is
 
 ## What has to be true for this format to be worth building
 
-1. **H1 - accuracy.** Block-granular FP16 scales must beat the shipped
-   `int4_per_token_head` scale by a useful margin on *real* KV activations,
-   not on synthetic rows. The synthetic gap is 3.76 dB; the real gap is
-   unknown.
+1. **H1 - accuracy.** Block-granular FP16 scales with a packed zero-point
+   must beat the shipped `int4_per_token_head` scale on *real* KV activations,
+   not on synthetic rows, and it must be measured on **attention output
+   error**, not on round-trip SNR. The synthetic gap is 5.73 dB on
+   outlier-heavy rows and 1.78 dB on clean rows; the real gap is unknown.
+   SNR alone is not an acceptable metric here: the OCP E8M0 floor rule
+   scores *higher* SNR than the safe round-up rule while clipping 17 of 256
+   blocks, because a rare clipped element barely moves a row's RMS error
+   while a clipped K value perturbs a whole attention logit row.
 2. **H2 - compute path.** Dequantising to FP16 must put the dot on
    `v_dot2_f32_f16` and not on the scalar FMA path, and that must be visible
    in decode throughput.
 3. **H3 - it has to be reachable.** `RdnaAttentionBackend.supported_kv_cache_dtypes`
-   is `["auto", "float16"]` today. Either the RDNA2 backend grows the dtype or
-   the design is re-scoped to the Triton path.
+   is `["auto", "float16"]` today, and the backend rejects every quantised KV
+   dtype. Either the RDNA2 backend grows the dtype - which means reviving the
+   legacy INT8 FA-RDNA2 dispatch (`3baecdb516`, see the README's *Prior work*
+   section) and swapping the format inside it - or the design is re-scoped to
+   the Triton path, where the dot cannot use `v_dot2_f32_f16` at all.
 4. **H4 - no global scale.** If the global scale turns out to matter on real
    activations, the format needs a per-tensor side buffer and the change
    stops being a kernel-sized change.
+5. **H5 - the zero-point really is free.** The packed zero-point costs about
+   half a dB against a zero-point that spends its own 0.125 bits/value. If
+   real activations make that gap larger than 0.5 dB, the zero-point has to
+   be stored separately and the format costs 4.625 bits/value.
 
 If H1 or H2 fails, the format is not worth a new dtype and the shipped
 `int4_per_token_head` stays.
@@ -55,20 +67,28 @@ decides H1.
 Run the reference codec over the captured rows. This is the H1 check and it
 needs no GPU, only the dumps from Step 1.
 
-| Scheme | SNR dB (real K) | SNR dB (real V) | bits/value |
-| --- | --- | --- | --- |
-| `int4_per_token_head` (shipped) | | | 4.250 |
-| `int4_fp16_block` k=64 | | | 4.250 |
-| `int4_fp16_block` k=32 | | | 4.500 |
-| `int4_fp16_block` k=16 | | | 5.000 |
-| `int4_fp16_block` k=32, asymmetric | | | 4.625 |
-| `int4_fp16_block` k=32 + global | | | 4.500 |
-| `int4_e4m3_block` k=16, no global | | | 4.500 |
-| `int4_e4m3_block` k=16 + global | | | 4.500 |
-| NVFP4 (E2M1 + E4M3/16 + global) | | | 4.500 |
+| Scheme | SNR dB (real K) | SNR dB (real V) | attn output err | bits/value |
+| --- | --- | --- | --- | --- |
+| `int4_per_token_head` (shipped) | | | | 4.250 |
+| `int4_fp16_block` k=64, symmetric | | | | 4.250 |
+| `int4_fp16_block` k=64, packed zp | | | | 4.250 |
+| `int4_fp16_block` k=32, symmetric | | | | 4.500 |
+| **`int4_fp16_block` k=32, packed zp (proposal)** | | | | **4.500** |
+| `int4_fp16_block` k=32, asymmetric, separate zp | | | | 4.625 |
+| `int4_fp16_block` k=16, packed zp | | | | 5.000 |
+| `int4_e4m3_block` k=32, no global | | | | 4.250 |
+| `int4_e4m3_block` k=16, no global | | | | 4.500 |
+| `int4_e8m0_block` k=32, round-up | | | | 4.250 |
+| `int4_e8m0_block` k=32, OCP floor | | | | 4.250 |
+| `int8_e8m0_block` k=32 | | | | 8.250 |
 
-Acceptance for H1: the `k=32` row beats the shipped row by at least 2 dB on
-both K and V. If it does not, stop here.
+Acceptance for H1: the `k=32` packed row beats the shipped row by at least
+2 dB of attention output error on both K and V, and the packed row stays
+within 0.5 dB of the row that spends its own 4 bits on the zero-point
+(H5). If it does not, stop here.
+
+Acceptance for H5: the packed row is within 0.5 dB of the separate-zero-point
+row. If it is not, the format grows to 4.625 bits/value.
 
 ## Step 3 - memory budget check (no GPU)
 
@@ -77,7 +97,10 @@ Byte budget per token per layer, `head_size=128`:
 | Scheme | Element bytes | Scale bytes | Total bytes | bits/value |
 | --- | --- | --- | --- | --- |
 | `int4_per_token_head` | 64 | 4 (zp in the scale) | 68 | 4.250 |
-| `int4_fp16_block` k=32 | 64 | 8 | 72 | 4.500 |
+| `int4_fp16_block` k=32, symmetric | 64 | 8 | 72 | 4.500 |
+| `int4_fp16_block` k=32, packed zp | 64 | 8 (zp inside) | 72 | 4.500 |
+| `int4_e4m3_block` k=32 | 64 | 4 | 68 | 4.250 |
+| `int8_e8m0_block` k=32 | 128 | 4 | 132 | 8.250 |
 
 The scale bytes sit beside the data in the same page, so the page size has to
 grow by 4 bytes per head per token for the proposal. That is the whole
@@ -90,8 +113,20 @@ Only after Steps 1-3 hold does a kernel get written.
 
 - **Kernel**: a reshape (write) kernel and a split-dot (read) kernel next to
   `vllm/v1/attention/ops/int4_per_token_head.py`. Write path: FP16 block
-  scale per `k` values, nibble-packed elements. Read path: unpack to FP16 and
-  dot with `v_dot2_f32_f16`.
+  scale per `k` values with the zero-point packed into the scale's low
+  mantissa bits, nibble-packed elements. Read path: unpack to FP16 and dot
+  with `v_dot2_f32_f16`.
+- **Two kernel decisions the README derives, both to be confirmed by the
+  measurement rather than assumed**:
+    - apply the block scale **per element**, not per partial dot. On gfx1030
+      the per-partial-dot form costs `head_size^2 / k` accumulator ops against
+      `head_size` for the per-element form - 8x worse at `head_size=256,
+      k=32`.
+    - hoist the zero-point correction **out of the element loop**: on the QK
+      side it is a rank-1 correction against the query's own block sums (the
+      same trick the shipped Triton kernel uses at
+      `int4_per_token_head.py:570-572`); on the PV side it rides the per-block
+      probability mass that per-block value scales already require.
 - **Correctness**: round-trip against the reference codec, and the existing
   per-token-head test suite extended to the new mode
   (`tests/quantization/test_per_token_kv_cache.py`).
@@ -115,10 +150,15 @@ requires:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | fp16 | | | | | | | | |
 | B | `int4_per_token_head` | | | | | | | | |
-| C | `int4_fp16_block` k=32 | | | | | | | | |
+| C | `int4_fp16_block` k=32, packed zp | | | | | | | | |
 
 Acceptance for H2: arm C's decode tok/s per request beats arm B's at c=1 and
 c=8, with prefill within noise and identical greedy output.
+
+An arm D for `int4_e4m3_block` k=32 is only worth building if Step 2's
+real-activation numbers put the one-byte scale within 0.5 dB of the proposal.
+On the synthetic rows it is 1.22 dB behind on outlier rows, so the default
+answer is no.
 
 ## Step 5 - output quality
 
@@ -131,7 +171,7 @@ perplexity number on the pruned DeepSeek-V4 checkpoint.
 | --- | --- | --- | --- |
 | A (fp16) | | - | baseline |
 | B (`int4_per_token_head`) | | | |
-| C (`int4_fp16_block` k=32) | | | |
+| C (`int4_fp16_block` k=32, packed zp) | | | |
 
 ## Records
 
