@@ -29,6 +29,11 @@ width:
     NVFP4's scale geometry with an integer element type: symmetric INT4,
     one E4M3 scale per block, divided by a per-tensor FP32 global scale.
 
+``int4_e8m0_block``
+    The MX-style alternative to the proposal: symmetric INT4 with one E8M0
+    (power-of-two) scale per block, under both the OCP floor rule and the
+    no-saturation round-up rule.
+
 ``nvfp4``
     NVIDIA NVFP4 itself: E2M1 elements, one E4M3 scale per 16 values, divided
     by a per-tensor FP32 global scale.
@@ -59,6 +64,8 @@ from dataclasses import dataclass
 __all__ = [
     "e4m3_encode",
     "e4m3_decode",
+    "e8m0_encode",
+    "e8m0_decode",
     "f16_round",
     "pack_int4",
     "unpack_int4",
@@ -66,6 +73,7 @@ __all__ = [
     "quantize_int4_fp16_block",
     "quantize_int4_fp16_block_g",
     "quantize_int4_e4m3_block_g",
+    "quantize_int4_e8m0_block",
     "quantize_nvfp4",
     "snr_db",
     "bits_per_value",
@@ -175,6 +183,111 @@ def e4m3_encode(x: float) -> int:
 
 
 # ---------------------------------------------------------------------------
+# E8M0 (the OCP MX shared-scale format)
+# ---------------------------------------------------------------------------
+#
+# E8M0 is an *unsigned biased exponent*: eight bits, no sign, no mantissa, no
+# zero and no infinity. The code is the FP32 exponent field with bias 127, so
+# code 0 is 2**-127, code 254 is 2**127 and code 255 (0xFF) is the single
+# reserved NaN. It is stored as one raw byte per block.
+#
+# Decoding to FP32 is a bit trick, not an FP operation: 2**(code - 127) is
+# exactly the FP32 bit pattern ``code << 23``. That is what makes E8M0 cheap
+# on hardware, and it is also why the fork's own MXFP8 kernels build the
+# reciprocal instead of dividing by 2**(code - 127): code 0 gives a divisor of
+# 2**-127, which is subnormal in FP32 and flushes to zero on AMD parts
+# (see vllm/model_executor/layers/quantization/utils/mxfp8_utils.py).
+
+
+#: Exponent bias of the E8M0 scale format.
+E8M0_BIAS = 127
+#: Largest finite E8M0 code (0xFE).
+E8M0_MAX_CODE = 254
+#: The one reserved NaN encoding.
+E8M0_NAN_CODE = 255
+#: Largest positive value of the symmetric INT4 element type.
+INT4_MAX = 7.0
+#: Smallest value of the symmetric INT4 element type.
+INT4_MIN = -8
+#: Exponent of the largest normal INT4 value (7 = 1.75 * 2**2).
+INT4_EMAX = 2
+
+
+def e8m0_decode(code: int) -> float:
+    """Decode one E8M0 code to a float.
+
+    Args:
+        code: The 8-bit E8M0 code.
+
+    Returns:
+        ``2 ** (code - 127)``, or NaN for the reserved code 0xFF.
+
+    """
+    code &= 0xFF
+    if code == E8M0_NAN_CODE:
+        return float("nan")
+    return 2.0 ** (code - E8M0_BIAS)
+
+
+def e8m0_encode(x: float, *, round_up: bool = True) -> int:
+    """Encode a positive scale into an E8M0 code.
+
+    Args:
+        x: The scale to encode. Must be positive.
+        round_up: When True (the default) the code is the smallest power of
+            two that is at least ``x``. When False it is the largest power of
+            two that is at most ``x``.
+
+    Returns:
+        The 8-bit E8M0 code, clamped to the finite range 0x00..0xFE.
+
+    """
+    if x != x or x <= 0.0:
+        return 0
+    exponent = _log2_ceil(x) if round_up else _log2_floor(x)
+    return _e8m0_code(exponent)
+
+
+def _e8m0_code(exponent: int) -> int:
+    """Clamp an unbiased exponent into E8M0's range and bias it."""
+    return max(0, min(E8M0_MAX_CODE, exponent + E8M0_BIAS))
+
+
+def _log2_floor(x: float) -> int:
+    """Return ``floor(log2(x))`` exactly, for positive ``x``."""
+    _, exponent = math.frexp(x)
+    return exponent - 1
+
+
+def _log2_ceil(x: float) -> int:
+    """Return ``ceil(log2(x))`` exactly, for positive ``x``."""
+    mantissa, exponent = math.frexp(x)
+    return exponent - 1 if mantissa == 0.5 else exponent
+
+
+def _int4_no_saturation_exponent(amax: float) -> int:
+    """Return the smallest exponent whose INT4 scale cannot saturate.
+
+    The scale must satisfy ``7 * 2**e >= amax`` so that every element maps
+    into ``[-7, 7]``. Writing ``amax = m * 2**p`` with ``m`` in ``[0.5, 1)``,
+    the answer is ``p - 2`` when ``amax <= 1.75 * 2**p`` and ``p - 1``
+    otherwise. The comparison is exact, so this never loses a bit to a
+    floating-point log.
+
+    Args:
+        amax: The largest absolute value in the block.
+
+    Returns:
+        The unbiased exponent of the scale.
+
+    """
+    exponent = _log2_floor(amax)
+    if amax <= 1.75 * (2.0**exponent):
+        return exponent - 2
+    return exponent - 1
+
+
+# ---------------------------------------------------------------------------
 # INT4 packing
 # ---------------------------------------------------------------------------
 
@@ -232,6 +345,8 @@ class TensorResult:
             schemes.
         underflowed_blocks: Number of blocks whose stored scale fell below
             the normal range of its scale format.
+        clipped_blocks: Number of blocks in which at least one element
+            saturated at the element format's maximum.
 
     """
 
@@ -239,6 +354,7 @@ class TensorResult:
     scales: list[list[float]]
     global_scale: float | None = None
     underflowed_blocks: int = 0
+    clipped_blocks: int = 0
 
 
 def _blocks(row: Sequence[float], k: int):
@@ -334,6 +450,78 @@ def quantize_int4_fp16_block(
         reconstructed.append(out)
         scales.append(row_scales)
     return TensorResult(reconstructed, scales, underflowed_blocks=underflowed)
+
+
+# ---------------------------------------------------------------------------
+# Scheme E: int4_e8m0_block (the MX-style alternative)
+# ---------------------------------------------------------------------------
+
+
+def quantize_int4_e8m0_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+    rule: str = "rceil",
+) -> TensorResult:
+    """Quantize rows with an E8M0 (power-of-two) block scale.
+
+    E8M0 can only hold a power of two, so the scale is chosen by rounding the
+    ideal ``amax / 7`` up or down to the nearest power of two. Two rules are
+    modelled:
+
+    ``rceil``
+        The scale is the smallest power of two with ``7 * scale >= amax``.
+        No element can ever saturate. This is the rule the fork's own MXFP8
+        code uses (``vllm/model_executor/layers/quantization/utils/
+        mxfp8_utils.py``), because the OCP floor rule saturates.
+
+    ``floor``
+        The OCP MX v1.0 rule, ``shared_exp = floor(log2(amax)) - emax_elem``
+        with ``emax_elem = 2`` for symmetric INT4. The block maximum then
+        lands in ``[4, 8)``, so it saturates at 7 whenever the fractional part
+        of ``log2(amax)`` exceeds ``log2(7/4)``.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+        rule: ``"rceil"`` or ``"floor"``.
+
+    Returns:
+        The round-trip result.
+
+    """
+    if rule not in ("rceil", "floor"):
+        raise ValueError(f"unknown E8M0 rule {rule!r}")
+    reconstructed: list[list[float]] = []
+    scales: list[list[float]] = []
+    clipped = 0
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[float] = []
+        for _, block in _blocks(row, k):
+            amax = max(abs(v) for v in block)
+            if amax == 0.0:
+                # E8M0 has no zero. Use the smallest scale; every element
+                # quantizes to 0, so the block reconstructs exactly.
+                code = 0
+            elif rule == "rceil":
+                code = _e8m0_code(_int4_no_saturation_exponent(amax))
+            else:
+                code = _e8m0_code(_log2_floor(amax) - INT4_EMAX)
+            scale = e8m0_decode(code)
+            block_clipped = False
+            codes: list[int] = []
+            for value in block:
+                code_value = _round_half_even(value / scale)
+                if code_value > INT4_MAX or code_value < INT4_MIN:
+                    block_clipped = True
+                codes.append(max(INT4_MIN, min(INT4_MAX, code_value)))
+            if block_clipped:
+                clipped += 1
+            row_scales.append(scale)
+            out.extend(code_value * scale for code_value in codes)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales, clipped_blocks=clipped)
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +799,7 @@ class SchemeResult:
         bits: Total bits per value including scale overhead.
         notes: Free-text caveats.
         underflowed: Blocks whose stored scale fell out of the normal range.
+        clipped: Blocks in which at least one element saturated.
 
     """
 
@@ -619,6 +808,7 @@ class SchemeResult:
     bits: float
     notes: str
     underflowed: int = 0
+    clipped: int = 0
 
 
 def _make_row(rng: random.Random, head_size: int, outlier: bool) -> list[float]:
@@ -660,6 +850,7 @@ def run_comparison(
             bits,
             notes,
             underflowed=result.underflowed_blocks,
+            clipped=result.clipped_blocks,
         )
 
     return [
@@ -700,10 +891,46 @@ def run_comparison(
             "symmetric, FP16 block scale / FP32 per-tensor global",
         ),
         measure(
+            "int4_e8m0_block k=32 (rceil)",
+            lambda r: quantize_int4_e8m0_block(r, k=32, rule="rceil"),
+            bits_per_value(4, 8, 32),
+            "symmetric, one E8M0 scale per 32 values, no-saturation rule",
+        ),
+        measure(
+            "int4_e8m0_block k=16 (rceil)",
+            lambda r: quantize_int4_e8m0_block(r, k=16, rule="rceil"),
+            bits_per_value(4, 8, 16),
+            "symmetric, one E8M0 scale per 16 values, no-saturation rule",
+        ),
+        measure(
+            "int4_e8m0_block k=32 (OCP floor)",
+            lambda r: quantize_int4_e8m0_block(r, k=32, rule="floor"),
+            bits_per_value(4, 8, 32),
+            "symmetric, one E8M0 scale per 32 values, OCP MX floor rule",
+        ),
+        measure(
+            "int4_e8m0_block k=16 (OCP floor)",
+            lambda r: quantize_int4_e8m0_block(r, k=16, rule="floor"),
+            bits_per_value(4, 8, 16),
+            "symmetric, one E8M0 scale per 16 values, OCP MX floor rule",
+        ),
+        measure(
             "int4_e4m3_block k=16 (no global)",
             quantize_int4_e4m3_block,
             bits_per_value(4, 8, 16),
             "symmetric, one E4M3 scale per 16 values, single level",
+        ),
+        measure(
+            "int4_e4m3_block k=32 (no global)",
+            lambda r: quantize_int4_e4m3_block(r, k=32),
+            bits_per_value(4, 8, 32),
+            "symmetric, one E4M3 scale per 32 values, single level",
+        ),
+        measure(
+            "int4_e4m3_block k=64 (no global)",
+            lambda r: quantize_int4_e4m3_block(r, k=64),
+            bits_per_value(4, 8, 64),
+            "symmetric, one E4M3 scale per 64 values, single level",
         ),
         measure(
             "int4_e4m3_block_g k=16",
@@ -745,6 +972,26 @@ def _self_check() -> None:
     codes = list(range(16))
     assert unpack_int4(pack_int4(codes), 16) == codes
 
+    # E8M0 round-trips exactly for every finite code: the value is a power
+    # of two and the code is its unbiased exponent plus the bias.
+    for code in range(E8M0_MAX_CODE + 1):
+        value = e8m0_decode(code)
+        assert e8m0_encode(value) == code, f"E8M0 round-trip failed at {code:#04x}"
+    assert math.isnan(e8m0_decode(E8M0_NAN_CODE))
+
+    # The no-saturation exponent is exact and minimal: the chosen scale never
+    # lets an element exceed the INT4 maximum, and halving it would.
+    for amax in (0.1, 0.5, 1.0, 3.0, 3.6, 7.0, 14.0, 100.0):
+        exponent = _int4_no_saturation_exponent(amax)
+        scale = 2.0**exponent
+        assert 7.0 * scale >= amax, f"scale {scale} saturates amax {amax}"
+        assert 7.0 * (scale / 2.0) < amax, f"scale {scale} is not minimal"
+
+    # The round-up rule never saturates; the OCP floor rule does.
+    rows = [[0.5 * i for i in range(64)]]
+    assert quantize_int4_e8m0_block(rows, k=32, rule="rceil").clipped_blocks == 0
+    assert quantize_int4_e8m0_block(rows, k=32, rule="floor").clipped_blocks > 0
+
     # The proposal's stored scale really is FP16-representable.
     rows = [[0.5 * i for i in range(64)]]
     result = quantize_int4_fp16_block(rows, k=32)
@@ -770,13 +1017,15 @@ def main() -> None:
         print(f"=== head_size={head_size}, {label} ===")
         print("64 rows, N(0, 0.5). SNR is round-trip, averaged over rows.")
         print("These are arithmetic results, not V620 measurements.\n")
-        header = f"{'scheme':<38} {'SNR dB':>8} {'bits/val':>10} {'subnorm':>9}"
+        header = (
+            f"{'scheme':<38} {'SNR dB':>8} {'bits/val':>10} {'subnorm':>9} {'clip':>6}"
+        )
         print(header)
         print("-" * len(header))
         for result in results:
             print(
                 f"{result.name:<38} {result.snr:>8.3f} {result.bits:>10.3f} "
-                f"{result.underflowed:>9d}"
+                f"{result.underflowed:>9d} {result.clipped:>6d}"
             )
         print()
         for result in results:
