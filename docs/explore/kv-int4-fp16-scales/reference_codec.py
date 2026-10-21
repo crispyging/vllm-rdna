@@ -34,6 +34,23 @@ width:
     (power-of-two) scale per block, under both the OCP floor rule and the
     no-saturation round-up rule.
 
+``int4_fp32_block``
+    The same format with an FP32 scale, to test whether FP32 buys anything
+    over FP16 at block granularity.
+
+``int4_fp16_block_token_groups``
+    The other grouping axis: one scale per (channel, group of ``k`` tokens)
+    instead of per (token, group of ``k`` values). Costs the same memory and
+    behaves completely differently on the two outlier modes.
+
+``int8_*``
+    INT8 with an E8M0, FP16, FP32 or E4M3 block scale.
+
+``fp8_e4m3``
+    FP8 e4m3 elements with a per-tensor or per-block scale. This is what
+    ``--kv-cache-dtype fp8`` does, and it is the only KV cache dtype with a
+    measurement on the V620.
+
 ``nvfp4``
     NVIDIA NVFP4 itself: E2M1 elements, one E4M3 scale per 16 values, divided
     by a per-tensor FP32 global scale.
@@ -555,6 +572,184 @@ def quantize_int4_fp16_block_packed(
 
 
 # ---------------------------------------------------------------------------
+# Scheme H: FP32 block scales, and the token-axis grouping
+# ---------------------------------------------------------------------------
+
+
+def quantize_int4_fp32_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+    symmetric: bool = True,
+) -> TensorResult:
+    """Quantize rows with an FP32 block scale and a packed zero-point.
+
+    The FP32 scale has 23 mantissa bits, so the 4-bit zero-point costs
+    nothing at all in precision - this is the shipped format's trick, at
+    block granularity instead of row granularity.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+        symmetric: When True use a symmetric scale and no zero-point.
+
+    Returns:
+        The round-trip result.
+
+    """
+    reconstructed: list[list[float]] = []
+    scales: list[list[int]] = []
+    clipped = 0
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[int] = []
+        for _, block in _blocks(row, k):
+            if symmetric:
+                scale = max(max(abs(v) for v in block) / 7.0, 1e-6)
+                zp = 0
+                codes = [max(-8, min(7, _round_half_even(v / scale))) for v in block]
+            else:
+                lo = min(block)
+                hi = max(block)
+                scale = max((hi - lo) / 15.0, 1e-6)
+                zp = max(0, min(15, _round_half_away(-lo / scale)))
+                codes = []
+                for value in block:
+                    code = _round_half_away(value / scale) + zp
+                    if code < 0 or code > 15:
+                        clipped += 1
+                    codes.append(max(0, min(15, code)))
+            packed = struct.unpack("<I", struct.pack("<f", scale))[0]
+            packed = (packed & ~0xF) | zp
+            stored_scale = struct.unpack("<f", struct.pack("<I", packed & ~0xF))[0]
+            stored_zp = packed & 0xF
+            row_scales.append(packed)
+            out.extend((code - stored_zp) * stored_scale for code in codes)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales, clipped_blocks=clipped)
+
+
+def quantize_int8_fp32_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+) -> TensorResult:
+    """Quantize rows with symmetric INT8 and an FP32 block scale.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+
+    Returns:
+        The round-trip result.
+
+    """
+    reconstructed: list[list[float]] = []
+    scales: list[list[float]] = []
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[float] = []
+        for _, block in _blocks(row, k):
+            scale = max(max(abs(v) for v in block) / INT8_MAX, 1e-6)
+            codes = [
+                max(INT8_MIN, min(INT8_MAX, _round_half_even(value / scale)))
+                for value in block
+            ]
+            row_scales.append(scale)
+            out.extend(code * scale for code in codes)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales)
+
+
+def quantize_int8_e4m3_block(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+) -> TensorResult:
+    """Quantize rows with symmetric INT8 and an E4M3 block scale.
+
+    Args:
+        rows: The rows to quantize.
+        k: Block size along the head dimension.
+
+    Returns:
+        The round-trip result.
+
+    """
+    reconstructed: list[list[float]] = []
+    scales: list[list[float]] = []
+    underflowed = 0
+    for row in rows:
+        out: list[float] = []
+        row_scales: list[float] = []
+        for _, block in _blocks(row, k):
+            amax = max(abs(value) for value in block)
+            scale = max(amax / INT8_MAX, 1e-6)
+            stored = e4m3_decode(e4m3_encode(scale))
+            if not e4m3_is_normal(stored):
+                underflowed += 1
+            row_scales.append(stored)
+            for value in block:
+                code = max(
+                    INT8_MIN,
+                    min(INT8_MAX, _round_half_even(value / stored)),
+                )
+                out.append(code * stored)
+        reconstructed.append(out)
+        scales.append(row_scales)
+    return TensorResult(reconstructed, scales, underflowed_blocks=underflowed)
+
+
+def quantize_int4_fp16_block_token_groups(
+    rows: Sequence[Sequence[float]],
+    k: int = 32,
+) -> TensorResult:
+    """Quantize with one scale per (channel, group of ``k`` tokens).
+
+    This is the other grouping axis: instead of sharing a scale along the
+    head dimension within one token, share it along the token dimension
+    within one channel. KIVI's observation is that K carries per-channel
+    outliers and V carries per-token outliers, which points at this axis
+    for K.
+
+    The memory cost is the same as head-dimension grouping: the number of
+    scales per token per head is ``head_size / k`` either way.
+
+    Args:
+        rows: The rows to quantize. One row is one token.
+        k: Number of tokens that share a scale, per channel.
+
+    Returns:
+        The round-trip result.
+
+    """
+    if not rows:
+        return TensorResult([], [])
+    head_size = len(rows[0])
+    reconstructed = [[0.0] * head_size for _ in rows]
+    for channel in range(head_size):
+        column = [row[channel] for row in rows]
+        for start in range(0, len(column), k):
+            group = column[start : start + k]
+            lo = min(group)
+            hi = max(group)
+            ideal = max((hi - lo) / 15.0, 1e-6)
+            scale = f16_ceil_6(ideal)
+            zp = max(0, min(15, _round_half_away(-lo / scale)))
+            packed = (f16_bits(scale) & ~0xF) | zp
+            stored_scale = f16_from_bits(packed & ~0xF)
+            stored_zp = packed & 0xF
+            for offset, value in enumerate(group):
+                code = max(
+                    0,
+                    min(15, _round_half_away(value / stored_scale) + stored_zp),
+                )
+                reconstructed[start + offset][channel] = (
+                    code - stored_zp
+                ) * stored_scale
+    return TensorResult(reconstructed, [])
+
+
+# ---------------------------------------------------------------------------
 # Scheme G: fp8_e4m3 (what the fork already ships and has measured)
 # ---------------------------------------------------------------------------
 
@@ -1065,27 +1260,60 @@ class SchemeResult:
     clipped: int = 0
 
 
-def _make_row(rng: random.Random, head_size: int, outlier: bool) -> list[float]:
+#: Labels for the synthetic outlier modes.
+_OUTLIER_LABELS = {
+    "none": "no outlier channels",
+    "channel": "two x40 outlier channels (K-side)",
+    "token": "two x40 outlier tokens (V-side)",
+}
+
+
+def _make_row(
+    rng: random.Random,
+    head_size: int,
+    outlier: str,
+) -> list[float]:
     """Build one synthetic KV row, optionally with channel outliers."""
     row = [rng.gauss(0.0, 0.5) for _ in range(head_size)]
-    if outlier:
-        # KIVI's observation: a few channels carry much larger values.
+    if outlier == "channel":
+        # KIVI's observation for K: a few channels carry much larger
+        # values, and they do so consistently across tokens.
         for channel in (3, 17):
             if channel < head_size:
                 row[channel] *= 40.0
     return row
 
 
+def _make_rows(
+    rng: random.Random,
+    n_rows: int,
+    head_size: int,
+    outlier: str,
+) -> list[list[float]]:
+    """Build a synthetic KV tensor with the requested outlier mode.
+
+    ``channel`` is the K-side failure mode: two channels of every row are
+    40x too large. ``token`` is the V-side failure mode: two whole tokens
+    are 40x too large.
+    """
+    rows = [_make_row(rng, head_size, outlier) for _ in range(n_rows)]
+    if outlier == "token":
+        for index in (5, 40):
+            if index < len(rows):
+                rows[index] = [value * 40.0 for value in rows[index]]
+    return rows
+
+
 def run_comparison(
     head_size: int = 128,
-    outlier: bool = True,
+    outlier: str = "channel",
     seed: int = 42,
 ) -> list[SchemeResult]:
     """Compare the scale strategies on synthetic KV rows.
 
     Args:
         head_size: Values per row.
-        outlier: Whether to scale two channels up by 40x.
+        outlier: ``"channel"``, ``"token"`` or ``"none"``.
         seed: RNG seed, so the numbers are reproducible.
 
     Returns:
@@ -1093,7 +1321,7 @@ def run_comparison(
 
     """
     rng = random.Random(seed)
-    rows = [_make_row(rng, head_size, outlier) for _ in range(64)]
+    rows = _make_rows(rng, 64, head_size, outlier)
 
     def measure(name, quantize, bits, notes) -> SchemeResult:
         result = quantize(rows)
@@ -1131,6 +1359,12 @@ def run_comparison(
             lambda r: quantize_int4_fp16_block(r, k=16),
             bits_per_value(4, 16, 16),
             "symmetric, one FP16 scale per 16 values, single level",
+        ),
+        measure(
+            "int4_fp16_block_token_groups k=32",
+            lambda r: quantize_int4_fp16_block_token_groups(r, k=32),
+            bits_per_value(4, 16, 32),
+            "asymmetric, one FP16 scale per (channel, 32 tokens)",
         ),
         measure(
             "int4_fp16_block_packed k=64",
@@ -1227,6 +1461,30 @@ def run_comparison(
             lambda r: quantize_int8_fp16_block(r, k=32),
             bits_per_value(8, 16, 32),
             "symmetric INT8, one FP16 scale per 32 values",
+        ),
+        measure(
+            "int4_fp32_block k=32 (sym)",
+            lambda r: quantize_int4_fp32_block(r, k=32),
+            bits_per_value(4, 32, 32),
+            "symmetric, one FP32 scale per 32 values",
+        ),
+        measure(
+            "int4_fp32_block k=32 (packed zp)",
+            lambda r: quantize_int4_fp32_block(r, k=32, symmetric=False),
+            bits_per_value(4, 32, 32),
+            "asymmetric, FP32 scale with 4-bit zp packed in its mantissa",
+        ),
+        measure(
+            "int8_fp32_block k=32",
+            lambda r: quantize_int8_fp32_block(r, k=32),
+            bits_per_value(8, 32, 32),
+            "symmetric INT8, one FP32 scale per 32 values",
+        ),
+        measure(
+            "int8_e4m3_block k=32",
+            lambda r: quantize_int8_e4m3_block(r, k=32),
+            bits_per_value(8, 8, 32),
+            "symmetric INT8, one E4M3 scale per 32 values",
         ),
         measure(
             "fp8_e4m3 per-tensor (shipped, measured)",
@@ -1327,8 +1585,8 @@ def main() -> None:
     _self_check()
     head_size = 128
 
-    for outlier in (True, False):
-        label = "with two x40 outlier channels" if outlier else "no outlier channels"
+    for outlier in ("channel", "token", "none"):
+        label = _OUTLIER_LABELS[outlier]
         results = run_comparison(head_size=head_size, outlier=outlier)
         print(f"=== head_size={head_size}, {label} ===")
         print("64 rows, N(0, 0.5). SNR is round-trip, averaged over rows.")

@@ -13,7 +13,7 @@ The format under test is specified in `README.md`. The reference codec is
    must beat the shipped `int4_per_token_head` scale on *real* KV activations,
    not on synthetic rows, and it must be measured on **attention output
    error**, not on round-trip SNR. The synthetic gap is 5.73 dB on
-   outlier-heavy rows and 1.78 dB on clean rows; the real gap is unknown.
+   K-side rows and 1.78 dB on the V side; the real gap is unknown.
    SNR alone is not an acceptable metric here: the OCP E8M0 floor rule
    scores *higher* SNR than the safe round-up rule while clipping 17 of 256
    blocks, because a rare clipped element barely moves a row's RMS error
@@ -158,8 +158,9 @@ c=8, with prefill within noise and identical greedy output.
 
 An arm D for `int4_e4m3_block` k=32 is only worth building if Step 2's
 real-activation numbers put the one-byte scale within 0.5 dB of the proposal.
-On the synthetic rows it is 1.22 dB behind on outlier rows, so the default
-answer is no.
+At the same 4.500 bits/value it is 0.32 dB behind on the K side and 0.48 dB
+behind on the V side, and at 4.250 bits/value it saves 0.25 bits/value but
+loses 2.14 dB on the K side, so the default answer is no.
 
 ## Step 5 - output quality
 
