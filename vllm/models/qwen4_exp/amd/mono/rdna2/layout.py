@@ -7,6 +7,7 @@ graph-mode helper shared by the parts."""
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from . import OPTS
 
@@ -138,6 +139,9 @@ class MonoLayer:
         self.k1_ready = False
         self.k1_reason = ""
         self.hc_ok = False
+        self.dense_mtp = False
+        self._dense_layout_logged = False
+        self._dense_call_logged = False
         self.reason = ""
 
     def setup(self) -> bool:
@@ -250,8 +254,15 @@ class MonoLayer:
         qm = getattr(experts, "quant_method", None) or getattr(
             mlp.experts, "_quant_method", None
         )
-        if type(qm).__name__ != "CompressedTensorsWNA16RDNA2MoEMethod":
+        dense_mtp = self.is_mtp and type(qm).__name__ == "UnquantizedFusedMoEMethod"
+        if (
+            type(qm).__name__ != "CompressedTensorsWNA16RDNA2MoEMethod"
+            and not dense_mtp
+        ):
             raise ValueError(f"routed experts use {type(qm).__name__}")
+        if dense_mtp:
+            self._setup_dense_mtp(layer, hc, experts, mlp)
+            return
         if getattr(qm, "_zero_v2", False) or getattr(qm, "_w4a8", False):
             raise ValueError("asymmetric (v2 zeros) or W4A8 experts")
         w13 = experts.w13_weight_packed
@@ -325,3 +336,162 @@ class MonoLayer:
                     ),
                     torch.zeros(MAX_ROWS, 4, dtype=torch.float16, device=router.device),
                 )
+
+    def _setup_dense_mtp(self, layer, hc, experts, mlp) -> None:
+        """Resolve the MTP-only unquantized FP16 expert layout for K2."""
+        if not self.is_mtp:
+            raise ValueError("dense FFN is supported only for the MTP drafter")
+        hc_weights = (
+            hc.hc_norm.weight,
+            hc.input_mix_weight_down_block_inject.weight,
+            hc.input_mix_weight_up.weight,
+        )
+        if any(weight.dtype != torch.float16 for weight in hc_weights):
+            raise ValueError("dense MTP hyper-connection weights must be fp16")
+        if any(weight.device != experts.w13_weight.device for weight in hc_weights):
+            raise ValueError("dense MTP hyper-connection weights must share a device")
+        if hc_weights[0].shape != (10240,):
+            raise ValueError("dense MTP HC norm must have one weight per HC element")
+        if hc_weights[1].shape != (336, 10240) or hc_weights[2].shape != (
+            10240,
+            320,
+        ):
+            raise ValueError("dense MTP hyper-connection geometry is unsupported")
+        if (
+            getattr(experts, "w13_bias", None) is not None
+            or getattr(experts, "w2_bias", None) is not None
+        ):
+            raise ValueError("dense MTP expert biases are not supported")
+        w13 = experts.w13_weight
+        w2 = experts.w2_weight
+        if (
+            w13.dtype != torch.float16
+            or w2.dtype != torch.float16
+            or not w13.is_contiguous()
+            or not w2.is_contiguous()
+            or w13.ndim != 3
+            or w2.ndim != 3
+        ):
+            raise ValueError("dense MTP experts must be contiguous rank-3 fp16 weights")
+        local_e, n2, h = w13.shape
+        if n2 % 2:
+            raise ValueError("dense MTP w13 second dimension must be even")
+        i = n2 // 2
+        if (local_e, h, i) != (128, 2560, 640) or tuple(w2.shape) != (
+            local_e,
+            h,
+            i,
+        ):
+            raise ValueError(
+                f"dense MTP expert geometry must be w13[128,1280,2560]/"
+                f"w2[128,2560,640], got {tuple(w13.shape)}/{tuple(w2.shape)}"
+            )
+        if w13.device != w2.device or w13.device != mlp.gate.weight.device:
+            raise ValueError("dense MTP expert and router weights must share a device")
+        if (
+            mlp.gate.weight.dtype != torch.float16
+            or tuple(mlp.gate.weight.shape) != (512, 2560)
+            or mlp.gate.weight.device != w13.device
+            or getattr(mlp.gate, "bias", None) is not None
+        ):
+            raise ValueError("dense MTP router must be fp16 [512, 2560]")
+        if getattr(experts, "top_k", 10) != 10 or not getattr(
+            experts, "renormalize", True
+        ):
+            raise ValueError("dense MTP requires normalized top-10 routing")
+        if (
+            getattr(experts, "activation", None) != MoEActivation.SILU
+            or getattr(experts, "scoring_func", "softmax") != "softmax"
+            or getattr(experts, "use_grouped_topk", False)
+            or getattr(experts, "custom_routing_function", None) is not None
+            or getattr(experts, "e_score_correction_bias", None) is not None
+            or getattr(experts, "routed_scaling_factor", 1.0) != 1.0
+        ):
+            raise ValueError("dense MTP requires plain SiLU and softmax routing")
+        if getattr(experts, "apply_router_weight_on_input", False):
+            raise ValueError("dense MTP does not support router weights on input")
+        emap = getattr(experts, "expert_map", None)
+        if emap is None:
+            raise ValueError("dense MTP requires expert parallelism (expert_map)")
+        loc = (emap >= 0).nonzero().flatten()
+        base = int(loc[0]) if loc.numel() else -1
+        if loc.numel() != local_e or not torch.equal(
+            emap[base : base + local_e].cpu(),
+            torch.arange(local_e, dtype=emap.dtype),
+        ):
+            raise ValueError("dense MTP local experts must be one contiguous block")
+
+        se = getattr(mlp, "shared_expert", None)
+        if se is None or getattr(se, "expert_gate", None) is None:
+            raise ValueError("dense MTP requires the gated shared expert")
+        gu = se.gate_up_proj.weight
+        dn = se.down_proj.weight
+        wg = se.expert_gate.weight
+        if (
+            gu.dtype != torch.float16
+            or dn.dtype != torch.float16
+            or wg.dtype != torch.float16
+            or not gu.is_contiguous()
+            or not dn.is_contiguous()
+            or not wg.is_contiguous()
+        ):
+            raise ValueError("dense MTP shared expert must be contiguous fp16")
+        # TP=4 shards the checkpoint's global shared intermediate width (640)
+        # to 160 columns per rank for this kernel.
+        if (
+            getattr(layer.config, "shared_expert_intermediate_size", None) != 640
+            or dn.ndim != 2
+            or gu.shape != (2 * dn.shape[1], 2560)
+            or dn.shape[0] != 2560
+            or dn.shape[1] != 160
+            or wg.numel() != 2560
+            or getattr(se.gate_up_proj, "bias", None) is not None
+            or getattr(se.down_proj, "bias", None) is not None
+            or getattr(se.expert_gate, "bias", None) is not None
+        ):
+            raise ValueError(
+                "dense MTP shared expert layout is unsupported: "
+                "expected TP4 local width 160 from global width 640; "
+                f"gate_up={tuple(gu.shape)}, down={tuple(dn.shape)}, "
+                f"gate={tuple(wg.shape)}"
+            )
+        if any(t.device != w13.device for t in (gu, dn, wg)):
+            raise ValueError("dense MTP shared expert must share the FFN device")
+
+        self.t = dict(
+            norm_w=hc.hc_norm.weight,
+            wd=hc.input_mix_weight_down_block_inject.weight,
+            wu=hc.input_mix_weight_up.weight,
+            wr=mlp.gate.weight,
+            se_w1=gu,
+            se_w2=dn,
+            se_wg=wg.reshape(-1).contiguous(),
+            w13=w13,
+            s13=torch.empty(0, dtype=torch.float16, device=w13.device),
+            z13=torch.empty(0, dtype=torch.int32, device=w13.device),
+            w2=w2,
+            s2=torch.empty(0, dtype=torch.float16, device=w13.device),
+            z2=torch.empty(0, dtype=torch.int32, device=w13.device),
+        )
+        if not getattr(self, "_dense_layout_logged", False):
+            self._dense_layout_logged = True
+            tensors = {**self.t, "shared_gate": wg}
+            logger.info(
+                "dense MTP K2 layout rank-device=%s expert_base=%d tensors=%s",
+                w13.device,
+                base,
+                {
+                    name: {
+                        "ptr": hex(t.data_ptr()),
+                        "shape": tuple(t.shape),
+                        "stride": tuple(t.stride()),
+                        "contiguous": t.is_contiguous(),
+                        "dtype": str(t.dtype),
+                    }
+                    for name, t in tensors.items()
+                },
+            )
+        self.base = base
+        self.eps = float(hc.config.rms_norm_eps)
+        self.dense_mtp = True
+        self.ws = workspace(w13.device, "mtp")

@@ -69,7 +69,8 @@ void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace,
                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                   double eps, double timeout_ms, bool reset_control = false);
+                   double eps, double timeout_ms, bool reset_control = false,
+                   bool dense_mtp = false);
 torch::Tensor mono_k2_rdna2_error(const torch::Tensor& workspace);
 void mono_k2_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width);
 torch::Tensor mono_k2_rdna2_workspace_alloc(int64_t nbytes, int64_t device);

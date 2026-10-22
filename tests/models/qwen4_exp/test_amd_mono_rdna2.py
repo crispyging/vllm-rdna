@@ -352,6 +352,123 @@ def test_mtp_k1_setup_is_independent_of_unsupported_k2(monkeypatch):
     assert mono.k1_ready
 
 
+class UnquantizedFusedMoEMethod:  # name-matched stand-in
+    pass
+
+
+def _dense_mtp_layer(*, w13_shape=(128, 1280, 2560)):
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import layout
+
+    def meta(shape):
+        return torch.empty(shape, dtype=torch.float16, device="meta")
+
+    hc = SimpleNamespace(
+        hc_count=4,
+        use_combine=True,
+        hc_norm=SimpleNamespace(weight=meta((10240,))),
+        input_mix_weight_down_block_inject=SimpleNamespace(
+            weight=meta((336, 10240)), weight_i8=None
+        ),
+        input_mix_weight_up=SimpleNamespace(weight=meta((10240, 320)), weight_i8=None),
+        config=SimpleNamespace(rms_norm_eps=1e-6),
+    )
+    experts = SimpleNamespace(
+        quant_method=UnquantizedFusedMoEMethod(),
+        w13_weight=meta(w13_shape),
+        w2_weight=meta((128, 2560, 640)),
+        activation=layout.MoEActivation.SILU,
+        w13_bias=None,
+        w2_bias=None,
+        expert_map=torch.arange(128, dtype=torch.int32),
+        top_k=10,
+        renormalize=True,
+        apply_router_weight_on_input=False,
+    )
+    shared = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=meta((320, 2560))),
+        down_proj=SimpleNamespace(weight=meta((2560, 160))),
+        expert_gate=SimpleNamespace(weight=meta((1, 2560))),
+    )
+    mlp = SimpleNamespace(
+        gate=SimpleNamespace(weight=meta((512, 2560)), bias=None),
+        experts=experts,
+        shared_expert=shared,
+    )
+    return layout, SimpleNamespace(
+        mlp=mlp,
+        mlp_hyper_connection=hc,
+        config=SimpleNamespace(shared_expert_intermediate_size=640),
+    )
+
+
+def test_dense_unquantized_mtp_ffn_is_supported_only_for_drafter(monkeypatch):
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import layout
+
+    _, layer = _dense_mtp_layer()
+    monkeypatch.setattr(layout, "workspace", lambda device, scope: object())
+
+    mono = layout.MonoLayer(layer, is_mtp=True)
+    assert mono.setup()
+    assert mono.dense_mtp
+    assert mono.t["w13"].shape == (128, 1280, 2560)
+    assert mono.t["w2"].shape == (128, 2560, 640)
+    assert mono.t["se_w1"].shape == (320, 2560)
+    assert mono.t["se_w2"].shape == (2560, 160)
+
+    target = layout.MonoLayer(layer, is_mtp=False)
+    assert not target.setup()
+    assert not target.dense_mtp
+
+
+def test_dense_unquantized_mtp_wrong_geometry_falls_back(monkeypatch):
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import layout
+
+    _, layer = _dense_mtp_layer(w13_shape=(128, 1278, 2560))
+    monkeypatch.setattr(layout, "workspace", lambda device, scope: object())
+
+    mono = layout.MonoLayer(layer, is_mtp=True)
+    assert not mono.setup()
+    assert not mono.dense_mtp
+
+
+def test_dense_unquantized_mtp_wrong_shared_shard_falls_back(monkeypatch):
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import layout
+
+    _, layer = _dense_mtp_layer()
+    layer.mlp.shared_expert.gate_up_proj.weight = torch.empty(
+        (640, 2560), dtype=torch.float16, device="meta"
+    )
+    monkeypatch.setattr(layout, "workspace", lambda device, scope: object())
+
+    mono = layout.MonoLayer(layer, is_mtp=True)
+    assert not mono.setup()
+    assert not mono.dense_mtp
+    assert "geometry" in mono.reason
+
+
+@pytest.mark.parametrize(
+    "field, value, reason",
+    [
+        ("scoring_func", "sigmoid", "routing"),
+        ("use_grouped_topk", True, "routing"),
+        ("apply_router_weight_on_input", True, "router weights on input"),
+    ],
+)
+def test_dense_unquantized_mtp_unsupported_routing_falls_back(
+    monkeypatch, field, value, reason
+):
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import layout
+
+    _, layer = _dense_mtp_layer()
+    setattr(layer.mlp.experts, field, value)
+    monkeypatch.setattr(layout, "workspace", lambda device, scope: object())
+
+    mono = layout.MonoLayer(layer, is_mtp=True)
+    assert not mono.setup()
+    assert not mono.dense_mtp
+    assert reason in mono.reason
+
+
 def test_gdn_and_qsa_parts_follow_the_switch(monkeypatch):
     assert md.qsa_part(_config(monokernel=False)) is None
     assert md.qsa_part(_config(knobs={"qsa": False})) is None

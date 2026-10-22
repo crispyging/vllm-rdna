@@ -48,6 +48,35 @@ def run(mono: MonoLayer, hidden_states, attn_out, injection):
         (m, 4), dtype=hidden_states.dtype, device=hidden_states.device
     )
     out = torch.empty_like(attn_out)
+    if mono.dense_mtp and not getattr(mono, "_dense_call_logged", False):
+        mono._dense_call_logged = True
+        tensors = {
+            "res": hidden_states,
+            "blk": attn_out,
+            "inj": injection,
+            "res_out": res_out,
+            "inj_out": inj_out,
+            "out": out,
+            "workspace": mono.ws,
+            **t,
+        }
+        logger.info(
+            "dense MTP K2 call M=%d expert_base=%d tensors=%s",
+            m,
+            mono.base,
+            {
+                name: {
+                    "ptr": hex(x.data_ptr()),
+                    "bytes": x.numel() * x.element_size(),
+                    "shape": tuple(x.shape),
+                    "stride": tuple(x.stride()),
+                    "contiguous": x.is_contiguous(),
+                    "dtype": str(x.dtype),
+                    "device": str(x.device),
+                }
+                for name, x in tensors.items()
+            },
+        )
     torch.ops._rocm_C.mono_k2_rdna2(
         hidden_states,
         attn_out,
@@ -75,6 +104,7 @@ def run(mono: MonoLayer, hidden_states, attn_out, injection):
         mono.eps,
         2000.0,
         mono.is_mtp,
+        mono.dense_mtp,
     )
     return res_out, out, inj_out
 
