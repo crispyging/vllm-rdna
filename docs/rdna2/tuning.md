@@ -440,10 +440,12 @@ text-only, 262K, KV sized from free memory, int4 PLE.
 - **Decode cadence.** Each request decodes every `pp_size` steps, so per-request
   decode at c>1 drops; MTP pays off up to ~4 streams, MTP0 above.
 - **Memory.** Vision does not fit next to stage 0's layers (text-only), dense
-  INT8 must be `ONLY` mode, and the MTP drafter needs the W4A16 drafter
-  checkpoint (`tools/rdna/quant_mtp_experts.py`). Under PP the drafter shares
-  the last stage's target embedding and `lm_head` (CPU placeholders until
-  shared). On 30 GB V620s a full 262K request at MTP2 needs `GMEM=0.975`
+  INT8 must be `ONLY` mode. The W4A16 MTP drafter checkpoint
+  (`tools/rdna/quant_mtp_experts.py`) is required for MTP K2; compatible
+  attention HyperConnections can use opt-in MTP K1 without it. Under PP the
+  drafter shares the last stage's target embedding and `lm_head` (CPU
+  placeholders until shared). On 30 GB V620s a full 262K request at MTP2
+  needs `GMEM=0.975`
   (0.95 caps the length at ~188K); 32 GB cards fit it at 0.95.
 - **Partition.** 16,16,16 for MTP0; 17,17,14 for MTP2 (the drafter sits on the
   last stage). PLE layers must stay on stage 0.

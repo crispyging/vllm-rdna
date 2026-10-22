@@ -33,8 +33,10 @@ provably zero-Triton run omits `--monokernel`.
 `layout.py` holds the per-layer weight views, the workspace and the rdna_ar
 attach; `debug.py` the in-serve timing. Kernels: `csrc/rocm/mono_k2_rdna2.cu`
 (K1 + K2), `mono_gdn_rdna2.cu`, `mono_qsa_decode_rdna2.cu`. Torch ops:
-`vllm::qwen4_exp_mono_{k1,k2,gdn,mark}_rdna2`. Wider batches, prefill and the
-MTP drafter keep today's modules.
+`vllm::qwen4_exp_mono_{k1,k2,gdn,mark}_rdna2`. Wider batches and prefill keep
+today's modules. Opt-in MTP K1 can fuse compatible attention
+HyperConnections independently of K2; MTP K2 still requires the supported
+symmetric W4A16 FFN.
 
 ## Knobs (only read with `--monokernel`)
 

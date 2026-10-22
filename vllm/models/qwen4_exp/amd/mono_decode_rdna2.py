@@ -68,6 +68,8 @@ def options(vllm_config) -> Options | None:
     opts = Options.from_dict(knobs)
     opts.k1_max_rows = min(_MAX_ROWS, opts.k1_max_rows)
     opts.k2_max_rows = min(_MAX_ROWS, opts.k2_max_rows)
+    opts.mtp_k1_max_rows = max(0, min(_MAX_ROWS, opts.mtp_k1_max_rows))
+    opts.mtp_k2_max_rows = max(0, min(_MAX_ROWS, opts.mtp_k2_max_rows))
     opts.gdn_max_rows = min(_GDN_MAX_ROWS, opts.gdn_max_rows)
     return opts
 
@@ -153,6 +155,14 @@ def install(vllm_config) -> Options | None:
     opts = options(vllm_config)
     if opts is None:
         return None
+    if opts.mtp_drafter:
+        from vllm import envs
+
+        if not envs.VLLM_RAISE_ON_LOGIT_NANS:
+            raise ValueError(
+                "--monokernel MTP drafter requires VLLM_RAISE_ON_LOGIT_NANS=1 "
+                "to prevent a MonoKernel timeout from reaching sampling"
+            )
     why = config_refusal(vllm_config) or ops_refusal()
     if why is not None:
         raise ValueError(f"--monokernel {why}.")
@@ -175,7 +185,7 @@ def install(vllm_config) -> Options | None:
         spec = getattr(vllm_config, "speculative_config", None)
         width = 1 + (getattr(spec, "num_speculative_tokens", 0) or 0)
         qsa.DECODE_WIDTH = width
-        qsa_ops.MONO_QSA = qsa
+        qsa_ops.__dict__["MONO_QSA"] = qsa
     _log_parts(opts)
     return opts
 
@@ -197,6 +207,11 @@ def _log_parts(o: Options) -> None:
         "k2 in-kernel all-reduce" if o.k2_ar else "",
         "timing" if o.timing else "",
         "modules reference" if o.modules else "",
+        (
+            f"MTP drafter K1/K2 (<= {o.mtp_k1_max_rows}/{o.mtp_k2_max_rows} rows)"
+            if o.mtp_drafter
+            else ""
+        ),
     ]
     logger.info(
         "mono rdna2: --monokernel on TP rank %d: %s",
@@ -209,20 +224,34 @@ def layer_hook(
     layer, vllm_config, prefix: str, is_moe_layer: bool
 ) -> tuple[str | None, str | None]:
     """Qwen4ExpDecoderLayer: the forward-context names of its K1 and K2 ops
-    (None: today's modules). Main-model MoE layers only; the MTP drafter
-    keeps its modules."""
-    if not enabled(vllm_config) or not is_moe_layer or ".mtp." in f".{prefix}.":
+    (None: today's modules). MTP is a separate explicit opt-in; the regular
+    target-model route remains governed by the existing options."""
+    if not enabled(vllm_config) or not is_moe_layer:
+        return None, None
+    is_mtp = ".mtp." in f".{prefix}."
+    if is_mtp and not OPTS.mtp_drafter:
         return None, None
     k1_on, k2_on = OPTS.k1 or OPTS.timing, OPTS.k2 or OPTS.timing
     if not (k1_on or k2_on):
         return None, None
     why = moe_refusal(layer)
-    if why is not None:
+    if why is not None and not is_mtp:
         raise ValueError(f"--monokernel {why}.")
     from .mono.rdna2.layout import MonoLayer
 
     name = f"{prefix}.mono_rdna2"
-    vllm_config.compilation_config.static_forward_context[name] = MonoLayer(layer)
+    mono = MonoLayer(
+        layer,
+        is_mtp=is_mtp,
+        k1_max_rows=OPTS.mtp_k1_max_rows if is_mtp else OPTS.k1_max_rows,
+        k2_max_rows=OPTS.mtp_k2_max_rows if is_mtp else OPTS.k2_max_rows,
+    )
+    vllm_config.compilation_config.static_forward_context[name] = mono
+    if why is not None:
+        logger.warning_once(
+            "mono MTP drafter K2 stays on modules: %s; K1 is checked independently",
+            why,
+        )
     return (name if k1_on else None), (name if k2_on else None)
 
 

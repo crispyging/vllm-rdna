@@ -69,7 +69,7 @@ void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace,
                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                   double eps, double timeout_ms);
+                   double eps, double timeout_ms, bool reset_control = false);
 torch::Tensor mono_k2_rdna2_error(const torch::Tensor& workspace);
 void mono_k2_rdna2_mark(torch::Tensor& stats, int64_t kind, int64_t width);
 torch::Tensor mono_k2_rdna2_workspace_alloc(int64_t nbytes, int64_t device);
@@ -143,7 +143,7 @@ void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& wd, const torch::Tensor& wu,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
-                   double eps, double timeout_ms);
+                   double eps, double timeout_ms, bool reset_control = false);
 
 std::tuple<at::Tensor, at::Tensor> rdna_hc_mix_prefill(
     const at::Tensor& xn, const at::Tensor& w_down, const at::Tensor& w_up,

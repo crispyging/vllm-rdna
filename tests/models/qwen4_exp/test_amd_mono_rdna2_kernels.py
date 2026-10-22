@@ -197,7 +197,7 @@ def ffn_layer():
     L, G = _make_layer(gen, keep_golden=True)
     nb = int(torch.ops._rocm_C.mono_k2_rdna2_workspace_bytes(H, R, ND, E, ISE, INTER))
     ws = torch.zeros(nb + 8192, dtype=torch.uint8, device=DEV)
-    mono = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, th=L, eps_a=EPS)
+    mono = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, th=L, eps_a=EPS, is_mtp=False)
     return L, G, mono
 
 
@@ -247,6 +247,29 @@ def test_k2_matches_today(ffn_layer, M):
     assert err[0] == 0, f"sticky record {err[:3]}"
 
 
+def test_mtp_control_reset_is_captured_and_clears_sticky_error(ffn_layer):
+    """MTP's graph memset must clear a previous error before the fused launch."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
+
+    L, G, mono = ffn_layer
+    mtp = SimpleNamespace(t=L, ws=mono.ws, base=mono.base, eps=mono.eps, is_mtp=True)
+    res, blk, inj = _inputs(4, 704)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = k2.run(mtp, res, blk, inj)
+
+    # Model a previous failed launch's sticky header. This tests reset/replay,
+    # not an actual barrier timeout or worker recovery.
+    mono.ws.view(torch.int32)[2].fill_(1)
+    torch.accelerator.synchronize()
+    graph.replay()
+    _check_k2(L, G, got, res, blk, inj)
+    err = torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()
+    assert err[0] == 0, f"MTP replay did not clear the sticky record: {err[:3]}"
+
+
 @pytest.mark.parametrize("M", range(1, 25))
 def test_k1_matches_today(ffn_layer, M):
     from vllm.model_executor.layers import rdna_ops  # noqa: F401
@@ -286,13 +309,85 @@ def test_k1_matches_today(ffn_layer, M):
     check(got)
 
 
+def test_mtp_k1_runs_when_dense_k2_is_unsupported(monkeypatch):
+    """MTP K1 must remain usable when its dense FFN makes K2 fall back."""
+    from vllm import forward_context
+    from vllm.model_executor.layers import rdna_ops  # noqa: F401
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k1
+    from vllm.models.qwen4_exp.amd.mono.rdna2.layout import MonoLayer
+    from vllm.models.qwen4_exp.amd.ops.hc import hc_combine_norm
+
+    gen = torch.Generator(device=DEV).manual_seed(704)
+    L, _ = _make_layer(gen, keep_golden=False)
+
+    def hc():
+        return SimpleNamespace(
+            hc_count=HC,
+            use_combine=True,
+            input_mix_weight_down_block_inject=SimpleNamespace(
+                weight=L["wd"], weight_i8=None
+            ),
+            input_mix_weight_up=SimpleNamespace(weight=L["wu"], weight_i8=None),
+            hc_norm=SimpleNamespace(weight=L["norm_w"]),
+            config=SimpleNamespace(rms_norm_eps=EPS),
+        )
+
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(
+            gate=object(), experts=SimpleNamespace(quant_method=SimpleNamespace())
+        ),
+        mlp_hyper_connection=hc(),
+        attn_hyper_connection=hc(),
+    )
+    mono = MonoLayer(layer, is_mtp=True)
+    assert not mono.setup()  # Unsupported dense MTP FFN disables K2.
+    assert mono.setup_k1()
+
+    context = SimpleNamespace(no_compile_layers={"mtp.layers.0": mono})
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    monkeypatch.setattr(k1.OPTS, "k1", True)
+    monkeypatch.setattr(k1, "MODES", {"eager", "full"})
+    is_capturing = torch.cuda.is_current_stream_capturing
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(k1, "mode", lambda: "eager")
+
+    res, blk, inj = _inputs(4, 705)
+
+    def today():
+        ro, xn = hc_combine_norm(res, blk, inj, L["norm_w"], EPS, HC)
+        b, dai = torch.ops.vllm.rdna_hc_mix(
+            xn, L["wd"], None, None, L["wu"], None, None, R, HC
+        )
+        return ro, b, dai[:, R : R + HC]
+
+    def check(got):
+        ro, block_input, injection = got
+        ro_ref, block_input_ref, injection_ref = today()
+        torch.accelerator.synchronize()
+        assert torch.equal(ro, ro_ref)
+        assert (block_input.float() - block_input_ref.float()).abs().max().item() < 5e-3
+        assert (injection.float() - injection_ref.float()).abs().max().item() < 5e-3
+
+    check(k1._k1(res, blk, inj, "mtp.layers.0"))
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", is_capturing)
+    monkeypatch.setattr(k1, "mode", lambda: "full")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = k1._k1(res, blk, inj, "mtp.layers.0")
+    for tensor, new in zip((res, blk, inj), _inputs(4, 706)):
+        tensor.copy_(new)
+    graph.replay()
+    check(got)
+
+
 def test_k2_fail_stop_writes_nan(ffn_layer):
     """A sticky error record makes the next launch write NaN, not stale data."""
     from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
 
     L, _, mono = ffn_layer
     ws = torch.zeros_like(mono.ws)
-    fs = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS)
+    fs = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, is_mtp=False)
     res, blk, inj = _inputs(3, 7)
     ws[8:12].copy_(torch.tensor([1], dtype=torch.int32).view(torch.uint8))
     out = k2.run(fs, res, blk, inj)[1]

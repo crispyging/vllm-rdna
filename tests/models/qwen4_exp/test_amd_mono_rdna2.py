@@ -82,6 +82,31 @@ def test_knobs_dict_and_unknown_keys():
     assert md.options(_config(monokernel=False, knobs={"bogus": 1})) is None
 
 
+def test_mtp_drafter_is_opt_in_and_has_independent_row_caps():
+    assert not md.options(_config()).mtp_drafter
+    assert md.options(_config()).mtp_k2_max_rows == 24
+    opts = md.options(
+        _config(
+            knobs={
+                "mtp_drafter": True,
+                "mtp_k1_max_rows": 32,
+                "mtp_k2_max_rows": 3,
+            }
+        )
+    )
+    assert opts.mtp_drafter
+    assert (opts.mtp_k1_max_rows, opts.mtp_k2_max_rows) == (24, 3)
+
+
+def test_mtp_drafter_requires_nan_failstop(monkeypatch, deployment):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_RAISE_ON_LOGIT_NANS", False)
+    cfg = _config(knobs={"mtp_drafter": True})
+    with pytest.raises(ValueError, match="requires VLLM_RAISE_ON_LOGIT_NANS=1"):
+        md.install(cfg)
+
+
 def _engine_config(monkeypatch, *args, env=None):
     from vllm.platforms import current_platform
 
@@ -245,12 +270,86 @@ def test_switch_adds_no_parameters_and_keeps_values(monkeypatch, deployment):
     assert all(torch.equal(on_state[k], off_state[k]) for k in on_state)
 
 
-def test_drafter_and_dense_layers_keep_their_modules(deployment):
+def test_mtp_drafter_stays_on_modules_by_default(deployment):
     cfg = _config()
     OPTS.assign(md.options(cfg))
     layer = _Layer(CompressedTensorsWNA16RDNA2MoEMethod())
     assert md.layer_hook(layer, cfg, "mtp.layers.0", True) == (None, None)
     assert md.layer_hook(layer, cfg, "model.layers.0", False) == (None, None)
+
+
+def test_mtp_drafter_opt_in_registers_isolated_mono_layer(monkeypatch, deployment):
+    import vllm.model_executor.layers.fused_moe.experts.rdna2_w4a16_moe as moe
+
+    monkeypatch.setattr(moe, "resolve_w4a8_moe", lambda: False)
+    cfg = _config(
+        knobs={"mtp_drafter": True, "mtp_k1_max_rows": 3, "mtp_k2_max_rows": 4}
+    )
+    OPTS.assign(md.options(cfg))
+    layer = _Layer(CompressedTensorsWNA16RDNA2MoEMethod())
+    names = md.layer_hook(layer, cfg, "mtp.layers.0", True)
+    assert names == ("mtp.layers.0.mono_rdna2",) * 2
+    mono = cfg.compilation_config.static_forward_context[names[0]]
+    assert mono.is_mtp
+    assert (mono.k1_max_rows, mono.k2_max_rows) == (3, 4)
+
+    # Opting in for the drafter must not change the target-model route.
+    target_layer = _Layer(CompressedTensorsWNA16RDNA2MoEMethod())
+    target_names = md.layer_hook(target_layer, cfg, "model.layers.0", True)
+    assert target_names == ("model.layers.0.mono_rdna2",) * 2
+    assert not cfg.compilation_config.static_forward_context[target_names[0]].is_mtp
+
+
+def test_unsupported_mtp_drafter_keeps_module_fallback(monkeypatch, deployment):
+    import vllm.model_executor.layers.fused_moe.experts.rdna2_w4a16_moe as moe
+
+    monkeypatch.setattr(moe, "resolve_w4a8_moe", lambda: False)
+    cfg = _config(knobs={"mtp_drafter": True})
+    OPTS.assign(md.options(cfg))
+    layer = _Layer(SimpleNamespace())
+    names = md.layer_hook(layer, cfg, "mtp.layers.0", True)
+    assert names == ("mtp.layers.0.mono_rdna2",) * 2
+    mono = cfg.compilation_config.static_forward_context[names[0]]
+    assert not mono.setup()
+    assert not mono.ready
+
+
+def test_mtp_k1_setup_is_independent_of_unsupported_k2(monkeypatch):
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import layout
+
+    def hc():
+        down = SimpleNamespace(
+            weight=torch.empty((4, 8), dtype=torch.float16), weight_i8=None
+        )
+        up = SimpleNamespace(
+            weight=torch.empty((8, 4), dtype=torch.float16), weight_i8=None
+        )
+        return SimpleNamespace(
+            hc_count=4,
+            use_combine=True,
+            input_mix_weight_down_block_inject=down,
+            input_mix_weight_up=up,
+            hc_norm=SimpleNamespace(weight=torch.ones(8, dtype=torch.float16)),
+            config=SimpleNamespace(rms_norm_eps=1e-6),
+        )
+
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(
+            gate=object(), experts=SimpleNamespace(quant_method=SimpleNamespace())
+        ),
+        mlp_hyper_connection=hc(),
+        attn_hyper_connection=hc(),
+    )
+    monkeypatch.setattr(layout, "workspace", lambda device, scope: object())
+    monkeypatch.setattr(layout.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(layout, "ZEROS", {})
+
+    mono = layout.MonoLayer(layer, is_mtp=True)
+    assert mono.setup_k1()
+    assert mono.k1_ready and mono.hc_ok
+    assert not mono.setup()
+    assert not mono.ready
+    assert mono.k1_ready
 
 
 def test_gdn_and_qsa_parts_follow_the_switch(monkeypatch):

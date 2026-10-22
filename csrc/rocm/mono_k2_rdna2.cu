@@ -23,9 +23,10 @@
 // they are deterministic. Phases are separated by a grid barrier on a
 // generation counter in global memory (agent-scope atomics, bounded wait, no
 // grid.sync). A timed-out wait writes a sticky {code, phase, wg} record and
-// every WG leaves; the record stays set until the host clears it, and a
-// launch that starts with it set writes NaN and exits (fail-stop: the caller
-// must check mono_k2_rdna2_error()).
+// each WG poisons caller-visible outputs before leaving; callers must fail
+// stop on NaN. Opt-in MTP calls enqueue a same-stream control-header memset
+// before the persistent launch so a prior timeout cannot latch later calls.
+// The memset is a graph memset node, not an additional HIP kernel launch.
 //
 // Plain launch, one stream, capturable. The grid must be co-resident: the WG
 // count is the residency cap derived from the code object (2 WGs per CU,
@@ -223,6 +224,18 @@ __device__ __forceinline__ bool err_set(Ctrl* c) {
                            __HIP_MEMORY_SCOPE_AGENT) != 0;
 }
 
+__device__ __forceinline__ void poison_outputs(const Params& p, int wg,
+                                                int tid, int G) {
+  const half nan = __float2half(__int_as_float(0x7fc00000));
+  for (int i = wg * kThreads + tid; i < p.M * kHC * p.H;
+       i += G * kThreads)
+    p.res_out[i] = nan;
+  for (int i = wg * kThreads + tid; i < p.M * kHC; i += G * kThreads)
+    p.inj_out[i] = nan;
+  for (int i = wg * kThreads + tid; i < p.M * p.H; i += G * kThreads)
+    p.out[i] = nan;
+}
+
 // Returns false if this WG must leave (timeout here or elsewhere).
 struct NoPrefetch {
   __device__ void operator()(int, uint32_t&, const volatile int*) const {}
@@ -321,6 +334,7 @@ __device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
   }
   __syncthreads();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  if (!*s_flag) poison_outputs(p, blockIdx.x, threadIdx.x, gridDim.x);
   return *s_flag != 0;
 }
 
@@ -818,9 +832,7 @@ __global__ void __launch_bounds__(kThreads)
   const int M = p.M, H = p.H, HCH = kHC * p.H, R = p.R, ND = p.ND;
 
   if (err_set(p.ctrl)) {  // fail-stop: a previous launch timed out
-    for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
-      p.out[i] =
-          __float2half(__int_as_float(0x7fc00000));  // NaN, not stale data
+    poison_outputs(p, wg, tid, G);
     return;
   }
   unsigned long long* const sc =
@@ -1759,8 +1771,10 @@ __global__ void __launch_bounds__(kThreads)
       s_ar_ok = ok;
     }
     __syncthreads();
-    if (wg == 0 && !s_ar_ok)
+    if (wg == 0 && !s_ar_ok) {
+      poison_outputs(p, wg, tid, G);
       return;  // sticky error set: the others leave the barrier
+    }
     if (!grid_barrier(p, 8, &s_flag)) return;
     const half* stage = reinterpret_cast<const half*>(p.ar.peers.stage[me]) +
                         (long long)par * W * slot;
@@ -1918,7 +1932,8 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         torch::Tensor& out, torch::Tensor& workspace,
                         int64_t expert_base, int64_t zero_offset,
                         int64_t num_wg, double eps, double timeout_ms,
-                        const GdnArgs* gdn = nullptr) {
+                        const GdnArgs* gdn = nullptr,
+                        bool reset_control = false) {
   using namespace mono_ffn;
   const bool hc_only = wr == nullptr && gdn == nullptr;  // K1 only
   const int M = res.size(0);
@@ -2088,6 +2103,13 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         res.get_device());
   p.timeout_ticks = (unsigned long long)(timeout_ms * (khz > 0 ? khz : 100000));
   auto stream = at::cuda::getCurrentCUDAStream();
+  if (reset_control) {
+    const hipError_t reset_err =
+        hipMemsetAsync(p.ctrl, 0, offsetof(Ctrl, ts), stream);
+    TORCH_CHECK(reset_err == hipSuccess,
+                "mono_ffn: MTP control reset failed: ",
+                hipGetErrorString(reset_err));
+  }
   auto launch = [&](auto kern, int slot) {
     // The grid barrier needs every WG resident. hipOccupancy* counts WGPs on
     // gfx10 and under-reports by 2x (P0 probe), so derive the per-CU limit
@@ -2138,10 +2160,11 @@ void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace,
                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
-                   double eps, double timeout_ms) {
+                   double eps, double timeout_ms, bool reset_control) {
   mono_launch(res, blk, inj, norm_w, wd, wu, &wr, &se_w1, &se_w2, &se_wg, &w13,
               &s13, &z13, &w2, &s2, &z2, res_out, inj_out, out, workspace,
-              expert_base, zero_offset, num_wg, eps, timeout_ms);
+              expert_base, zero_offset, num_wg, eps, timeout_ms, nullptr,
+              reset_control);
 }
 
 // E1: K1 + the GDN (linear-attention) decode of one layer in one launch.
@@ -2175,10 +2198,11 @@ void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& wd, const torch::Tensor& wu,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
-                   double eps, double timeout_ms) {
+                   double eps, double timeout_ms, bool reset_control) {
   mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out,
-              inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms);
+              inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms, nullptr,
+              reset_control);
 }
 
 // Sticky error record of a workspace: [code, phase, wg] (int32, CPU tensor).

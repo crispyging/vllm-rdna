@@ -11,7 +11,8 @@ expert and the routed symmetric W4A16 experts (``_rocm_C::mono_k2_rdna2``,
 The FFN block is per token, so the kernel is valid for any batch of at most
 ``k2_max_rows`` rows (<= 24): FULL and PIECEWISE CUDA graph captures and eager
 steps alike (``k2_modes``, default all three). Larger batches (prefill chunks)
-and unsupported layers run today's modules; the MTP drafter never takes it.
+and unsupported layers run today's modules. The MTP drafter can opt in
+separately and uses its own row cap and workspace.
 The decision is made at run time inside one opaque custom op
 (``vllm::qwen4_exp_mono_k2_rdna2``), so torch.compile sees a single op and the
 branch follows the actual batch, not the trace-time size.
@@ -26,7 +27,14 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from . import OPTS, debug
-from .layout import LOGGED, MAX_ROWS, MODES, MonoLayer, ar_fused, mode
+from .layout import (
+    LOGGED,
+    MAX_ROWS,
+    MODES,
+    MonoLayer,
+    ar_fused,
+    mode,
+)
 
 logger = init_logger(__name__)
 
@@ -66,6 +74,7 @@ def run(mono: MonoLayer, hidden_states, attn_out, injection):
         OPTS.k2_num_wg,
         mono.eps,
         2000.0,
+        mono.is_mtp,
     )
     return res_out, out, inj_out
 
@@ -88,7 +97,7 @@ def _k2(
     md = mode()
     fits = 0 < m <= MAX_ROWS and hidden_states.dtype == torch.float16 and mono.ready
     use = (
-        fits and OPTS.k2 and not OPTS.modules and m <= OPTS.k2_max_rows and md in MODES
+        fits and OPTS.k2 and not OPTS.modules and m <= mono.k2_max_rows and md in MODES
     )
     key = (m, md, use)
     if key not in LOGGED:
@@ -99,9 +108,9 @@ def _k2(
             md,
             "mono kernel" if use else "modules",
         )
-    timed = OPTS.timing and fits and md != "eager"
+    timed = OPTS.timing and fits and md != "eager" and not mono.is_mtp
     st = debug.STATS.get(hidden_states.device.index) if timed else None
-    if OPTS.timing and not torch.cuda.is_current_stream_capturing():
+    if OPTS.timing and not mono.is_mtp and not torch.cuda.is_current_stream_capturing():
         debug.log_stats()
     if st is not None:
         mark = torch.ops._rocm_C.mono_k2_rdna2_mark

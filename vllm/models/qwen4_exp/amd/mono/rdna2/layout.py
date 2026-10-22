@@ -13,7 +13,7 @@ from . import OPTS
 logger = init_logger(__name__)
 
 MAX_ROWS = 24  # widest batch K1 / K2 are built for
-_WORKSPACES: dict[int, torch.Tensor] = {}
+_WORKSPACES: dict[tuple[int, str], torch.Tensor] = {}
 _AR_MAX: dict[int, int] = {}  # per device: rdna_ar slot bytes once attached
 ZEROS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 LOGGED: set = set()
@@ -48,19 +48,24 @@ def set_modes() -> None:
     MODES.update(x.strip() for x in str(OPTS.k2_modes).split(",") if x.strip())
 
 
-def workspace(device: torch.device) -> torch.Tensor:
-    """One zero-initialized workspace per device, allocated outside capture."""
+def workspace(device: torch.device, scope: str = "model") -> torch.Tensor:
+    """One zero-initialized workspace per device and execution scope."""
     from . import debug
 
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    ws = _WORKSPACES.get(idx)
+    idx = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    key = (idx, scope)
+    ws = _WORKSPACES.get(key)
     if ws is None:
         ops = torch.ops._rocm_C
         nbytes = int(ops.mono_k2_rdna2_workspace_bytes(2560, 320, 336, 512, 160, 640))
         # explicit coarse-grained allocation, not the caching allocator (whose
         # blocks can be fine-grained under HSA_FORCE_FINE_GRAIN_PCIE=1)
         ws = ops.mono_k2_rdna2_workspace_alloc(nbytes + 8192, idx)
-        _WORKSPACES[idx] = ws
+        _WORKSPACES[key] = ws
         probe = torch.empty(1, dtype=torch.uint8, device=device)
         logger.info(
             "mono k2_rdna2: workspace %d B on cuda:%d, HSA global flags %d "
@@ -78,7 +83,7 @@ def workspace(device: torch.device) -> torch.Tensor:
         st[sc + 0] = -1  # entry_min
         st[sc + 5] = OPTS.k2_sleep
         st[sc + 6] = OPTS.k2_flags
-        if OPTS.timing:
+        if OPTS.timing and scope == "model":
             st[sc + 3] = 1  # enabled
             debug.STATS[idx] = st
     return ws
@@ -116,10 +121,22 @@ class MonoLayer:
     first eager call, after process_weights_after_loading). ``ready`` stays
     False, with a warning, for a geometry the kernel does not cover."""
 
-    def __init__(self, layer: torch.nn.Module):
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        *,
+        is_mtp: bool = False,
+        k1_max_rows: int | None = None,
+        k2_max_rows: int | None = None,
+    ):
         self.layer = layer
+        self.is_mtp = is_mtp
+        self.k1_max_rows = OPTS.k1_max_rows if k1_max_rows is None else k1_max_rows
+        self.k2_max_rows = OPTS.k2_max_rows if k2_max_rows is None else k2_max_rows
         self.first = getattr(layer, "layer_idx", None) == 0
         self.ready = False
+        self.k1_ready = False
+        self.k1_reason = ""
         self.hc_ok = False
         self.reason = ""
 
@@ -135,6 +152,83 @@ class MonoLayer:
                 "mono k2_rdna2 disabled for %s: %s", type(self.layer).__name__, e
             )
         return self.ready
+
+    def setup_k1(self) -> bool:
+        """Resolve only the HC tensors needed by K1.
+
+        MTP's dense FFN can be unsupported by K2 while its attention
+        HyperConnection still has the exact K1 layout. Keep these readiness
+        checks independent so that K2 can fall back without disabling K1.
+        """
+        if self.k1_ready or self.k1_reason:
+            return self.k1_ready
+        try:
+            self._setup_k1()
+            self.k1_ready = True
+        except Exception as e:  # unsupported HC geometry: stay on modules
+            self.k1_reason = str(e)
+            logger.warning_once(
+                "mono k1_rdna2 disabled for %s: %s",
+                type(self.layer).__name__,
+                e,
+            )
+        return self.k1_ready
+
+    def _setup_k1(self) -> None:
+        layer = self.layer
+        mlp_hc = layer.mlp_hyper_connection
+        attn_hc = layer.attn_hyper_connection
+        if mlp_hc.hc_count != 4 or not mlp_hc.use_combine:
+            raise ValueError("MLP hyper-connection must be hc_count 4 with combine")
+        if attn_hc.hc_count != 4 or not attn_hc.use_combine:
+            raise ValueError(
+                "attention hyper-connection must be hc_count 4 with combine"
+            )
+
+        mlp_down = mlp_hc.input_mix_weight_down_block_inject
+        mlp_up = mlp_hc.input_mix_weight_up
+        down = attn_hc.input_mix_weight_down_block_inject
+        up = attn_hc.input_mix_weight_up
+        for name, weight in (
+            ("MLP down", mlp_down),
+            ("MLP up", mlp_up),
+            ("attention down", down),
+            ("attention up", up),
+        ):
+            if getattr(weight, "weight_i8", None) is not None:
+                raise ValueError(f"{name} HC int8 shadow is not supported")
+        if (
+            down.weight.shape != mlp_down.weight.shape
+            or up.weight.shape != mlp_up.weight.shape
+        ):
+            raise ValueError("attention and MLP HC weight shapes differ")
+        norm_w = attn_hc.hc_norm.weight
+        if any(
+            weight.dtype != torch.float16 for weight in (norm_w, down.weight, up.weight)
+        ):
+            raise ValueError("attention HC weights must be fp16")
+        if any(weight.device != down.weight.device for weight in (norm_w, up.weight)):
+            raise ValueError("attention HC weights must share a device")
+
+        self.th = dict(norm_w=norm_w, wd=down.weight, wu=up.weight)
+        self.eps_a = float(attn_hc.config.rms_norm_eps)
+        self.hc_ok = True
+        idx = down.weight.device.index
+        if idx is None:
+            idx = torch.accelerator.current_device_index()
+        if idx not in ZEROS:
+            ZEROS[idx] = (
+                torch.zeros(
+                    MAX_ROWS,
+                    2560,
+                    dtype=torch.float16,
+                    device=down.weight.device,
+                ),
+                torch.zeros(
+                    MAX_ROWS, 4, dtype=torch.float16, device=down.weight.device
+                ),
+            )
+        self.ws = workspace(down.weight.device, "mtp" if self.is_mtp else "model")
 
     def _setup(self):
         layer = self.layer
@@ -204,7 +298,7 @@ class MonoLayer:
         )
         self.base = base
         self.eps = float(hc.config.rms_norm_eps)
-        self.ws = workspace(router.device)
+        self.ws = workspace(router.device, "mtp" if self.is_mtp else "model")
         # K1: the attention-side HC module, same geometry as the MLP one
         ahc = layer.attn_hyper_connection
         adown = ahc.input_mix_weight_down_block_inject
@@ -220,6 +314,7 @@ class MonoLayer:
         if self.hc_ok:
             self.th = dict(norm_w=ahc.hc_norm.weight, wd=adown.weight, wu=aup.weight)
             self.eps_a = float(ahc.config.rms_norm_eps)
+            self.k1_ready = True
             idx = router.device.index
             if (
                 idx not in ZEROS

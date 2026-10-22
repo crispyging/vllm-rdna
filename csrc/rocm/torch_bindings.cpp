@@ -97,7 +97,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor se_wg, Tensor w13, Tensor s13, Tensor z13, Tensor w2, Tensor s2, "
       "Tensor z2, Tensor! res_out, Tensor! inj_out, Tensor! out, "
       "Tensor! workspace, int expert_base, int zero_offset, int num_wg, "
-      "float eps, float timeout_ms) -> ()");
+      "float eps, float timeout_ms, bool reset_control=False) -> ()");
   rocm_ops.impl("mono_k2_rdna2", torch::kCUDA, &mono_k2_rdna2);
   rocm_ops.def("mono_k2_rdna2_error(Tensor workspace) -> Tensor");
   rocm_ops.impl("mono_k2_rdna2_error", torch::kCUDA, &mono_k2_rdna2_error);
@@ -116,7 +116,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "wd, "
       "Tensor wu, Tensor! res_out, Tensor! inj_out, Tensor! out, Tensor! "
       "workspace, "
-      "int num_wg, float eps, float timeout_ms) -> ()");
+      "int num_wg, float eps, float timeout_ms, bool reset_control=False) -> ()");
   rocm_ops.impl("mono_k1_rdna2", torch::kCUDA, &mono_k1_rdna2);
   rocm_ops.def(
       "mono_k2_rdna2_e1a(Tensor res, Tensor blk, Tensor inj, Tensor norm_w, "
