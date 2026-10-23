@@ -29,7 +29,7 @@ measures the cost of that on synthetic rows with two channels scaled 40x:
 
 **Its dequant lands on the wrong hardware path.** The cached values are
 unpacked to FP32 and multiplied against an FP32 query
-(`int4_per_token_head.py:440`, `:527`, and the dot at `:571`). gfx1030 has no
+(`vllm/v1/attention/ops/int4_per_token_head.py:440`, `:527`, and the dot at `:571`). gfx1030 has no
 FP32 matrix instruction, so an FP32 `tl.dot` cannot use the packed path. The
 established RDNA2 inner product in this fork is `v_dot2_f32_f16` with FP32
 accumulate (`docs/rdna/monokernel/README.md:104`). An FP32 dot is the
@@ -273,13 +273,14 @@ If INT8 is on the table at all, the scale format is forced:
 | `int8_fp16_block` k=32 | 8.500 | **39.475** | **45.594** | 0 |
 | `int8_fp32_block` k=32 | 9.000 | 39.476 | 45.593 | 0 |
 | `int8_e8m0_block` k=32 | 8.250 | 36.587 | 41.913 | 0 |
-| `int8_e4m3_block` k=32 | 8.250 | 35.952 | 35.304 | 190 |
+| `int8_e4m3_block` k=32 | 8.250 | 35.952 | 35.304 | 190 K / 247 V |
 
 - **INT8 + FP16 is the best INT8 format measured**, and it needs no second
   level: FP16's exponent range is wide enough that no block scale underflows.
 - **E4M3 cannot hold an INT8 block scale.** The scale is `absmax / 127`,
-  which lands in E4M3's subnormal range for 190 of 256 blocks, and the SNR
-  falls off a cliff on the V side (35.304 dB). This is the same narrow-range
+  which lands in E4M3's subnormal range for 190 of 256 blocks on the K side
+  and 247 of 256 on the V side, and the SNR falls off a cliff on the V side
+  (35.304 dB). This is the same narrow-range
   problem that forces NVFP4's global scale, and it is worse for INT8 than for
   INT4 because the scale itself is smaller.
 - **E8M0 costs 2.9 to 3.7 dB against FP16** for 3 % less memory, for the
@@ -310,10 +311,16 @@ Two further costs that do not show up in an SNR table:
   (`v_cvt_f32_i32` -> `v_mul_f32` -> `v_cvt_f16_f32`) is about 3 ops per
   element on 1 byte per element. INT4 is about 2.5 ops per element but on
   0.5 byte per element, because unpacking a nibble pair costs a shift and a
-  mask. Per *byte* that is roughly twice the arithmetic. On a bandwidth-bound
-  decode that is the right trade - the V620's 896 GB/s is the limit - but on a
-  compute-bound prefill it may not be, and that is a measurement, not an
-  argument.
+  mask. Per *byte* that is roughly twice the arithmetic. Counting the whole
+  read path - the conversion, the dot and the probability pass - this
+  proposal's INT4 read is 8.1 instructions per element on 1.125 bytes, i.e.
+  7.2 instructions per byte, against 8.5 on 2.063 bytes for INT8, i.e. 4.1 per
+  byte: **1.75x the arithmetic per byte**, against 1.8x less traffic. On a
+  bandwidth-bound decode that is the right trade - the V620's 512 GB/s is the
+  limit - but on a compute-bound prefill it may not be, and that is a
+  measurement, not an argument. The break-even moves with it: the narrow
+  format has to keep about 7 compute units busy before its byte saving beats
+  its instruction count, against about 8 for INT8.
 - **The scale costs 2 bytes per block, not 1.** At `k=32` that is 0.25
   bits/value more than a one-byte scale, i.e. 5.6 % more KV DRAM traffic than
   `int4_e8m0_block` k=32 and 0.25 bits/value less than the shipped format's
@@ -326,8 +333,12 @@ the fork's evidence is strongest and where a new format is least needed.
 
 FP8 e4m3 with a per-tensor scale costs **8.000 bits/value**. It is
 `--kv-cache-dtype fp8`, it needs no new kernel, and it is the only KV cache
-dtype with a measurement on the V620: about 2x the memory saved and +0.1 PPL
-(`QUAL_FORMATS.md:479`, `:483`, `:587`, `:695`).
+dtype with a measurement on the V620: about 2x the memory saved and +0.1 PPL.
+The format itself is documented in
+`docs/features/quantization/quantized_kvcache.md`; the PPL figure comes from
+a V620 measurement kept outside this tree, so it is the one number here a
+reviewer cannot open from the repository and should be treated as a
+recollection rather than a citation.
 
 `int8_e8m0_block` - the OCP MXINT8 geometry - costs **8.250 bits/value**. It
 is 3 % *more* memory than the FP8 that already ships, it needs a new element
@@ -382,7 +393,7 @@ rounding rules:
 | Rule | Behaviour |
 | --- | --- |
 | OCP MX v1.0 "floor" | `shared_exp = floor(log2(amax)) - emax_elem`. The block maximum lands in `[4, 8)` and **saturates** at 7 whenever the fractional part of `log2(amax)` exceeds `log2(7/4)`. |
-| Round-up ("rceil") | The smallest power of two with `7 * scale >= amax`. Nothing saturates. This is what the fork's own MXFP8 code does (`mxfp8_utils.py:62`, `input_quant_fp8.py:249`, `per_token_group_fp8_quant.py:155`). |
+| Round-up ("rceil") | The smallest power of two with `7 * scale >= amax`. Nothing saturates. This is what the fork's own MXFP8 code does (`vllm/model_executor/layers/quantization/utils/mxfp8_utils.py:62`, `vllm/model_executor/layers/quantization/input_quant_fp8.py:249`, `vllm/kernels/helion/ops/per_token_group_fp8_quant.py:155`). |
 
 Measured: the floor rule clipped 17 of 256 blocks at `k=32` and 33 of 256 at
 `k=16`. The round-up rule never clips, and costs about 3 dB against an FP16
@@ -418,23 +429,24 @@ than E8M0, and it is the one the codec already models.
 The format is only worth having if the kernel is native. Three decisions
 follow from the hardware, and none of them are the MX defaults.
 
-**Apply the block scale per element, not per partial dot.** The MX idiom is
-to promote the block scale to the matrix-multiplication boundary and scale
-each partial accumulator. That is a tensor-core idiom, and gfx1030 has no
-matrix instruction. Here the two options cost:
-
-- per element: `head_size` packed FP16 ops per (token, head)
-- per partial dot: `(head_size/k)` blocks times `head_size` accumulator ops,
-  i.e. `head_size^2 / k`
-
-At `head_size=128, k=32` that is 128 against 512 ops; at `head_size=256,
-k=32` it is 256 against 2048. The real target is `head_size=256` (Qwen3.8-27B
-has 256-dim heads), where per-element application is 8x cheaper. The
-dequantised values are converted to FP16 in registers and fed straight into
-`v_dot2_f32_f16`, exactly like the proven INT8 pattern in
-`csrc/rocm/fa_rdna2.cu` - a packed dword load, a sign-extend, a scale
-multiply and an FP16 convert, with the dequant living in VGPRs and no
-materialised FP16 workspace.
+**Apply the block scale per element, because on this path there is no
+per-partial-dot option.** The MX idiom is to promote the block scale to the
+matrix-multiplication boundary and scale each partial accumulator. That is a
+tensor-core idiom, and gfx1030 has no matrix instruction - and the
+`head_size^2 / k` figure that goes with it describes only a *split-dot*
+implementation, which needs a quantised query. This path has an FP16 query
+and one FP16 dot over the whole head dimension in a single inner loop, so
+there is no partial accumulator to scale. A scale that varies inside the
+head therefore cannot be folded into the per-token score, and it costs `1/k`
+of an instruction per element - 0.031 slots at `k=32`, 1.5 % - against the
+`head_size^2 / k` accumulator operations an MX-shaped implementation would
+carry (512 ops at `head_size=128, k=32`; 2048 at `head_size=256`). For the
+4-bit formats the scale is free on top of that, because it rides inside the
+dequantise that had to happen anyway. The dequantised values are converted to
+FP16 in registers and fed straight into `v_dot2_f32_f16`, exactly like the
+proven INT8 pattern in `csrc/rocm/fa_rdna2.cu` - a packed dword load, a
+sign-extend, a scale multiply and an FP16 convert, with the dequant living
+in VGPRs and no materialised FP16 workspace.
 
 **Hoist the zero-point out of the element loop.** With `x_hat = (q - zp) * s`
 the subtraction can be taken out of the inner loop entirely:
@@ -444,7 +456,7 @@ the subtraction can be taken out of the inner loop entirely:
   over the query rather than over the cache, so it costs one FMA per
   (query, block) and nothing per element. This is the same correction the
   shipped Triton kernel already applies
-  (`int4_per_token_head.py:570-572`).
+  (`vllm/v1/attention/ops/int4_per_token_head.py:570-572`).
 - PV side: `out_b = s_b * (dot(P_b, c_b) - zp_b * sum(P_b))`. The per-block
   probability mass is needed anyway, because per-block value scales already
   force a segmented PV accumulation.
@@ -479,7 +491,7 @@ have to touch.
 | mode enum | `vllm/v1/kv_cache_interface.py:39` | add a `KVQuantMode` value and map it in `get_kv_quant_mode` (`:84`) |
 | page size | `vllm/v1/kv_cache_interface.py:86` | the scale bytes are part of the page, so the spec has to account for `head_size/k` FP16 scales per head |
 | attention ops | `vllm/v1/attention/ops/` | a new module next to `int4_per_token_head.py`, owning nibble pack/unpack, the reshape (write) kernel and the split-dot (read) kernel |
-| backend opt-in | `vllm/v1/attention/backends/rdna_attn.py:583` | `supported_kv_cache_dtypes` |
+| backend opt-in | `vllm/v1/attention/backends/rdna_attn.py:601` | `supported_kv_cache_dtypes` |
 
 The Triton backend already lists `int4_per_token_head`
 (`vllm/v1/attention/backends/triton_attn.py:320`), so H3 is the fork's own
@@ -506,7 +518,7 @@ What is missing, and what is wrong:
    `torch.ops._rocm_C`, so the registration and the
    `vllm/v1/attention/ops/fa_rdna2_backend.py` shim both have to change.
 2. **The writer has a real defect, and it is in this tree already.**
-   `csrc/rocm/fa_rdna2.cu:4628` writes the four bytes of a slot's FP32 scale
+   `csrc/rocm/fa_rdna2.cu:4681` writes the four bytes of a slot's FP32 scale
    at `HEAD_DIM * block_size + slot_in_block + d`. With the declared
    `[num_blocks, H_kv, HEAD_DIM+4, block_size]` layout and
    `stride_d = block_size`, that address is *not* `(HEAD_DIM + d) *
@@ -557,13 +569,16 @@ document:
   [PR #71](https://github.com/opengfx1030/vllm-rdna/pull/71) and implemented
   in the `humanwork-legacy` tree at commit `3baecdb516` ("feat(rocm): fp8 +
   int8 KV cache decode and prefill for fa_rdna2"). It is a *different* format:
-  symmetric INT8 with a per-(token, head) **FP32** scale, native INT8 prefill
-  and decode kernels in `csrc/rocm/fa_rdna2.cu`, and an INT8 writer
+  symmetric INT8 with a per-(token, head) **FP32** scale, int8-storage prefill
+  and decode kernels in `csrc/rocm/fa_rdna2.cu` - the cache is int8, but the
+  dot is FP16 in both of them: the decode path dequantises each element into an
+  FP16 shared tile and the prefill path dequantises in VGPRs, and neither
+  uses an integer dot instruction - and an INT8 writer
   (`reshape_and_cache_int8_rdna2`). In this tree it is not reachable:
   `fa_rdna2_prefill_paged_varlen_int8` and `fa_rdna2_decode_paged_int8` are
   not registered in `csrc/rocm/torch_bindings.cpp`, and
   `RdnaAttentionBackend._can_run_fa_rdna2` rejects every quantised KV dtype
-  (`vllm/v1/attention/backends/rdna_attn.py:281`).
+  (`vllm/v1/attention/backends/rdna_attn.py:283`).
 
   That work is this proposal's most likely *host*, and the port is mapped in
   *The INT8 backport* above. It is also this proposal's clearest benchmark:
