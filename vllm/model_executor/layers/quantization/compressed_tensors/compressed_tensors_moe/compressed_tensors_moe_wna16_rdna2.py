@@ -230,7 +230,7 @@ def _rdna2_fused_moe(
         global_num_experts = layer.w13_weight_packed.shape[0]
 
     use_large_prefill_tile8 = (
-        num_tokens >= 4096
+        num_tokens >= 1024
         and dtype == torch.float16
         and hidden_size == 2560
         and intermediate_size == 640
@@ -240,7 +240,8 @@ def _rdna2_fused_moe(
         and layer.w13_weight_scale.shape[1] == 20
         and layer.w2_weight_scale.shape[1] == 5
     )
-    # Tile 8 is measured for this Qwen4-Exp geometry; retain existing choices elsewhere.
+    # Tile 8 wins from M=1024 for this exact FP16 Qwen4-Exp geometry; keep
+    # smaller mixed batches on tile 4 and all other shapes on existing choices.
     block_size_m = 8 if use_large_prefill_tile8 else (1 if num_tokens <= 4 else 4)
 
     if use_large_prefill_tile8:

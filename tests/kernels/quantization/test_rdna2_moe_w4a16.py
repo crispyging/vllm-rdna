@@ -183,9 +183,10 @@ def test_fused_moe_w1_matches_dense(
 
 
 @gfx1030_only
-def test_v620_moe_prefill_tile8_matches_tile4():
-    """The qualified V620 expert shape must preserve the existing tile output."""
-    experts, hidden, gate_up, top_k, group_size, tokens = 16, 2560, 1280, 10, 128, 64
+@pytest.mark.parametrize("tokens", [64, 533, 768, 1024, 1536])
+def test_v620_moe_prefill_tiles_match(tokens):
+    """Larger M tiles preserve W13 and fused W2 outputs across the crossover."""
+    experts, hidden, gate_up, top_k, group_size = 16, 2560, 1280, 10, 128
     torch.manual_seed(42)
     x = torch.randn(tokens, hidden, dtype=torch.float16, device=device)
     weight = _make_packed_weights(experts, hidden, gate_up)
@@ -195,6 +196,12 @@ def test_v620_moe_prefill_tile8_matches_tile4():
         0, experts, (tokens, top_k), device=device, dtype=torch.int32
     )
     outputs = []
+    down_outputs = []
+    down_weight = _make_packed_weights(experts, 640, hidden)
+    down_scales = _make_scales(experts, 640 // group_size, hidden, torch.float16)
+    down_zeros = _make_qzeros(experts, 640 // group_size, hidden)
+    down_input = torch.randn(tokens * top_k, 640, dtype=torch.float16, device=device)
+    topk_weights = torch.softmax(torch.randn(tokens, top_k, device=device), dim=-1)
     for block_size_m in (4, 8):
         sorted_ids, expert_ids, padded_count = moe_align_block_size(
             topk_ids, block_size_m, experts
@@ -218,7 +225,26 @@ def test_v620_moe_prefill_tile8_matches_tile4():
             0,
         )
         outputs.append(output)
+        down_output = torch.zeros(tokens, hidden, dtype=torch.float16, device=device)
+        ops.moe_gptq_gemm_rdna2(
+            down_input,
+            down_output,
+            down_weight,
+            down_scales,
+            down_zeros,
+            topk_weights.reshape(-1).float(),
+            sorted_ids,
+            expert_ids,
+            padded_count,
+            1,
+            block_size_m,
+            True,
+            output_topk=top_k,
+            use_v2_format=False,
+        )
+        down_outputs.append(down_output)
     torch.testing.assert_close(outputs[1], outputs[0], atol=0.1, rtol=0.01)
+    torch.testing.assert_close(down_outputs[1], down_outputs[0], atol=0.1, rtol=0.01)
 
 
 @gfx1030_only
