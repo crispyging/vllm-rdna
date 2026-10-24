@@ -296,7 +296,10 @@ def test_unsupported_gpu_does_not_set_nan_failstop(monkeypatch, deployment):
 
     with pytest.raises(ValueError, match="^--monokernel needs a gfx10x"):
         md.check_config(_config())
-    assert "VLLM_RAISE_ON_LOGIT_NANS" not in os.environ@pytest.mark.parametrize("cache_dtype", ["auto", "float16", "bfloat16"])
+    assert "VLLM_RAISE_ON_LOGIT_NANS" not in os.environ
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "float16", "bfloat16"])
 def test_fp16_kv_cache_is_accepted(deployment, cache_dtype):
     """The QSA kernels read the main KV cache as FP16/BF16 words."""
     assert md.config_refusal(_config(cache_dtype=cache_dtype)) is None
@@ -582,7 +585,11 @@ def test_dense_unquantized_mtp_wrong_shared_shard_falls_back(monkeypatch):
     mono = layout.MonoLayer(layer, is_mtp=True)
     assert not mono.setup()
     assert not mono.dense_mtp
-    assert "geometry" in mono.reason
+    # The shared expert was given the global width where the local TP4 width
+    # was expected, so the reason has to say the layout is unsupported and
+    # name the widths it saw.
+    assert "shared expert layout is unsupported" in mono.reason
+    assert "640" in mono.reason and "160" in mono.reason
 
 
 @pytest.mark.parametrize(
