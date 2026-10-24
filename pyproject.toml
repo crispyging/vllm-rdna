@@ -264,8 +264,7 @@ wht = "wht"
 WHT = "WHT"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
-# PCIe Advanced Error Reporting (AER) terms used by the RDNA serving harness
-AER = "AER"
+# PCIe Advanced Error Reporting (AER) term used by the RDNA serving harness
 aer = "aer"
 
 [tool.uv]

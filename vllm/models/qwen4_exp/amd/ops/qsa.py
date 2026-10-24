@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging as _logging
 import math
 import os as _os
+from typing import Any
 
 import torch
 
@@ -23,7 +24,8 @@ from . import qsa_rdna2
 
 # Qwen4Exp RDNA2 MonoKernel QSA part (--monokernel): the module
 # vllm/models/qwen4_exp/amd/mono/rdna2/qsa.py once installed, else None.
-MONO_QSA = None
+# The module is installed at runtime, so the type is only known there.
+MONO_QSA: Any = None
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 

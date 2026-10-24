@@ -943,6 +943,25 @@ def test_mono_qsa_sparse_decode_precedes_the_hip_gate(monkeypatch):
     assert hip_calls == [1]
 
 
+def test_mono_qsa_hip_gate_requires_an_fp16_cache():
+    """The fused decode reads K and V as FP16 words. A packed INT4 cache (the
+    int4_fp16_block record layout) is not FP16 and must be refused by the gate
+    rather than reinterpreted as half words."""
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mq
+
+    rows, heads = 3, QH
+    q = torch.zeros(rows, heads, HD, dtype=torch.float16, device=DEV)
+    k_cache = torch.zeros(8, PAGE, 1, HD, dtype=torch.float16, device=DEV)
+    v_cache = torch.zeros(8, PAGE, 1, HD, dtype=torch.float16, device=DEV)
+    assert mq._hip_ok(q, k_cache, v_cache, heads)
+
+    record = HD // 2 + 2 * (HD // 32)
+    packed = torch.zeros(8, PAGE, 1, record, dtype=torch.uint8, device=DEV)
+    assert not mq._hip_ok(q, packed, packed, heads)
+    assert not mq._hip_ok(q, packed, v_cache, heads)
+    assert not mq._hip_ok(q, k_cache, packed, heads)
+
+
 FLASH_NEXT_ROPE = dict(
     head_size=256,
     max_position=262144,
