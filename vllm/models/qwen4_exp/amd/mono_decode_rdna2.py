@@ -143,10 +143,33 @@ def check_config(vllm_config) -> None:
         return
     if not (_on_gfx10x() or is_qwen4exp(vllm_config)):
         return  # another model's MonoKernel on another GPU: not ours to judge
-    options(vllm_config)  # unknown knobs
+    opts = options(vllm_config)  # unknown knobs
     why = config_refusal(vllm_config)
     if why is not None:
         raise ValueError(f"--monokernel {why}.")
+    if opts is not None and (opts.mtp_drafter or opts.k1 or opts.k2):
+        # Configure before env caching and worker spawn. Preserve explicit
+        # opt-outs so they fail early instead of being silently overridden.
+        raw = os.environ.get("VLLM_RAISE_ON_LOGIT_NANS")
+        if raw is None:
+            os.environ["VLLM_RAISE_ON_LOGIT_NANS"] = "1"
+            logger.info(
+                "--monokernel: enabling VLLM_RAISE_ON_LOGIT_NANS=1 for "
+                "timeout-poisoned output fail-stop"
+            )
+        else:
+            try:
+                enabled_nan_failstop = bool(int(raw))
+            except ValueError as exc:
+                raise ValueError(
+                    "--monokernel VLLM_RAISE_ON_LOGIT_NANS must be 0 or 1."
+                ) from exc
+            if not enabled_nan_failstop:
+                raise ValueError(
+                    "--monokernel requires VLLM_RAISE_ON_LOGIT_NANS=1; "
+                    "explicitly setting it to 0 disables fail-stop for "
+                    "timeout-poisoned NaN outputs."
+                )
 
 
 def install(vllm_config) -> Options | None:

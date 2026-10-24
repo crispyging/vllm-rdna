@@ -237,6 +237,60 @@ def test_mtp_drafter_config_is_accepted(deployment):
     assert md.config_refusal(_config(arch="Qwen4ExpMTP")) is None
 
 
+@pytest.mark.parametrize("raw", [None, "1"], ids=["unset", "explicitly-enabled"])
+def test_api_config_enables_nan_failstop_for_supported_monokernel(
+    monkeypatch, deployment, raw
+):
+    if raw is None:
+        monkeypatch.delenv("VLLM_RAISE_ON_LOGIT_NANS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_RAISE_ON_LOGIT_NANS", raw)
+
+    md.check_config(_config())
+
+    assert os.environ["VLLM_RAISE_ON_LOGIT_NANS"] == "1"
+
+
+def test_api_config_respects_explicit_nan_failstop_opt_out(monkeypatch, deployment):
+    monkeypatch.setenv("VLLM_RAISE_ON_LOGIT_NANS", "0")
+
+    with pytest.raises(
+        ValueError,
+        match="explicitly setting it to 0 disables fail-stop",
+    ):
+        md.check_config(_config())
+    assert os.environ["VLLM_RAISE_ON_LOGIT_NANS"] == "0"
+
+
+def test_api_config_does_not_set_nan_failstop_without_protected_mono_parts(
+    monkeypatch, deployment
+):
+    monkeypatch.delenv("VLLM_RAISE_ON_LOGIT_NANS", raising=False)
+
+    md.check_config(_config(knobs={"k1": False, "k2": False}))
+
+    assert "VLLM_RAISE_ON_LOGIT_NANS" not in os.environ
+
+
+def test_api_config_does_not_set_nan_failstop_without_monokernel(
+    monkeypatch, deployment
+):
+    monkeypatch.delenv("VLLM_RAISE_ON_LOGIT_NANS", raising=False)
+
+    md.check_config(_config(monokernel=False))
+
+    assert "VLLM_RAISE_ON_LOGIT_NANS" not in os.environ
+
+
+def test_unsupported_gpu_does_not_set_nan_failstop(monkeypatch, deployment):
+    monkeypatch.setattr(md, "_on_gfx10x", lambda: False)
+    monkeypatch.delenv("VLLM_RAISE_ON_LOGIT_NANS", raising=False)
+
+    with pytest.raises(ValueError, match="^--monokernel needs a gfx10x"):
+        md.check_config(_config())
+    assert "VLLM_RAISE_ON_LOGIT_NANS" not in os.environ
+
+
 def test_missing_ops_are_named(monkeypatch):
     monkeypatch.setattr(md, "REQUIRED_OPS", ("mono_does_not_exist_rdna2",))
     assert "mono_does_not_exist_rdna2" in md.ops_refusal()
