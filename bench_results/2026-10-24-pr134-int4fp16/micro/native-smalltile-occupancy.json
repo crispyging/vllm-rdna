@@ -1,0 +1,61 @@
+{
+  "scope": "HIP resource query only; no kernel launches",
+  "kernels": [
+    {
+      "name": "_Z29fa_decode_paged_splitk_kernelI6__halfLb0ELb0ELb0EEvPKS0_PKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE",
+      "dtype": "fp16",
+      "head_dim": 128,
+      "block_threads": 128,
+      "kv_tile_tokens": 64,
+      "dynamic_lds_bytes_at_launch": 35348,
+      "max_threads": 128,
+      "fixed_lds_bytes": 512,
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 70,
+      "active_blocks_at_actual_lds": 1,
+      "active_blocks_if_no_dynamic_lds": 14
+    },
+    {
+      "name": "_Z33fa_decode_paged_splitk_kernel_256I6__halfLb0ELb0ELb0EEvPKS0_PKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE",
+      "dtype": "fp16",
+      "head_dim": 256,
+      "block_threads": 256,
+      "kv_tile_tokens": 32,
+      "dynamic_lds_bytes_at_launch": 34468,
+      "max_threads": 256,
+      "fixed_lds_bytes": 256,
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 71,
+      "active_blocks_at_actual_lds": 1,
+      "active_blocks_if_no_dynamic_lds": 7
+    },
+    {
+      "name": "_Z29fa_decode_paged_splitk_kernelIhLb0ELb0ELb1EEvPK6__halfPKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE",
+      "dtype": "packed",
+      "head_dim": 128,
+      "block_threads": 128,
+      "kv_tile_tokens": 32,
+      "dynamic_lds_bytes_at_launch": 17812,
+      "max_threads": 128,
+      "fixed_lds_bytes": 1280,
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 47,
+      "active_blocks_at_actual_lds": 3,
+      "active_blocks_if_no_dynamic_lds": 16
+    },
+    {
+      "name": "_Z33fa_decode_paged_splitk_kernel_256IhLb0ELb0ELb1EEvPK6__halfPKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE",
+      "dtype": "packed",
+      "head_dim": 256,
+      "block_threads": 256,
+      "kv_tile_tokens": 16,
+      "dynamic_lds_bytes_at_launch": 17508,
+      "max_threads": 256,
+      "fixed_lds_bytes": 640,
+      "local_bytes_per_thread": 0,
+      "registers_per_thread": 47,
+      "active_blocks_at_actual_lds": 3,
+      "active_blocks_if_no_dynamic_lds": 8
+    }
+  ]
+}

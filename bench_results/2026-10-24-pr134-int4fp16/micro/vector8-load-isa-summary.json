@@ -1,0 +1,30 @@
+[
+  {
+    "kernel": "000000000002a100 <_Z29fa_decode_paged_splitk_kernelIhLb1ELb0ELb0EEvPK6__halfPKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE>:",
+    "global_load_dword": 1,
+    "global_load_ushort": 1,
+    "global_load_ubyte": 2,
+    "flat_load": 0
+  },
+  {
+    "kernel": "000000000002b300 <_Z33fa_decode_paged_splitk_kernel_256IhLb1ELb0ELb0EEvPK6__halfPKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE>:",
+    "global_load_dword": 1,
+    "global_load_ushort": 1,
+    "global_load_ubyte": 2,
+    "flat_load": 0
+  },
+  {
+    "kernel": "0000000000043200 <_Z29fa_decode_paged_splitk_kernelIhLb0ELb0ELb1EEvPK6__halfPKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE>:",
+    "global_load_dword": 3,
+    "global_load_ushort": 5,
+    "global_load_ubyte": 2,
+    "flat_load": 0
+  },
+  {
+    "kernel": "0000000000044a00 <_Z33fa_decode_paged_splitk_kernel_256IhLb0ELb0ELb1EEvPK6__halfPKT_S5_PKiS7_iiiiiiiiiiiiiPfS8_S8_iiiiififfPKfSA_S7_iNSt11conditionalIXT2_E11FaInt4Cache13FaNoInt4CacheE4typeE>:",
+    "global_load_dword": 3,
+    "global_load_ushort": 5,
+    "global_load_ubyte": 2,
+    "flat_load": 0
+  }
+]

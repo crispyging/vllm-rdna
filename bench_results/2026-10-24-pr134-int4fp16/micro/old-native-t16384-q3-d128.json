@@ -1,0 +1,86 @@
+{
+  "args": {
+    "length": 16384,
+    "queries": 3,
+    "dim": 128,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 30,
+    "output": "/home/chenco_adm/pr134-results/old-native-t16384-q3-d128.json",
+    "build_only": false,
+    "fp16_only": true,
+    "fa_source": "/home/chenco_adm/pr134-results/pr134-fa-rdna2-baseline.cu"
+  },
+  "source_sha256": {
+    "/home/chenco_adm/pr134-results/pr134-fa-rdna2-baseline.cu": "615f23179b685afe97d67002c869e1732e39be0ec0c587af1ebeed473e239a9f",
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu": "c256cedec9b24a1c39289595885261f877c3f3186a8b4a1648234113438d6b6d",
+    "/home/chenco_adm/vllm-pr-int4fp16/benchmarks/kernels/pr134/native_bindings.cpp": "3267484977267c942801d4d896f7d7cc9b1209ae2c65f2e2ea2e827c96218772"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "scope": "synthetic paged GQA; quantization quality not measured",
+  "writer_exact_strided_nondefault_stream": {
+    "passed": true,
+    "blocks": 1530,
+    "head_dims": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "changed_input_graph": "PASS"
+  },
+  "changed_input_graph_maxabs": {
+    "fp16_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_prefill": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_prefill_gqa": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ]
+  },
+  "timings": {
+    "fp16_decode": {
+      "median_us": 573.1250762939453,
+      "samples_us": [
+        571.1664199829102,
+        573.6303965250651,
+        573.1250762939453,
+        572.7024078369141,
+        573.5090891520182,
+        573.1970469156901,
+        572.6317087809244
+      ]
+    },
+    "fp16_prefill": {
+      "median_us": 7014.838155110677,
+      "samples_us": [
+        7006.382242838542,
+        7015.825907389323,
+        7014.8020426432295,
+        7014.6331787109375,
+        7014.905293782552,
+        7014.988708496094,
+        7014.838155110677
+      ]
+    },
+    "fp16_prefill_gqa": {
+      "median_us": 1936.6718292236328,
+      "samples_us": [
+        1937.249247233073,
+        1936.7799123128254,
+        1936.6718292236328,
+        1936.644999186198,
+        1937.698491414388,
+        1936.6411844889324,
+        1936.6584777832031
+      ]
+    }
+  }
+}

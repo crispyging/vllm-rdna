@@ -1,0 +1,4 @@
+
+/home/chenco_adm/.cache/pr134/extensions/pr134_writer_t128_w16_refine585/pr134-writer-refine-585eee91.cuda.o:	file format elf64-x86-64
+Extracting offload bundle: /home/chenco_adm/.cache/pr134/extensions/pr134_writer_t128_w16_refine585/pr134-writer-refine-585eee91.cuda.o.0.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /home/chenco_adm/.cache/pr134/extensions/pr134_writer_t128_w16_refine585/pr134-writer-refine-585eee91.cuda.o.0.hipv4-amdgcn-amd-amdhsa--gfx1030

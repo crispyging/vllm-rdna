@@ -1,0 +1,303 @@
+Displaying notes found in: .note
+  Owner                Data size 	Description
+  AMDGPU               0x00001429	NT_AMDGPU_METADATA (AMDGPU Metadata)
+    AMDGPU Metadata:
+        ---
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         48
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         56
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         72
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         88
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         104
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         120
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         128
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         136
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         144
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         152
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         156
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         160
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         164
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         166
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         168
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         170
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         172
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         174
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         192
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         200
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         208
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         216
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 408
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 128
+    .name:           _ZN12_GLOBAL__N_128write_int4_fp16_block_kernelEPK6__halfS2_PhPKllllllllllllllll
+    .private_segment_fixed_size: 0
+    .sgpr_count:     54
+    .sgpr_spill_count: 0
+    .symbol:         _ZN12_GLOBAL__N_128write_int4_fp16_block_kernelEPK6__halfS2_PhPKllllllllllllllll.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     26
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         48
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         56
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         72
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         88
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         104
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         120
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         128
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         136
+        .size:           8
+        .value_kind:     by_value
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 144
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 128
+    .name:           _ZN12_GLOBAL__N_130write_int4_fp16_prefill_kernelILi128ELi128ELi16EEEvPK6__halfS3_PhPKllllillllllllll
+    .private_segment_fixed_size: 0
+    .sgpr_count:     46
+    .sgpr_spill_count: 0
+    .symbol:         _ZN12_GLOBAL__N_130write_int4_fp16_prefill_kernelILi128ELi128ELi16EEEvPK6__halfS3_PhPKllllillllllllll.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     29
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         48
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         56
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         72
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         88
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         104
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         120
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         128
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         136
+        .size:           8
+        .value_kind:     by_value
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 144
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 128
+    .name:           _ZN12_GLOBAL__N_130write_int4_fp16_prefill_kernelILi256ELi128ELi16EEEvPK6__halfS3_PhPKllllillllllllll
+    .private_segment_fixed_size: 0
+    .sgpr_count:     46
+    .sgpr_spill_count: 0
+    .symbol:         _ZN12_GLOBAL__N_130write_int4_fp16_prefill_kernelILi256ELi128ELi16EEEvPK6__halfS3_PhPKllllillllllllll.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     29
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1030
+amdhsa.version:
+  - 1
+  - 2
+...
+

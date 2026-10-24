@@ -1,0 +1,135 @@
+{
+  "expected_hip_ordinals": [
+    6,
+    7,
+    8,
+    9
+  ],
+  "served_hip_ordinals": [],
+  "placement_matches": false,
+  "touched_hip_ordinals": [],
+  "foreign_workload_untouched": true,
+  "served_pcie_roots": [],
+  "cards": [
+    {
+      "smi_card": "card0",
+      "pci_bus": "0000:07:00.0",
+      "pci_slot": "07:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "56424",
+      "hip_ordinal": 6,
+      "pcie_root": "00:01.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card1",
+      "pci_bus": "0000:0A:00.0",
+      "pci_slot": "0a:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "18860",
+      "hip_ordinal": 7,
+      "pcie_root": "00:01.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card2",
+      "pci_bus": "0000:12:00.0",
+      "pci_slot": "12:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "17318",
+      "hip_ordinal": 8,
+      "pcie_root": "00:01.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card3",
+      "pci_bus": "0000:15:00.0",
+      "pci_slot": "15:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "29156",
+      "hip_ordinal": 9,
+      "pcie_root": "00:01.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card4",
+      "pci_bus": "0000:47:00.0",
+      "pci_slot": "47:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "11353",
+      "hip_ordinal": 2,
+      "pcie_root": "40:03.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card5",
+      "pci_bus": "0000:4A:00.0",
+      "pci_slot": "4a:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "47517",
+      "hip_ordinal": 3,
+      "pcie_root": "40:03.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card6",
+      "pci_bus": "0000:52:00.0",
+      "pci_slot": "52:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "45975",
+      "hip_ordinal": 4,
+      "pcie_root": "40:03.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card7",
+      "pci_bus": "0000:55:00.0",
+      "pci_slot": "55:00.0",
+      "product": "AMD Radeon Pro V620",
+      "gfx": "gfx1030",
+      "guid": "33237",
+      "hip_ordinal": 5,
+      "pcie_root": "40:03.1",
+      "vram_used_bytes": 17182720,
+      "vram_used_gib": 0.02
+    },
+    {
+      "smi_card": "card8",
+      "pci_bus": "0000:83:00.0",
+      "pci_slot": "83:00.0",
+      "product": "AMD Radeon Pro W7800 48GB",
+      "gfx": "gfx1100",
+      "guid": "5082",
+      "hip_ordinal": 1,
+      "pcie_root": "80:01.1",
+      "vram_used_bytes": 27947008,
+      "vram_used_gib": 0.03
+    },
+    {
+      "smi_card": "card9",
+      "pci_bus": "0000:C7:00.0",
+      "pci_slot": "c7:00.0",
+      "product": "AMD Radeon Pro W7800 48GB",
+      "gfx": "gfx1100",
+      "guid": "8425",
+      "hip_ordinal": 0,
+      "pcie_root": "c0:03.1",
+      "vram_used_bytes": 27947008,
+      "vram_used_gib": 0.03
+    }
+  ]
+}

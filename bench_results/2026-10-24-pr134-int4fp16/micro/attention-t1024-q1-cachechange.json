@@ -1,0 +1,76 @@
+{
+  "args": {
+    "tokens": 1024,
+    "queries": 1,
+    "heads": 8,
+    "head_size": 128,
+    "repeats": 30,
+    "output": "/home/chenco_adm/pr134-results/attention-t1024-q1-cachechange.json"
+  },
+  "device": "AMD Radeon Pro V620",
+  "torch": "2.12.0+rocm7.14.0",
+  "triton": "3.7.1",
+  "scope": "synthetic contiguous single-sequence read microbench; no model quality claim",
+  "fp16_same_kernel": {
+    "eager_and_changed_input_graph_parity": "PASS",
+    "changed_input_max_abs": [
+      3.0517578125e-05,
+      3.0517578125e-05
+    ],
+    "asm_keys": [
+      "source",
+      "ttir",
+      "ttgir",
+      "llir",
+      "amdgcn",
+      "hsaco"
+    ],
+    "dot2_count": 2048,
+    "fma_count": 112,
+    "mfma_count": 0,
+    "eager_us": 187.5191471155952,
+    "graph": {
+      "median_us": 165.47346115112305,
+      "samples_us": [
+        165.13749758402506,
+        165.45883814493814,
+        165.68284034729004,
+        165.48287073771158,
+        165.4721736907959,
+        165.57083129882812,
+        165.47346115112305
+      ]
+    }
+  },
+  "int4_fp16_block": {
+    "eager_and_changed_input_graph_parity": "PASS",
+    "changed_input_max_abs": [
+      3.0517578125e-05,
+      3.0517578125e-05
+    ],
+    "asm_keys": [
+      "source",
+      "ttir",
+      "ttgir",
+      "llir",
+      "amdgcn",
+      "hsaco"
+    ],
+    "dot2_count": 2048,
+    "fma_count": 112,
+    "mfma_count": 0,
+    "eager_us": 534.3643875683055,
+    "graph": {
+      "median_us": 520.2127456665039,
+      "samples_us": [
+        520.2127456665039,
+        520.1727231343588,
+        520.2193895975748,
+        520.1513608296713,
+        520.2274004618326,
+        520.1713879903158,
+        520.2767372131348
+      ]
+    }
+  }
+}

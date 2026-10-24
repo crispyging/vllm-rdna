@@ -1,0 +1,208 @@
+{
+  "status": "PASS",
+  "registered_schema_count": 143,
+  "tags": {
+    "reshape_and_cache_int4_fp16_rdna2": [
+      "Tag.needs_exact_strides"
+    ],
+    "fa_rdna2_paged_int4_fp16_block": [
+      "Tag.needs_exact_strides"
+    ]
+  },
+  "actual_tp4_attention_page_bytes": {
+    "fp16": 1048576,
+    "packed": 294912
+  },
+  "writer_fullrange_gate": {
+    "passed": true,
+    "blocks": 1530,
+    "head_dims": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "changed_input_graph": "PASS",
+    "large_T64_and_range_cancellation_edge": "PASS"
+  },
+  "layouts": [
+    {
+      "dim": 128,
+      "layout": "LBHNC",
+      "query_heads": 8,
+      "kv_heads": 2,
+      "logical_strides": [
+        294912,
+        147456,
+        144,
+        1
+      ],
+      "writer_strides": [
+        147456,
+        294912,
+        144,
+        72,
+        1
+      ],
+      "changed_inputs_decode_prefill_maxabs": [
+        [
+          3.0517578125e-05,
+          3.0517578125e-05
+        ],
+        [
+          9.5367431640625e-07,
+          2.384185791015625e-07
+        ],
+        [
+          1.52587890625e-05,
+          3.0517578125e-05
+        ],
+        [
+          1.52587890625e-05,
+          3.0517578125e-05
+        ],
+        [
+          3.0517578125e-05,
+          3.0517578125e-05
+        ]
+      ],
+      "status": "PASS"
+    },
+    {
+      "dim": 128,
+      "layout": "LHBNC",
+      "query_heads": 8,
+      "kv_heads": 2,
+      "logical_strides": [
+        147456,
+        294912,
+        144,
+        1
+      ],
+      "writer_strides": [
+        294912,
+        147456,
+        144,
+        72,
+        1
+      ],
+      "changed_inputs_decode_prefill_maxabs": [
+        [
+          3.0517578125e-05,
+          6.103515625e-05
+        ],
+        [
+          6.103515625e-05,
+          6.103515625e-05
+        ],
+        [
+          3.814697265625e-06,
+          3.814697265625e-06
+        ],
+        [
+          3.814697265625e-06,
+          3.814697265625e-06
+        ],
+        [
+          9.5367431640625e-07,
+          9.5367431640625e-07
+        ]
+      ],
+      "status": "PASS"
+    },
+    {
+      "dim": 256,
+      "layout": "LBHNC",
+      "query_heads": 6,
+      "kv_heads": 1,
+      "logical_strides": [
+        294912,
+        147456,
+        144,
+        1
+      ],
+      "writer_strides": [
+        147456,
+        294912,
+        144,
+        144,
+        1
+      ],
+      "changed_inputs_decode_prefill_maxabs": [
+        [
+          0.0001220703125,
+          0.0001220703125
+        ],
+        [
+          0.0001220703125,
+          0.0001220703125
+        ],
+        [
+          7.62939453125e-06,
+          7.62939453125e-06
+        ],
+        [
+          7.62939453125e-06,
+          7.62939453125e-06
+        ],
+        [
+          6.103515625e-05,
+          3.814697265625e-06
+        ]
+      ],
+      "status": "PASS"
+    },
+    {
+      "dim": 256,
+      "layout": "LHBNC",
+      "query_heads": 6,
+      "kv_heads": 1,
+      "logical_strides": [
+        147456,
+        294912,
+        144,
+        1
+      ],
+      "writer_strides": [
+        294912,
+        147456,
+        144,
+        144,
+        1
+      ],
+      "changed_inputs_decode_prefill_maxabs": [
+        [
+          7.62939453125e-06,
+          0.0001220703125
+        ],
+        [
+          3.0517578125e-05,
+          3.0517578125e-05
+        ],
+        [
+          0.0001220703125,
+          3.0517578125e-05
+        ],
+        [
+          0.0001220703125,
+          3.0517578125e-05
+        ],
+        [
+          0.0,
+          9.5367431640625e-07
+        ]
+      ],
+      "status": "PASS"
+    }
+  ],
+  "source_sha256": {
+    "vllm/_rocm_C.abi3.so": "e44311ef18442e8b37dda7745499497bb4c46cb5d1f8c6f865c2ea60399f5624",
+    "vllm/_C_stable_libtorch.abi3.so": "756c3a3c1eb0313dd8fcb9b8a2b062e9247c0d527a436c27202b2a7615f79b37",
+    "vllm/_rust_tool_parser.abi3.so": "2d2164732fcee310f30f1a9dfbe0d276bd51acdaac31df7e1b177535b0a7f25c",
+    "vllm/_moe_C_stable_libtorch.abi3.so": "ddd219c4544b0c7de999fb11445813c6a87a55ad7f70b3147725d94995666900",
+    "vllm/cumem_allocator.abi3.so": "1fdd5e906262e048abfd033af94e83d52fc55b801e3a387755d7f11273ae645e",
+    "vllm/spinloop.abi3.so": "7d31e20594806377fec86c4196fbf4bcd396572a4a989966e6e9b1ff329086f0",
+    "vllm/fs_io_C.abi3.so": "b3d52d0fdc9e490e6911b3b19da2cf092ebdee949f39a7aa99f3aafadd7c8fff",
+    "vllm/_C.abi3.so": "2d08baa6fe2116d58e501691d3411e1e1b4af7ce7f1c843e26f0e107a03948f7"
+  }
+}

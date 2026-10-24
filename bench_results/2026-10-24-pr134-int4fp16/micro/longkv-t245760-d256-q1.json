@@ -1,0 +1,73 @@
+{
+  "args": {
+    "length": 245760,
+    "queries": 1,
+    "dim": 256,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 10,
+    "output": "/home/chenco_adm/pr134-results/longkv-t245760-d256-q1.json",
+    "build_only": false,
+    "fp16_only": false,
+    "fa_source": "None",
+    "inline_cache": true,
+    "kv_splits": 16,
+    "batch": 1,
+    "decode_only": true,
+    "prefill_only": false,
+    "skip_writer_check": true,
+    "block_size": 1024
+  },
+  "source_sha256": {
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/fa_rdna2.cu": "e410dd10d77cbdee1ad1918cec2fad867d8e6e0beb9d6df5c005b0308f9fc4bd",
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu": "ed3ff1dc008142d0f1095c37655444f01372d230e48ff8fe4e3ba08a7e83f0a0",
+    "/home/chenco_adm/vllm-pr-int4fp16/benchmarks/kernels/pr134/native_bindings.cpp": "3267484977267c942801d4d896f7d7cc9b1209ae2c65f2e2ea2e827c96218772"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "cache_bytes": {
+    "fp16": 503316480,
+    "int4_fp16": 141557760
+  },
+  "peak_allocated_bytes": 7279893504,
+  "scope": "synthetic paged GQA, shared prefix across sequences; no model quality claim",
+  "timing_order": "seven rounds, rotated and reversed arm order",
+  "writer_exact_strided_nondefault_stream": "unchanged writer previously qualified",
+  "changed_input_graph_maxabs": {
+    "packed_decode": [
+      0.0,
+      6.103515625e-05
+    ],
+    "fp16_decode": [
+      0.0,
+      0.0
+    ]
+  },
+  "timings": {
+    "packed_decode": {
+      "median_us": 9056.033325195312,
+      "samples_us": [
+        8971.624755859375,
+        9073.625946044922,
+        9025.20980834961,
+        9070.733642578125,
+        9056.033325195312,
+        9067.310333251953,
+        9044.30160522461
+      ]
+    },
+    "fp16_decode": {
+      "median_us": 6048.947906494141,
+      "samples_us": [
+        6002.111053466797,
+        6045.536041259766,
+        6073.479843139648,
+        6047.224044799805,
+        6097.184371948242,
+        6133.632659912109,
+        6048.947906494141
+      ]
+    }
+  }
+}

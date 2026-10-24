@@ -1,0 +1,11 @@
+{
+  "refine585": {
+    "instructions": 2322,
+    "normalized_isa_sha256": "faf048089c5f50ab11ea726093c214ae1bf92e4672fe67241d7de894bc62e1ef"
+  },
+  "finald40": {
+    "instructions": 2322,
+    "normalized_isa_sha256": "faf048089c5f50ab11ea726093c214ae1bf92e4672fe67241d7de894bc62e1ef"
+  },
+  "identical": true
+}

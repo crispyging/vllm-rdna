@@ -1,0 +1,66 @@
+{
+  "args": {
+    "length": 16384,
+    "queries": 1,
+    "dim": 128,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 20,
+    "output": "/home/chenco_adm/pr134-results/split-b8-d128-s16.json",
+    "build_only": false,
+    "fp16_only": false,
+    "fa_source": "None",
+    "inline_cache": true,
+    "kv_splits": 16,
+    "batch": 8,
+    "decode_only": true,
+    "skip_writer_check": true
+  },
+  "source_sha256": {
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/fa_rdna2.cu": "adb2d5183515b54d86d2fb21f6159996a309f6bc93bb1462eb3a44a64203c028",
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu": "ed3ff1dc008142d0f1095c37655444f01372d230e48ff8fe4e3ba08a7e83f0a0",
+    "/home/chenco_adm/vllm-pr-int4fp16/benchmarks/kernels/pr134/native_bindings.cpp": "3267484977267c942801d4d896f7d7cc9b1209ae2c65f2e2ea2e827c96218772"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "scope": "synthetic paged GQA, shared prefix across sequences; no model quality claim",
+  "timing_order": "seven rounds, alternating arm order",
+  "writer_exact_strided_nondefault_stream": "unchanged writer previously qualified",
+  "changed_input_graph_maxabs": {
+    "packed_decode": [
+      0.0,
+      0.0
+    ],
+    "fp16_decode": [
+      0.0,
+      6.103515625e-05
+    ]
+  },
+  "timings": {
+    "packed_decode": {
+      "median_us": 1993.3687210083008,
+      "samples_us": [
+        1999.9727249145508,
+        1987.4425888061523,
+        1990.0266647338867,
+        1993.3687210083008,
+        1992.5167083740234,
+        1993.6948776245117,
+        1997.4428176879883
+      ]
+    },
+    "fp16_decode": {
+      "median_us": 1290.514087677002,
+      "samples_us": [
+        1283.2660675048828,
+        1284.3940734863281,
+        1288.4860038757324,
+        1292.3420906066895,
+        1291.0920143127441,
+        1290.7220840454102,
+        1290.514087677002
+      ]
+    }
+  }
+}

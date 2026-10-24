@@ -1,0 +1,4 @@
+
+/home/chenco_adm/vllm-pr-int4fp16/build/pr134-core/CMakeFiles/_rocm_C.dir/csrc/rocm/fa_rdna2.hip.o:	file format elf64-x86-64
+Extracting offload bundle: /home/chenco_adm/vllm-pr-int4fp16/build/pr134-core/CMakeFiles/_rocm_C.dir/csrc/rocm/fa_rdna2.hip.o.0.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /home/chenco_adm/vllm-pr-int4fp16/build/pr134-core/CMakeFiles/_rocm_C.dir/csrc/rocm/fa_rdna2.hip.o.0.hipv4-amdgcn-amd-amdhsa--gfx1030

@@ -1,0 +1,66 @@
+{
+  "args": {
+    "length": 16384,
+    "queries": 1,
+    "dim": 256,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 20,
+    "output": "/home/chenco_adm/pr134-results/split-b1-d256-s16.json",
+    "build_only": false,
+    "fp16_only": false,
+    "fa_source": "None",
+    "inline_cache": true,
+    "kv_splits": 16,
+    "batch": 1,
+    "decode_only": true,
+    "skip_writer_check": true
+  },
+  "source_sha256": {
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/fa_rdna2.cu": "adb2d5183515b54d86d2fb21f6159996a309f6bc93bb1462eb3a44a64203c028",
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu": "ed3ff1dc008142d0f1095c37655444f01372d230e48ff8fe4e3ba08a7e83f0a0",
+    "/home/chenco_adm/vllm-pr-int4fp16/benchmarks/kernels/pr134/native_bindings.cpp": "3267484977267c942801d4d896f7d7cc9b1209ae2c65f2e2ea2e827c96218772"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "scope": "synthetic paged GQA, shared prefix across sequences; no model quality claim",
+  "timing_order": "seven rounds, alternating arm order",
+  "writer_exact_strided_nondefault_stream": "unchanged writer previously qualified",
+  "changed_input_graph_maxabs": {
+    "packed_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ]
+  },
+  "timings": {
+    "packed_decode": {
+      "median_us": 524.6828079223633,
+      "samples_us": [
+        522.4600791931152,
+        523.754072189331,
+        524.3360996246338,
+        524.8347759246826,
+        526.0608196258545,
+        524.6828079223633,
+        526.7608642578125
+      ]
+    },
+    "fp16_decode": {
+      "median_us": 340.0691509246826,
+      "samples_us": [
+        342.49799251556396,
+        338.31396102905273,
+        340.05794525146484,
+        341.8299913406372,
+        341.0011053085327,
+        338.93115520477295,
+        340.0691509246826
+      ]
+    }
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "args": {
+    "length": 16384,
+    "queries": 1,
+    "dim": 256,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 30,
+    "output": "/home/chenco_adm/pr134-results/globalcb-direct-d256-q1.json",
+    "build_only": false,
+    "fp16_only": false,
+    "fa_source": "/home/chenco_adm/pr134-results/pr134-fa-global-cb598324.cu",
+    "inline_cache": true,
+    "kv_splits": 16,
+    "batch": 1,
+    "decode_only": true,
+    "prefill_only": false,
+    "skip_writer_check": true,
+    "block_size": 1024,
+    "compare_native_library": "/home/chenco_adm/.cache/pr134/controls/bec102/pr134_native_fa.so",
+    "module_tag": "globalcb"
+  },
+  "source_sha256": {
+    "/home/chenco_adm/pr134-results/pr134-fa-global-cb598324.cu": "cb598324debd32f041980e31b3ef11ebc3ed58aa427605be3611ff02c06c0157",
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu": "ed3ff1dc008142d0f1095c37655444f01372d230e48ff8fe4e3ba08a7e83f0a0",
+    "/home/chenco_adm/vllm-pr-int4fp16/benchmarks/kernels/pr134/native_bindings.cpp": "3267484977267c942801d4d896f7d7cc9b1209ae2c65f2e2ea2e827c96218772"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "cache_bytes": {
+    "fp16": 33554432,
+    "int4_fp16": 9437184
+  },
+  "peak_allocated_bytes": 516974592,
+  "previous_library_sha256": "ae37bbde518350b88aa4527ad9c44ac83da7fd1b82dfbbe028cc46c9a0e4227f",
+  "scope": "synthetic paged GQA, shared prefix across sequences; no model quality claim",
+  "timing_order": "seven rounds, rotated and reversed arm order",
+  "writer_exact_strided_nondefault_stream": "unchanged writer previously qualified",
+  "changed_input_graph_maxabs": {
+    "packed_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "previous_packed_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ]
+  },
+  "timings": {
+    "packed_decode": {
+      "median_us": 468.9855257670085,
+      "samples_us": [
+        463.7161572774251,
+        464.74905014038086,
+        468.21889877319336,
+        471.12023035685223,
+        470.99355061848956,
+        468.9855257670085,
+        471.2162335713704
+      ]
+    },
+    "fp16_decode": {
+      "median_us": 381.3487688700358,
+      "samples_us": [
+        388.8154983520508,
+        380.9308369954427,
+        380.46817779541016,
+        381.3487688700358,
+        382.76742299397785,
+        380.9247652689616,
+        381.8367640177409
+      ]
+    },
+    "previous_packed_decode": {
+      "median_us": 469.74023183186847,
+      "samples_us": [
+        465.7103856404622,
+        467.0424461364746,
+        465.7895088195801,
+        471.62424723307294,
+        469.74023183186847,
+        471.65358861287433,
+        470.39756774902344
+      ]
+    }
+  }
+}

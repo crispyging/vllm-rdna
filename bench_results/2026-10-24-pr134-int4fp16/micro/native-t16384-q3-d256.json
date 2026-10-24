@@ -1,0 +1,116 @@
+{
+  "args": {
+    "length": 16384,
+    "queries": 3,
+    "dim": 256,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 10,
+    "output": "/home/chenco_adm/pr134-results/native-t16384-q3-d256.json",
+    "build_only": false
+  },
+  "source_sha256": {
+    "csrc/rocm/fa_rdna2.cu": "8f6a1f3e08bf841c51966821911b04fecfdb21094ded41c7a939cf664f7c0aad",
+    "csrc/rocm/int4_fp16_kv_cache.cu": "c256cedec9b24a1c39289595885261f877c3f3186a8b4a1648234113438d6b6d",
+    "benchmarks/kernels/pr134/native_bindings.cpp": "23f616b1dbd86c8f8f0c8767f76eb620c58ee403ceb6878914f8cec36611211a"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "scope": "synthetic paged GQA; quantization quality not measured",
+  "writer_exact_strided_nondefault_stream": {
+    "passed": true,
+    "blocks": 1530,
+    "head_dims": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "changed_input_graph": "PASS"
+  },
+  "changed_input_graph_maxabs": {
+    "packed_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "packed_prefill": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_prefill": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_prefill_gqa": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ]
+  },
+  "timings": {
+    "packed_decode": {
+      "median_us": 2186.9312286376953,
+      "samples_us": [
+        2230.6640625,
+        2184.9355697631836,
+        2185.991668701172,
+        2185.2115631103516,
+        2186.9312286376953,
+        2192.8876876831055,
+        2192.899513244629
+      ]
+    },
+    "packed_prefill": {
+      "median_us": 9296.315002441406,
+      "samples_us": [
+        9296.315002441406,
+        9292.411041259766,
+        9297.47543334961,
+        9291.239166259766,
+        9297.76611328125,
+        9296.115112304688,
+        9298.834991455078
+      ]
+    },
+    "fp16_decode": {
+      "median_us": 677.9700756072998,
+      "samples_us": [
+        679.2900085449219,
+        677.9700756072998,
+        678.0459880828857,
+        677.1500110626221,
+        677.869987487793,
+        677.8100967407227,
+        679.4061183929443
+      ]
+    },
+    "fp16_prefill": {
+      "median_us": 5702.770614624023,
+      "samples_us": [
+        5696.486282348633,
+        5694.530487060547,
+        5701.9866943359375,
+        5703.834915161133,
+        5703.978729248047,
+        5702.770614624023,
+        5703.154754638672
+      ]
+    },
+    "fp16_prefill_gqa": {
+      "median_us": 3082.6553344726562,
+      "samples_us": [
+        3082.871627807617,
+        3083.3635330200195,
+        3079.851531982422,
+        3082.503128051758,
+        3082.6553344726562,
+        3080.9192657470703,
+        3083.9433670043945
+      ]
+    }
+  }
+}

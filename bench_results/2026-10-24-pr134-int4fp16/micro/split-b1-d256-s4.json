@@ -1,0 +1,66 @@
+{
+  "args": {
+    "length": 16384,
+    "queries": 1,
+    "dim": 256,
+    "q_heads": 8,
+    "kv_heads": 2,
+    "repeats": 20,
+    "output": "/home/chenco_adm/pr134-results/split-b1-d256-s4.json",
+    "build_only": false,
+    "fp16_only": false,
+    "fa_source": "None",
+    "inline_cache": true,
+    "kv_splits": 4,
+    "batch": 1,
+    "decode_only": true,
+    "skip_writer_check": true
+  },
+  "source_sha256": {
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/fa_rdna2.cu": "adb2d5183515b54d86d2fb21f6159996a309f6bc93bb1462eb3a44a64203c028",
+    "/home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu": "ed3ff1dc008142d0f1095c37655444f01372d230e48ff8fe4e3ba08a7e83f0a0",
+    "/home/chenco_adm/vllm-pr-int4fp16/benchmarks/kernels/pr134/native_bindings.cpp": "3267484977267c942801d4d896f7d7cc9b1209ae2c65f2e2ea2e827c96218772"
+  },
+  "torch": "2.12.0+rocm7.14.0",
+  "hip": "7.14.60850",
+  "device": "_CudaDeviceProperties(name='AMD Radeon Pro V620', major=10, minor=3, gcnArchName='gfx1030', total_memory=30704MB, multi_processor_count=36, uuid=64623165-6264-3331-3263-393361396435, pci_bus_id=71, pci_device_id=0, pci_domain_id=0, L2_cache_size=4MB)",
+  "scope": "synthetic paged GQA, shared prefix across sequences; no model quality claim",
+  "timing_order": "seven rounds, alternating arm order",
+  "writer_exact_strided_nondefault_stream": "unchanged writer previously qualified",
+  "changed_input_graph_maxabs": {
+    "packed_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ],
+    "fp16_decode": [
+      3.0517578125e-05,
+      6.103515625e-05
+    ]
+  },
+  "timings": {
+    "packed_decode": {
+      "median_us": 969.5948600769043,
+      "samples_us": [
+        969.5948600769043,
+        964.5547866821289,
+        966.8448448181152,
+        966.0488128662109,
+        974.9268531799316,
+        972.8287696838379,
+        974.6709823608398
+      ]
+    },
+    "fp16_decode": {
+      "median_us": 612.4616146087646,
+      "samples_us": [
+        618.9937114715576,
+        610.8856201171875,
+        612.4616146087646,
+        610.7436180114746,
+        613.6556148529053,
+        612.0575428009033,
+        613.6995792388916
+      ]
+    }
+  }
+}

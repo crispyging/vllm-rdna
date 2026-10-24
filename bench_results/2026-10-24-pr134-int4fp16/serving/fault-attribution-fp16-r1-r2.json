@@ -1,0 +1,59 @@
+{
+  "27b-fp16": {
+    "label": "r1 (first reference)",
+    "boot_id": "1e8b5da1-759f-4dbb-ae87-e58c2faaff48",
+    "cache_dtype": "auto",
+    "raw_status": {
+      "status": "FAIL",
+      "cleanup": "PASS"
+    },
+    "kernel_event_verdict": "corrected-only",
+    "corrected_event_groups": 3,
+    "corrected_error_count": 3,
+    "fatal_event_groups": 0,
+    "fatal_events": [],
+    "endpoints_with_nonfatal_err": 0,
+    "endpoints_with_bad_tlp": 3,
+    "aer_recovery_buffer_overflows": [],
+    "event_timestamps": [
+      10295.076725,
+      10558.251721,
+      10690.350248
+    ],
+    "qualification_mode": "diagnostic-only",
+    "hardware_attribution": "contaminated-corrected-link-noise"
+  },
+  "27b-fp16-r2": {
+    "label": "r2 (second reference)",
+    "boot_id": "1e8b5da1-759f-4dbb-ae87-e58c2faaff48",
+    "cache_dtype": "auto",
+    "raw_status": {
+      "status": "FAIL",
+      "cleanup": "PASS"
+    },
+    "kernel_event_verdict": "corrected-only",
+    "corrected_event_groups": 4,
+    "corrected_error_count": 20,
+    "fatal_event_groups": 0,
+    "fatal_events": [],
+    "endpoints_with_nonfatal_err": 16,
+    "endpoints_with_bad_tlp": 2,
+    "aer_recovery_buffer_overflows": [
+      "0000:4f:10.0",
+      "0000:50:00.0"
+    ],
+    "event_timestamps": [
+      11852.62203,
+      11960.656866,
+      12042.579027,
+      12042.579176
+    ],
+    "qualification_mode": "diagnostic-only",
+    "hardware_attribution": "contaminated-corrected-link-noise"
+  },
+  "summary": {
+    "note": "Retroactive classification of the preserved kernel deltas from both FP16 reference arms. Every PCIe/AER event in both arms was classified by the kernel as corrected; no amdgpu fault, timeout, reset or UTCL2 event was recorded. The raw status.json of both arms remains FAIL.",
+    "raw_status_preserved": true,
+    "fatal_device_faults_observed": false
+  }
+}

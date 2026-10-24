@@ -1,0 +1,5 @@
+1eac14b65158e85bcc894eda96823b0fa82249fa7f67a295f08dc90bc5a97df4  /home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/fa_rdna2.cu
+6ca852798a4d609718112973be49b6b8aff3925a0ce8051540f836c424c71026  /home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/int4_fp16_kv_cache.cu
+bdf8d839dc4af836bdde8a79868f46650a81d40815bc3b733faf582a6c624a04  /home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/torch_bindings.cpp
+90c214c831f50cc32b14b4cec86df2a061e498b000f34cf336ee442658e55141  /home/chenco_adm/vllm-pr-int4fp16/csrc/rocm/ops.h
+b3ed1b5bff954b25d58e1fb8cb334e1ec80a30274a7a862c2b3f170211acfac2  /home/chenco_adm/vllm-pr-int4fp16/CMakeLists.txt

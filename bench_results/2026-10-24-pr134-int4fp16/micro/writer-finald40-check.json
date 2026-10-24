@@ -1,0 +1,30 @@
+{
+  "correctness": {
+    "15": {
+      "passed": true,
+      "blocks": 1530,
+      "head_dims": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "changed_input_graph": "PASS",
+      "large_T64_and_range_cancellation_edge": "PASS"
+    },
+    "1024": {
+      "passed": true,
+      "blocks": 1530,
+      "head_dims": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "changed_input_graph": "PASS",
+      "large_T64_and_range_cancellation_edge": "PASS"
+    }
+  },
+  "writer_sha256": "d40bf3a5933c8f3a9cf09af78794632b8a120606d771f0e1d4faf7f45aaa00e1",
+  "compile_geometry": "fixed source"
+}
