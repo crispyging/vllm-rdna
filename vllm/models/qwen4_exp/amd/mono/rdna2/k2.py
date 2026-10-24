@@ -105,6 +105,7 @@ def run(mono: MonoLayer, hidden_states, attn_out, injection):
         2000.0,
         mono.is_mtp,
         mono.dense_mtp,
+        getattr(mono, "preserve_fault", False),
     )
     return res_out, out, inj_out
 

@@ -289,6 +289,136 @@ def test_mtp_control_reset_is_captured_and_clears_sticky_error(ffn_layer):
     assert err[0] == 0, f"MTP replay did not clear the sticky record: {err[:3]}"
 
 
+def test_mtp_preserve_fault_is_captured_and_requires_explicit_recovery(ffn_layer):
+    """Only the internal production mode keeps an injected K2 fault sticky."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
+    from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import (
+        clear_mtp_fault_for_recovery,
+    )
+    from vllm.models.qwen4_exp.amd.mono.rdna2.layout import _WORKSPACES
+
+    L, G, mono = ffn_layer
+    mtp = SimpleNamespace(
+        t=L,
+        ws=mono.ws,
+        base=mono.base,
+        eps=mono.eps,
+        is_mtp=True,
+        dense_mtp=False,
+        preserve_fault=True,
+    )
+    res, blk, inj = _inputs(4, 706)
+    mono.ws.zero_()  # module-scoped fixture: begin with a clean arena
+    torch.accelerator.synchronize()
+    ws_ptr = mono.ws.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = k2.run(mtp, res, blk, inj)
+    graph.replay()
+    _check_k2(L, G, got, res, blk, inj)
+    assert all(torch.isfinite(x).all().item() for x in got)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 0
+
+    mono.ws.view(torch.int32)[2].fill_(1)
+    torch.accelerator.synchronize()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert all(torch.isnan(x).all().item() for x in got)
+    err = torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()
+    assert err[0] == 1, f"MTP replay lost the sticky record: {err[:3]}"
+
+    # The fixture uses an independent workspace, so bind it to the one MTP
+    # scope slot while exercising the explicit offline recovery helper.
+    idx = mono.ws.device.index
+    if idx is None:
+        idx = torch.accelerator.current_device_index()
+    key = (idx, "mtp")
+    prior = _WORKSPACES.get(key)
+    _WORKSPACES[key] = mono.ws
+    try:
+        mono.ws[64:128].fill_(7)  # include non-header scratch
+        clear_mtp_fault_for_recovery(mono.ws.device)
+    finally:
+        if prior is None:
+            del _WORKSPACES[key]
+        else:
+            _WORKSPACES[key] = prior
+    assert mono.ws.data_ptr() == ws_ptr
+    assert torch.count_nonzero(mono.ws).item() == 0
+
+    for dst, src in zip((res, blk, inj), _inputs(4, 707), strict=True):
+        dst.copy_(src)
+    graph.replay()
+    _check_k2(L, G, got, res, blk, inj)
+    assert all(torch.isfinite(x).all().item() for x in got)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 0
+
+    fresh_ws = torch.zeros_like(mono.ws)
+    fresh = SimpleNamespace(
+        t=L,
+        ws=fresh_ws,
+        base=mono.base,
+        eps=mono.eps,
+        is_mtp=True,
+        dense_mtp=False,
+        preserve_fault=True,
+    )
+    fresh_got = k2.run(fresh, res, blk, inj)
+    torch.accelerator.synchronize()
+    for recovered, clean in zip(got, fresh_got, strict=True):
+        torch.testing.assert_close(recovered.float(), clean.float(), atol=5e-3, rtol=0)
+
+
+def test_mtp_k2_fault_survives_k1_and_next_k2_capture(ffn_layer):
+    """K1 between draft K2 launches must not erase a shared MTP fault."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k1, k2
+
+    L, G, mono = ffn_layer
+    mtp = SimpleNamespace(
+        t=L,
+        th=L,
+        ws=mono.ws,
+        base=mono.base,
+        eps=mono.eps,
+        eps_a=mono.eps_a,
+        is_mtp=True,
+        dense_mtp=False,
+        preserve_fault=True,
+    )
+    res, blk, inj = _inputs(4, 708)
+    mono.ws.zero_()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        first = k2.run(mtp, res, blk, inj)
+        # Test-only fault injection between draft steps, captured on the same
+        # stream. The first K2 is clean; K1 and the next K2 share its arena.
+        mono.ws.view(torch.int32)[2].fill_(1)
+        middle = k1.run(mtp, res, blk, inj)
+        last = k2.run(mtp, res, blk, inj)
+
+    mono.ws.zero_()  # graph capture itself ran the injected sequence
+    torch.accelerator.synchronize()
+    graph.replay()
+    torch.accelerator.synchronize()
+    _check_k2(L, G, first, res, blk, inj)
+    assert all(torch.isfinite(x).all().item() for x in first)
+    assert all(torch.isnan(x).all().item() for x in middle)
+    assert all(torch.isnan(x).all().item() for x in last)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 1
+
+    # A direct K1 caller without the internal property keeps legacy reset.
+    legacy = SimpleNamespace(th=L, ws=mono.ws, eps_a=mono.eps_a, is_mtp=True)
+    cleared = k1.run(legacy, res, blk, inj)
+    torch.accelerator.synchronize()
+    assert all(torch.isfinite(x).all().item() for x in cleared)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 0
+
+
 @pytest.fixture(scope="module")
 def router_boundary_layer():
     """Fixed fixture used to guard the quantized-target router FP16 boundary."""

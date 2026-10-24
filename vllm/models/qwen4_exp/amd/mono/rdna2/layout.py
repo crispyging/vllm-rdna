@@ -132,6 +132,7 @@ class MonoLayer:
     ):
         self.layer = layer
         self.is_mtp = is_mtp
+        self.preserve_fault = is_mtp  # production MTP keeps K1/K2 errors sticky
         self.k1_max_rows = OPTS.k1_max_rows if k1_max_rows is None else k1_max_rows
         self.k2_max_rows = OPTS.k2_max_rows if k2_max_rows is None else k2_max_rows
         self.first = getattr(layer, "layer_idx", None) == 0

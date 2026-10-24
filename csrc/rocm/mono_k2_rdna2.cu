@@ -24,8 +24,9 @@
 // generation counter in global memory (agent-scope atomics, bounded wait, no
 // grid.sync). A timed-out wait writes a sticky {code, phase, wg} record and
 // each WG poisons caller-visible outputs before leaving; callers must fail
-// stop on NaN. Opt-in MTP calls enqueue a same-stream control-header memset
-// before the persistent launch so a prior timeout cannot latch later calls.
+// stop on NaN. Production MTP calls reset only count/gen on the same stream;
+// the error record stays sticky across K1/K2 calls until engine restart.
+// Explicit reset callers retain the full control-header clear by default.
 // The memset is a graph memset node, not an additional HIP kernel launch.
 //
 // Plain launch, one stream, capturable. The grid must be co-resident: the WG
@@ -2130,20 +2131,18 @@ struct GdnArgs {
   int64_t sigmoid;
 };
 
-static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
-                        const torch::Tensor& inj, const torch::Tensor& norm_w,
-                        const torch::Tensor& wd, const torch::Tensor& wu,
-                        const torch::Tensor* wr, const torch::Tensor* se_w1,
-                        const torch::Tensor* se_w2, const torch::Tensor* se_wg,
-                        const torch::Tensor* w13, const torch::Tensor* s13,
-                        const torch::Tensor* z13, const torch::Tensor* w2,
-                        const torch::Tensor* s2, const torch::Tensor* z2,
-                        torch::Tensor& res_out, torch::Tensor& inj_out,
-                        torch::Tensor& out, torch::Tensor& workspace,
-                        int64_t expert_base, int64_t zero_offset,
-                        int64_t num_wg, double eps, double timeout_ms,
-                        const GdnArgs* gdn = nullptr,
-                        bool reset_control = false, bool dense_mtp = false) {
+static void mono_launch(
+    const torch::Tensor& res, const torch::Tensor& blk,
+    const torch::Tensor& inj, const torch::Tensor& norm_w,
+    const torch::Tensor& wd, const torch::Tensor& wu, const torch::Tensor* wr,
+    const torch::Tensor* se_w1, const torch::Tensor* se_w2,
+    const torch::Tensor* se_wg, const torch::Tensor* w13,
+    const torch::Tensor* s13, const torch::Tensor* z13, const torch::Tensor* w2,
+    const torch::Tensor* s2, const torch::Tensor* z2, torch::Tensor& res_out,
+    torch::Tensor& inj_out, torch::Tensor& out, torch::Tensor& workspace,
+    int64_t expert_base, int64_t zero_offset, int64_t num_wg, double eps,
+    double timeout_ms, const GdnArgs* gdn = nullptr, bool reset_control = false,
+    bool dense_mtp = false, bool preserve_fault = false) {
   using namespace mono_ffn;
   const bool hc_only = wr == nullptr && gdn == nullptr;  // K1 only
   const int M = res.size(0);
@@ -2335,9 +2334,12 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
                         res.get_device());
   p.timeout_ticks = (unsigned long long)(timeout_ms * (khz > 0 ? khz : 100000));
   auto stream = at::cuda::getCurrentCUDAStream();
+  TORCH_CHECK(!preserve_fault || reset_control,
+              "mono_ffn: preserve_fault requires reset_control");
   if (reset_control) {
-    const hipError_t reset_err =
-        hipMemsetAsync(p.ctrl, 0, offsetof(Ctrl, ts), stream);
+    const hipError_t reset_err = hipMemsetAsync(
+        p.ctrl, 0,
+        preserve_fault ? offsetof(Ctrl, err_code) : offsetof(Ctrl, ts), stream);
     TORCH_CHECK(reset_err == hipSuccess, "mono_ffn: MTP control reset failed: ",
                 hipGetErrorString(reset_err));
   }
@@ -2392,11 +2394,11 @@ void mono_k2_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    torch::Tensor& out, torch::Tensor& workspace,
                    int64_t expert_base, int64_t zero_offset, int64_t num_wg,
                    double eps, double timeout_ms, bool reset_control,
-                   bool dense_mtp) {
+                   bool dense_mtp, bool preserve_fault) {
   mono_launch(res, blk, inj, norm_w, wd, wu, &wr, &se_w1, &se_w2, &se_wg, &w13,
               &s13, &z13, &w2, &s2, &z2, res_out, inj_out, out, workspace,
               expert_base, zero_offset, num_wg, eps, timeout_ms, nullptr,
-              reset_control, dense_mtp);
+              reset_control, dense_mtp, preserve_fault);
 }
 
 // E1: K1 + the GDN (linear-attention) decode of one layer in one launch.
@@ -2430,11 +2432,12 @@ void mono_k1_rdna2(const torch::Tensor& res, const torch::Tensor& blk,
                    const torch::Tensor& wd, const torch::Tensor& wu,
                    torch::Tensor& res_out, torch::Tensor& inj_out,
                    torch::Tensor& out, torch::Tensor& workspace, int64_t num_wg,
-                   double eps, double timeout_ms, bool reset_control) {
+                   double eps, double timeout_ms, bool reset_control,
+                   bool preserve_fault) {
   mono_launch(res, blk, inj, norm_w, wd, wu, nullptr, nullptr, nullptr, nullptr,
               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, res_out,
               inj_out, out, workspace, 0, 1, num_wg, eps, timeout_ms, nullptr,
-              reset_control);
+              reset_control, false, preserve_fault);
 }
 
 // Sticky error record of a workspace: [code, phase, wg] (int32, CPU tensor).

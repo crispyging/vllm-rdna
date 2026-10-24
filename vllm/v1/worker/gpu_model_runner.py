@@ -320,6 +320,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         check_ep_fault: bool = False,
         num_nans: torch.Tensor | None = None,
         num_draft_tokens: list[int] | None = None,
+        mtp_fault: torch.Tensor | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -342,6 +343,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             else None
         )
         self._has_fault: torch.Tensor | None = None
+        self._mtp_fault = mtp_fault
+        self._mtp_fault_cpu: torch.Tensor | None = None
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -360,6 +363,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 if self._num_nans is not None
                 else None
             )
+            if mtp_fault is not None:
+                self._mtp_fault_cpu = mtp_fault.to("cpu", non_blocking=True)
+                mtp_fault.record_stream(async_output_copy_stream)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -372,6 +378,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
+        if self._mtp_fault_cpu is not None:
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import raise_if_error
+
+            raise_if_error(self._mtp_fault_cpu)
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -537,6 +547,11 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self._mono_mtp_failstop = False
+        if getattr(getattr(vllm_config, "kernel_config", None), "monokernel", False):
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import enabled
+
+            self._mono_mtp_failstop = enabled(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -5033,6 +5048,17 @@ class GPUModelRunner(
                 )
                 self.drafter.dummy_run(num_tokens=1)
 
+        mtp_fault = None
+        if self._mono_mtp_failstop:
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import (
+                collect_tp_error,
+                raise_if_error,
+            )
+
+            mtp_fault = collect_tp_error(self.device)
+            if not self.use_async_scheduling:
+                raise_if_error(mtp_fault.to("cpu"))
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -5076,6 +5102,7 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 check_ep_fault=self.check_ep_fault,
                 num_nans=num_nans_device,
+                mtp_fault=mtp_fault,
                 num_draft_tokens=(
                     spec_decode_metadata.num_draft_tokens
                     if spec_decode_metadata is not None
