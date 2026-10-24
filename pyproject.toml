@@ -222,6 +222,8 @@ inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
 AER = "AER" # PCIe Advanced Error Reporting in preserved diagnostic logs.
+alog = "alog" # Log-A parameter name in the GDN kernel.
+halfs = "halfs" # Count of half-precision elements in kernel tile comments.
 Hel = "Hel"
 suh = "suh"
 wether = "wether"

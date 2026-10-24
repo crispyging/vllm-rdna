@@ -123,7 +123,7 @@ def _golden_gaps(G, res, blk, inj):
     return (srt[:, TOPK - 1] - srt[:, TOPK]).tolist()
 
 
-def _today_ffn(L, res, blk, inj):
+def _today_ffn(L, res, blk, inj, *, return_routes=False):
     """Today's decode FFN block on one EP rank (expert base 0)."""
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers import rdna_ops  # noqa: F401
@@ -188,7 +188,10 @@ def _today_ffn(L, res, blk, inj):
         True,
         TOPK,
     )
-    return routed + se, res_out, inj_out
+    result = (routed + se, res_out, inj_out)
+    if return_routes:
+        return (*result, tids, tw)
+    return result
 
 
 @pytest.fixture(scope="module")
@@ -284,6 +287,105 @@ def test_mtp_control_reset_is_captured_and_clears_sticky_error(ffn_layer):
     _check_k2(L, G, got, res, blk, inj)
     err = torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()
     assert err[0] == 0, f"MTP replay did not clear the sticky record: {err[:3]}"
+
+
+@pytest.fixture(scope="module")
+def router_boundary_layer():
+    """Fixed fixture used to guard the quantized-target router FP16 boundary."""
+    gen = torch.Generator(device=DEV).manual_seed(50124)
+    layer, _ = _make_layer(gen, keep_golden=False)
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("M", "first_delta", "second_delta"),
+    ((3, 200_000, 100_000), (7, 100_000, 200_000), (24, 100_000, 200_000)),
+)
+def test_quantized_target_router_half_boundary_matches_native(
+    router_boundary_layer, M, first_delta, second_delta
+):
+    """The quantized target Mono route IDs must match native FP16 router logits.
+
+    The layer seed and changed input seed deltas pin the historical failures.
+    Every graph replay is also checked against a fresh eager candidate and
+    today's module path; a near tie is not an exemption for different IDs.
+    """
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
+
+    L = router_boundary_layer
+    ws_bytes = int(
+        torch.ops._rocm_C.mono_k2_rdna2_workspace_bytes(H, R, ND, E, ISE, INTER)
+    )
+    ws = torch.zeros(ws_bytes + 8192, dtype=torch.uint8, device=DEV)
+    mono = SimpleNamespace(
+        t=L,
+        ws=ws,
+        base=0,
+        eps=EPS,
+        is_mtp=False,
+        dense_mtp=False,
+    )
+
+    def check(candidate, res, blk, inj, label):
+        actual, actual_residual, actual_injection, actual_ids, _ = _today_ffn(
+            L, res, blk, inj, return_routes=True
+        )
+        torch.accelerator.synchronize()
+        error = torch.ops._rocm_C.mono_k2_rdna2_error(ws).tolist()
+        assert error[0] == 0, f"{label}: sticky record {error[:3]}"
+
+        # Native fused_topk and Mono may use different slot ordering; selected
+        # expert IDs must match exactly as sets for every row.
+        # Ctrl has eight 32-bit words, eight 64-bit timestamps and the
+        # wg_done[10][256] 64-bit debug array before topk_id. The standalone
+        # C++ topk helper is not registered as a production Torch operator.
+        topk_offset = 8 * 4 + 8 * 8 + 10 * 256 * 8
+        mono_ids = ws.narrow(0, topk_offset, M * TOPK * 4).view(torch.int32)
+        mono_ids = mono_ids.view(M, TOPK).sort(dim=-1).values
+        actual_ids = actual_ids.sort(dim=-1).values
+        assert torch.equal(mono_ids, actual_ids), (
+            f"{label}: router expert IDs differ; "
+            f"Mono={mono_ids.tolist()} native={actual_ids.tolist()}"
+        )
+
+        got_residual, got_ffn, got_injection = candidate
+        max_ffn_error = (got_ffn.float() - actual.float()).abs().max().item()
+        assert max_ffn_error < 5e-3, f"{label}: FFN max abs error {max_ffn_error:.6g}"
+        assert torch.equal(got_residual, actual_residual), f"{label}: residual differs"
+        injection_error = (
+            (got_injection.float() - actual_injection.float()).abs().max().item()
+        )
+        assert injection_error < 5e-3, (
+            f"{label}: injection max abs error {injection_error:.6g}"
+        )
+
+    # Start with the same base input family as the strict scratch sweep.
+    res, blk, inj = _inputs(M, 50124 + M)
+    check(k2.run(mono, res, blk, inj), res, blk, inj, "initial eager")
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = k2.run(mono, res, blk, inj)
+
+    for delta in (first_delta, second_delta):
+        changed = _inputs(M, 50124 + delta + M)
+        for dst, src in zip((res, blk, inj), changed, strict=True):
+            dst.copy_(src)
+        torch.accelerator.synchronize()
+
+        eager_candidate = k2.run(mono, res, blk, inj)
+        check(eager_candidate, res, blk, inj, f"fresh eager seed+{delta}")
+        graph.replay()
+        check(graph_outputs, res, blk, inj, f"graph replay seed+{delta}")
+        for graph_tensor, eager_tensor in zip(
+            graph_outputs, eager_candidate, strict=True
+        ):
+            replay_error = (
+                (graph_tensor.float() - eager_tensor.float()).abs().max().item()
+            )
+            assert replay_error < 5e-3, (
+                f"graph/eager path mismatch at seed+{delta}: {replay_error:.6g}"
+            )
 
 
 @pytest.mark.parametrize("M", range(1, 25))

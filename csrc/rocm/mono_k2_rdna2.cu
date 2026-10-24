@@ -822,6 +822,30 @@ __device__ __forceinline__ void dense_dot2_rows(const half* __restrict__ wg,
   wave_sum<MT>(u);
 }
 
+// Match native dense HIP rounding: gu is dead after P5c's existing
+// phase5 barrier and is reused as [pair,H] half slots in P6. Each P7 thread
+// owns one(m,h), so only it consumes/clears all10 slots for that output.
+__device__ __forceinline__ half
+dense_native_output_rounding(const Params& p, const int* selected_ids, int i) {
+  static_assert(sizeof(Fx) * 2 * 640 >= sizeof(half) * 2560,
+                "dense [pair,H] slots must fit existing [pair,2I] Fx scratch");
+  const int m = i / p.H, h = i % p.H;
+  half* const slots = reinterpret_cast<half*>(p.gu);
+  float routed = 0.f;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    const int pi = m * kTopK + k;
+    const int le = selected_ids[pi] - p.expert_base;
+    const size_t address = (size_t)pi * p.H + h;
+    if (le >= 0 && le < kLocalE) routed += __half2float(slots[address]);
+    // Consume/clear only this exact pair-column, including nonlocal slots.
+    slots[address] = __float2half_rn(0.f);
+  }
+  const half routed16 = __float2half_rn(routed);
+  const half shared16 = __float2half_rn(p.acc[i]);
+  return __float2half_rn(__half2float(shared16) + __half2float(routed16));
+}
+
 // int4 column dequant constants for one (expert, group, column).
 __device__ __forceinline__ void q4_prep(const uint32_t* z, const half* s,
                                         int group, int N, int col, int zoff,
@@ -895,6 +919,7 @@ __global__ void __launch_bounds__(kThreads)
   const int G = gridDim.x, wg = blockIdx.x;
   const int gw = wg * kWaves + wave, GW = G * kWaves;
   const int M = p.M, H = p.H, HCH = kHC * p.H, R = p.R, ND = p.ND;
+  const bool dense_native_rounding = p.dense_mtp && H == 2560 && p.I == 640;
 
   if (err_set(p.ctrl)) {  // fail-stop: a previous launch timed out
     poison_outputs(p, wg, tid, G);
@@ -914,6 +939,13 @@ __global__ void __launch_bounds__(kThreads)
   }
 
   // ---------------- P1: combine + grouped RMSNorm; zero scratch
+  if (dense_native_rounding) {
+    // Full capacity, not only active M: recover gu lifetime after a dense
+    // reset.
+    for (int i = wg * kThreads + tid; i < kMaxM * kTopK * 2 * p.I;
+         i += G * kThreads)
+      p.gu[i].v = 0;
+  }
   for (int i = wg * kThreads + tid; i < M * ND; i += G * kThreads)
     p.dai[i] = 0.f;
   for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
@@ -1508,6 +1540,8 @@ __global__ void __launch_bounds__(kThreads)
     // fixed point, so the order of pairs does not change any result).
     // M > GTOPK_MIN: one wave of the grid per row (instead of every WG doing
     // all rows on its 8 waves), published through the workspace + one barrier.
+    const bool quantized_router_half_boundary =
+        !p.dense_mtp && H == 2560 && p.E == 512 && p.I == 640;
     const bool gtopk = M > MONO_FFN_GTOPK_MIN;
     for (int m = gtopk ? gw : wave; m < M; m += gtopk ? GW : kWaves) {
       int* const o_tid = gtopk ? p.ctrl->topk_id : s_tid;
@@ -1519,7 +1553,11 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
       for (int j = 0; j < 16; j++) {
         const int e = lane + 32 * j;
-        v[j] = e < p.E ? (float)lg[e] : -INFINITY;
+        v[j] = e < p.E
+                   ? ((dense_native_rounding || quantized_router_half_boundary)
+                          ? __half2float(__float2half_rn((float)lg[e]))
+                          : (float)lg[e])
+                   : -INFINITY;
         mx = fmaxf(mx, v[j]);
         const unsigned b = __float_as_uint(v[j]);
         key[j] = e < p.E ? ((b & 0x80000000u) ? ~b : (b | 0x80000000u)) : 0u;
@@ -1561,7 +1599,26 @@ __global__ void __launch_bounds__(kThreads)
         sel_sum += __shfl_xor(sel_sum, off);
       __builtin_amdgcn_wave_barrier();
       __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent");
-      if (lane < kTopK) o_tw[m * kTopK + lane] *= 1.f / sel_sum;
+      if (dense_native_rounding) {
+        if (lane < kTopK) {
+          // Register snapshot before any write; all10 selected lanes remain
+          // active for every shuffle. Rank by raw logit, not rounded weights.
+          const int id = o_tid[m * kTopK + lane];
+          const float weight = o_tw[m * kTopK + lane];
+          const float score = __half2float(__float2half_rn((float)lg[id]));
+          int rank = 0;
+#pragma unroll
+          for (int k = 0; k < kTopK; ++k) {
+            const float other = __shfl(score, k);
+            const int other_id = __shfl(id, k);
+            rank += other > score || (other == score && other_id < id);
+          }
+          o_tid[m * kTopK + rank] = id;
+          o_tw[m * kTopK + rank] = weight * (1.f / sel_sum);
+        }
+      } else {
+        if (lane < kTopK) o_tw[m * kTopK + lane] *= 1.f / sel_sum;
+      }
     }
     if (gtopk) {
       if (!grid_barrier(p, 7, &s_flag)) return;
@@ -1653,8 +1710,17 @@ __global__ void __launch_bounds__(kThreads)
               for (int r = 0; r < 4; r++) {
                 if (r < nr) {
                   const int pi = s_urow[u * kMaxM + r0 + r];
-                  p.gu[(size_t)pi * N13 + col] = g[r];
-                  p.gu[(size_t)pi * N13 + I + col] = up[r];
+                  if (dense_native_rounding) {
+                    // Keep original FP32 bits without intermediate half/Fx
+                    // rounding.
+                    p.gu[(size_t)pi * N13 + col].v =
+                        (long long)__float_as_uint(g[r]);
+                    p.gu[(size_t)pi * N13 + I + col].v =
+                        (long long)__float_as_uint(up[r]);
+                  } else {
+                    p.gu[(size_t)pi * N13 + col] = g[r];
+                    p.gu[(size_t)pi * N13 + I + col] = up[r];
+                  }
                 }
               }
             }
@@ -1739,13 +1805,22 @@ __global__ void __launch_bounds__(kThreads)
         const int le = s_tid[pi] - p.expert_base;
         if (le < 0 || le >= kLocalE) continue;
         Fx* gp = p.gu + (size_t)pi * N13;
-        const half g16 = __float2half(gp[j]);
-        const half u16 = __float2half(gp[I + j]);
-        gp[j].v = 0;
-        gp[I + j].v = 0;
-        const half sg = __float2half(silu_f(__half2float(g16)));
-        p.act[(size_t)pi * I + j] =
-            __float2half(__half2float(sg) * __half2float(u16));
+        if (dense_native_rounding) {
+          const float gate = __uint_as_float((unsigned)gp[j].v);
+          const float up = __uint_as_float((unsigned)gp[I + j].v);
+          gp[j].v = 0;
+          gp[I + j].v = 0;
+          const float activated = gate / (1.0f + expf(-gate));
+          p.act[(size_t)pi * I + j] = __float2half_rn(activated * up);
+        } else {
+          const half g16 = __float2half(gp[j]);
+          const half u16 = __float2half(gp[I + j]);
+          gp[j].v = 0;
+          gp[I + j].v = 0;
+          const half sg = __float2half(silu_f(__half2float(g16)));
+          p.act[(size_t)pi * I + j] =
+              __float2half(__half2float(sg) * __half2float(u16));
+        }
       }
     }
     {
@@ -1795,9 +1870,15 @@ __global__ void __launch_bounds__(kThreads)
               for (int r = 0; r < 4; r++) {
                 if (r < nr) {
                   const int pi = s_urow[u * kMaxM + r0 + r];
-                  Fx* dst = p.acc + (size_t)(pi / kTopK) * H + col;
-                  const half down16 = __float2half(a[r]);
-                  atomicAdd(dst, __half2float(down16) * s_tw[pi]);
+                  if (dense_native_rounding) {
+                    half* const slots = reinterpret_cast<half*>(p.gu);
+                    slots[(size_t)pi * H + col] =
+                        __float2half_rn(a[r] * s_tw[pi]);
+                  } else {
+                    Fx* dst = p.acc + (size_t)(pi / kTopK) * H + col;
+                    const half down16 = __float2half(a[r]);
+                    atomicAdd(dst, __half2float(down16) * s_tw[pi]);
+                  }
                 }
               }
             }
@@ -1849,7 +1930,9 @@ __global__ void __launch_bounds__(kThreads)
     const int par = seq & 1;
     const long long slot = p.ar.max_bytes / 2;
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads) {
-      const half h = __float2half(p.acc[i]);
+      const half h = dense_native_rounding
+                         ? dense_native_output_rounding(p, s_tid, i)
+                         : __float2half(p.acc[i]);
       p.out[i] = h;
       for (int k = 1; k < W; k++) {
         const int j = (me + k) % W;
@@ -1911,7 +1994,9 @@ __global__ void __launch_bounds__(kThreads)
     }
   } else {
     for (int i = wg * kThreads + tid; i < M * H; i += G * kThreads)
-      p.out[i] = __float2half(p.acc[i]);
+      p.out[i] = dense_native_rounding
+                     ? dense_native_output_rounding(p, s_tid, i)
+                     : __float2half(p.acc[i]);
   }
   if (wg == 0 && tid == 0) {
     p.ctrl->ts[7] = wall_clock64();
