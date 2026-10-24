@@ -80,7 +80,7 @@ def build(baseline, candidate):
 def markdown(report):
     lines = [
         "| cell | metric | baseline | candidate | ratio | delta % |",
-        "|---|---|---|---|---|---|",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for row in report["cells"]:
         for _, label in KEYS:

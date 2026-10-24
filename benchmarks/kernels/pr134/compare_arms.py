@@ -179,7 +179,7 @@ def build(reference, candidate):
 def markdown(report):
     lines = [
         "| cell | metric | FP16 | INT4 | ratio | delta % |",
-        "|---|---|---|---|---|---|",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for row in report["cells"]:
         for _, label in KEYS:
