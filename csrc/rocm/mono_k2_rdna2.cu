@@ -227,11 +227,10 @@ __device__ __forceinline__ bool err_set(Ctrl* c) {
                            __HIP_MEMORY_SCOPE_AGENT) != 0;
 }
 
-__device__ __forceinline__ void poison_outputs(const Params& p, int wg,
-                                                int tid, int G) {
+__device__ __forceinline__ void poison_outputs(const Params& p, int wg, int tid,
+                                               int G) {
   const half nan = __float2half(__int_as_float(0x7fc00000));
-  for (int i = wg * kThreads + tid; i < p.M * kHC * p.H;
-       i += G * kThreads)
+  for (int i = wg * kThreads + tid; i < p.M * kHC * p.H; i += G * kThreads)
     p.res_out[i] = nan;
   for (int i = wg * kThreads + tid; i < p.M * kHC; i += G * kThreads)
     p.inj_out[i] = nan;
@@ -249,8 +248,8 @@ struct NoPrefetch {
 // thread index among them), which touches the weights of this WG's tasks in
 // the next phase so they come from L2 / Infinity Cache instead of DRAM.
 template <typename F = NoPrefetch>
-__device__ bool grid_barrier(const Params& p, int phase, int* s_flag,
-                             F prefetch = F()) {
+__device__ __forceinline__ bool grid_barrier(const Params& p, int phase,
+                                             int* s_flag, F prefetch = F()) {
   __shared__ volatile int s_rel;  // set once the barrier has released
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (threadIdx.x == 0) s_rel = 0;
@@ -1647,9 +1646,8 @@ __global__ void __launch_bounds__(kThreads)
               return p.bin + (size_t)(pi / kTopK) * H;
             };
             float g[4], up[4];
-            dense_dot2_rows<4>(we + (size_t)col * H,
-                               we + (size_t)(I + col) * H, H, row_of, nr,
-                               lane, g, up);
+            dense_dot2_rows<4>(we + (size_t)col * H, we + (size_t)(I + col) * H,
+                               H, row_of, nr, lane, g, up);
             if (lane == 0) {
 #pragma unroll
               for (int r = 0; r < 4; r++) {
@@ -2255,8 +2253,7 @@ static void mono_launch(const torch::Tensor& res, const torch::Tensor& blk,
   if (reset_control) {
     const hipError_t reset_err =
         hipMemsetAsync(p.ctrl, 0, offsetof(Ctrl, ts), stream);
-    TORCH_CHECK(reset_err == hipSuccess,
-                "mono_ffn: MTP control reset failed: ",
+    TORCH_CHECK(reset_err == hipSuccess, "mono_ffn: MTP control reset failed: ",
                 hipGetErrorString(reset_err));
   }
   auto launch = [&](auto kern, int slot) {

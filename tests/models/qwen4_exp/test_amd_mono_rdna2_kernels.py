@@ -197,7 +197,16 @@ def ffn_layer():
     L, G = _make_layer(gen, keep_golden=True)
     nb = int(torch.ops._rocm_C.mono_k2_rdna2_workspace_bytes(H, R, ND, E, ISE, INTER))
     ws = torch.zeros(nb + 8192, dtype=torch.uint8, device=DEV)
-    mono = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, th=L, eps_a=EPS, is_mtp=False)
+    mono = SimpleNamespace(
+        t=L,
+        ws=ws,
+        base=0,
+        eps=EPS,
+        th=L,
+        eps_a=EPS,
+        is_mtp=False,
+        dense_mtp=False,
+    )
     return L, G, mono
 
 
@@ -254,7 +263,14 @@ def test_mtp_control_reset_is_captured_and_clears_sticky_error(ffn_layer):
     from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
 
     L, G, mono = ffn_layer
-    mtp = SimpleNamespace(t=L, ws=mono.ws, base=mono.base, eps=mono.eps, is_mtp=True)
+    mtp = SimpleNamespace(
+        t=L,
+        ws=mono.ws,
+        base=mono.base,
+        eps=mono.eps,
+        is_mtp=True,
+        dense_mtp=False,
+    )
     res, blk, inj = _inputs(4, 704)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -387,7 +403,7 @@ def test_k2_fail_stop_writes_nan(ffn_layer):
 
     L, _, mono = ffn_layer
     ws = torch.zeros_like(mono.ws)
-    fs = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, is_mtp=False)
+    fs = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, is_mtp=False, dense_mtp=False)
     res, blk, inj = _inputs(3, 7)
     ws[8:12].copy_(torch.tensor([1], dtype=torch.int32).view(torch.uint8))
     out = k2.run(fs, res, blk, inj)[1]
