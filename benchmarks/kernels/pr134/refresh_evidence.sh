@@ -64,11 +64,10 @@ curate() {
     echo "skip $name: no raw arm at $raw" >&2
     return 0
   fi
-  if [[ -e $serving/$name ]]; then
-    echo "skip $name: already curated"
-    return 0
-  fi
-  python3 "$tools/curate_arm.py" "$raw" "$serving/$name"
+  # Re-curate from scratch every time: the staged raw arm is the source of
+  # truth, and an earlier curation may predate a file that is now pulled (the
+  # manifest, the serve log). Curation is idempotent, so re-running is safe.
+  python3 "$tools/curate_arm.py" --force "$raw" "$serving/$name"
   echo "curated $name"
 }
 

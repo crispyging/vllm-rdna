@@ -14,7 +14,7 @@ into ``serve-evidence.log``: the TunableOp profile, the attention backend
 selection, the KV cache size, the engine configuration and the speculative
 decoding metrics. The raw arm is left untouched.
 
-Usage: python curate_arm.py <raw-arm-dir> <curated-dir>
+Usage: python curate_arm.py <raw-arm-dir> <curated-dir> [--force]
 """
 
 import argparse
@@ -84,9 +84,14 @@ def distill_serve_log(raw: Path, target: Path) -> int:
     return len(kept)
 
 
-def curate(raw: Path, curated: Path) -> None:
+def curate(raw: Path, curated: Path, force: bool = False) -> None:
     if curated.exists():
-        raise SystemExit(f"refusing to overwrite {curated}")
+        if not force:
+            raise SystemExit(f"refusing to overwrite {curated}")
+        # The raw arm is the source of truth, so replacing the curated copy
+        # is what "refresh" means: an earlier curation may predate a file
+        # that is now pulled (the manifest, the serve log).
+        shutil.rmtree(curated)
     curated.mkdir(parents=True)
     copied = 0
     for name in KEEP:
@@ -105,8 +110,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("raw", type=Path)
     parser.add_argument("curated", type=Path)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing curated directory (the raw arm wins)",
+    )
     args = parser.parse_args()
-    curate(args.raw, args.curated)
+    curate(args.raw, args.curated, force=args.force)
 
 
 if __name__ == "__main__":
