@@ -23,7 +23,7 @@ export TRITON_KERNELS_SRC_DIR=$tree/.deps/pr134-triton-kernels
 mkdir -p "$evidence" "$TRITON_KERNELS_SRC_DIR" "$build"
 rsync -a --exclude='__pycache__/' --exclude='*.pyc' "$frozen_triton/" "$TRITON_KERNELS_SRC_DIR/"
 cat /proc/sys/kernel/random/boot_id > "$evidence/boot-id.before"
-sha256sum "$tree"/csrc/rocm/{fa_rdna2.cu,int4_fp16_kv_cache.cu,torch_bindings.cpp,ops.h} \
+sha256sum "$tree"/csrc/rocm/{fa_rdna2.cu,int4_fp16_kv_cache.cu,int4_kv_layout_common.cuh,torch_bindings.cpp,ops.h} \
   "$tree/CMakeLists.txt" > "$evidence/source.before.sha256"
 test -e "$evidence/rocm-original.so" || cp "$tree/vllm/_rocm_C.abi3.so" "$evidence/rocm-original.so"
 sha256sum "$evidence/rocm-original.so" > "$evidence/original-binary.sha256"
