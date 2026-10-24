@@ -5,11 +5,23 @@
     8,
     9
   ],
-  "served_hip_ordinals": [],
-  "placement_matches": false,
-  "touched_hip_ordinals": [],
+  "served_hip_ordinals": [
+    6,
+    7,
+    8,
+    9
+  ],
+  "placement_matches": true,
+  "touched_hip_ordinals": [
+    6,
+    7,
+    8,
+    9
+  ],
   "foreign_workload_untouched": true,
-  "served_pcie_roots": [],
+  "served_pcie_roots": [
+    "00:01.1"
+  ],
   "cards": [
     {
       "smi_card": "card0",
@@ -20,8 +32,8 @@
       "guid": "56424",
       "hip_ordinal": 6,
       "pcie_root": "00:01.1",
-      "vram_used_bytes": 17182720,
-      "vram_used_gib": 0.02
+      "vram_used_bytes": 15894831104,
+      "vram_used_gib": 14.8
     },
     {
       "smi_card": "card1",
@@ -32,8 +44,8 @@
       "guid": "18860",
       "hip_ordinal": 7,
       "pcie_root": "00:01.1",
-      "vram_used_bytes": 17182720,
-      "vram_used_gib": 0.02
+      "vram_used_bytes": 15903281152,
+      "vram_used_gib": 14.81
     },
     {
       "smi_card": "card2",
@@ -44,8 +56,8 @@
       "guid": "17318",
       "hip_ordinal": 8,
       "pcie_root": "00:01.1",
-      "vram_used_bytes": 17182720,
-      "vram_used_gib": 0.02
+      "vram_used_bytes": 15903272960,
+      "vram_used_gib": 14.81
     },
     {
       "smi_card": "card3",
@@ -56,8 +68,8 @@
       "guid": "29156",
       "hip_ordinal": 9,
       "pcie_root": "00:01.1",
-      "vram_used_bytes": 17182720,
-      "vram_used_gib": 0.02
+      "vram_used_bytes": 15878115328,
+      "vram_used_gib": 14.79
     },
     {
       "smi_card": "card4",
@@ -68,7 +80,7 @@
       "guid": "11353",
       "hip_ordinal": 2,
       "pcie_root": "40:03.1",
-      "vram_used_bytes": 17182720,
+      "vram_used_bytes": 20668416,
       "vram_used_gib": 0.02
     },
     {
@@ -80,7 +92,7 @@
       "guid": "47517",
       "hip_ordinal": 3,
       "pcie_root": "40:03.1",
-      "vram_used_bytes": 17182720,
+      "vram_used_bytes": 20668416,
       "vram_used_gib": 0.02
     },
     {
@@ -92,7 +104,7 @@
       "guid": "45975",
       "hip_ordinal": 4,
       "pcie_root": "40:03.1",
-      "vram_used_bytes": 17182720,
+      "vram_used_bytes": 20668416,
       "vram_used_gib": 0.02
     },
     {
@@ -104,7 +116,7 @@
       "guid": "33237",
       "hip_ordinal": 5,
       "pcie_root": "40:03.1",
-      "vram_used_bytes": 17182720,
+      "vram_used_bytes": 20668416,
       "vram_used_gib": 0.02
     },
     {
@@ -116,7 +128,7 @@
       "guid": "5082",
       "hip_ordinal": 1,
       "pcie_root": "80:01.1",
-      "vram_used_bytes": 27947008,
+      "vram_used_bytes": 31432704,
       "vram_used_gib": 0.03
     },
     {
@@ -128,8 +140,9 @@
       "guid": "8425",
       "hip_ordinal": 0,
       "pcie_root": "c0:03.1",
-      "vram_used_bytes": 27947008,
+      "vram_used_bytes": 31432704,
       "vram_used_gib": 0.03
     }
-  ]
+  ],
+  "note": "Captured while a live vLLM server was up on the same core and the same GPUs the serving arms used. rocm-smi's card index is not the HIP ordinal (rocm-smi sorts by PCI bus address, HIP follows the KFD node order), so the HIP ordinal is resolved through the KFD node GUID before the PCIe root port is read from sysfs. The placement assertion only means something while a server holds the cards."
 }
