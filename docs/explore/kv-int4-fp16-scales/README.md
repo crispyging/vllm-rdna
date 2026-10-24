@@ -621,6 +621,15 @@ document:
   same-boot FP16/INT4 qualification, the hardware-event classifier, the
   registered-op and CUDA-graph parity checks, and the microbenchmarks.
 
+The serving evidence itself is **not** in this PR. The measured arms, the
+paired comparisons, the counterbalanced ABBA artifacts, the baseline
+reproducibility artifacts, the GPU placement proof and the handover live on
+the separate branch `evidence/pr134-serving`, under
+`bench_results/2026-10-24-pr134-int4fp16/`. Keeping them out of this diff
+means the diff is the implementation and the harness, not 8.8 MB of
+measurement output; the harness on this branch is what regenerates that
+tree (`benchmarks/kernels/pr134/refresh_evidence.sh`).
+
 ## What this PR does not contain
 
 - No change for any other platform. The dtype is opt-in; the RDNA2 backend
