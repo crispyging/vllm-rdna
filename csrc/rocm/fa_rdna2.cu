@@ -78,6 +78,15 @@
 #include <hip/hip_bfloat16.h>
 
 #include "rdna2_scratch.cuh"
+// Packed INT4 + FP16 block-scale KV cache layout and its dequant helpers.
+// Shared with the QSA decode kernels so the format has one definition.
+#include "int4_kv_layout_common.cuh"
+
+using vllm::int4_kv::int4_eight_from_rows;
+using vllm::int4_kv::int4_load_half;
+using vllm::int4_kv::int4_pair_from_rows;
+using vllm::int4_kv::Int4KvArg;
+using vllm::int4_kv::Int4KvLayout;
 
 // ---- Tile constants for gfx1030 -----------------------------------------
 // Defined at global scope (not inside namespace vllm::fa_rdna2) because
@@ -290,92 +299,6 @@ __device__ __forceinline__ half fa_kv_load(const KV_T* ptr, float scale) {
 // reused without code duplication. Per the kv-int8.md wiki contract, this
 // is the structural fix for OPT-D: replace the scalar-__hmul _pth stub with
 // the occupancy-fixed fp16 decode tile shape, fused i8 KV load via fdot2.
-struct FaInt4Cache {
-  bool vector8;
-  const uint8_t* scales[2];
-  int64_t data_stride[2][4];
-  int64_t scale_stride[2][4];
-};
-struct FaNoInt4Cache {};
-template <bool Enabled>
-using FaInt4Arg = std::conditional_t<Enabled, FaInt4Cache, FaNoInt4Cache>;
-
-__device__ __forceinline__ half fa_int4_load(const uint8_t* cache,
-                                             const FaInt4Cache& layout,
-                                             int side, int block, int head,
-                                             int slot, int d) {
-  const auto& ds = layout.data_stride[side];
-  const auto& ss = layout.scale_stride[side];
-  const int64_t data_offset = int64_t(block) * ds[0] + int64_t(head) * ds[1] +
-                              int64_t(slot) * ds[2] + int64_t(d / 2) * ds[3];
-  const int64_t scale_offset = int64_t(block) * ss[0] + int64_t(head) * ss[1] +
-                               int64_t(slot) * ss[2] + int64_t(d / 32) * ss[3];
-  const uint8_t* sp = layout.scales[side] + scale_offset;
-  const uint16_t word = uint16_t(sp[0]) | (uint16_t(sp[1]) << 8);
-  const uint16_t clean_scale = word & 0xfff0;
-  half block_scale;
-  __builtin_memcpy(&block_scale, &clean_scale, sizeof(half));
-  const int q = (cache[data_offset] >> ((d & 1) * 4)) & 15;
-  const float value = float(q - int(word & 15)) * __half2float(block_scale);
-  return __float2half_rn(fminf(65504.0f, fmaxf(-65504.0f, value)));
-}
-
-__device__ __forceinline__ half2 fa_int4_pair_from_rows(
-    const uint8_t* data_row, const uint8_t* scale_row,
-    int64_t data_channel_stride, int64_t scale_channel_stride, int d) {
-  // Shared integer row bases otherwise lose global address-space provenance.
-  using GlobalByte = const uint8_t __attribute__((address_space(1)));
-  using GlobalWord = const uint16_t __attribute__((address_space(1)));
-  const auto* data =
-      reinterpret_cast<GlobalByte*>(reinterpret_cast<uint64_t>(data_row) +
-                                    int64_t(d / 2) * data_channel_stride);
-  const auto* sp =
-      reinterpret_cast<GlobalWord*>(reinterpret_cast<uint64_t>(scale_row) +
-                                    int64_t(d / 32) * scale_channel_stride);
-  // Metadata is a 16-bit tensor view, so every scale address is aligned.
-  const uint16_t word = *sp;
-  const uint16_t clean_scale = word & 0xfff0;
-  half block_scale;
-  __builtin_memcpy(&block_scale, &clean_scale, sizeof(half));
-  const float scale = __half2float(block_scale);
-  const int zp = word & 15;
-  const uint8_t packed = *data;
-  const float lo = float(int(packed & 15) - zp) * scale;
-  const float hi = float(int(packed >> 4) - zp) * scale;
-  return __floats2half2_rn(fminf(65504.0f, fmaxf(-65504.0f, lo)),
-                           fminf(65504.0f, fmaxf(-65504.0f, hi)));
-}
-
-__device__ __forceinline__ uint4
-fa_int4_eight_from_rows(const uint8_t* data_row, const uint8_t* scale_row,
-                        int64_t scale_channel_stride, int d) {
-  using GlobalDword = const uint32_t __attribute__((address_space(1)));
-  using GlobalWord = const uint16_t __attribute__((address_space(1)));
-  const auto* data = reinterpret_cast<GlobalDword*>(
-      reinterpret_cast<uint64_t>(data_row) + d / 2);
-  const auto* sp =
-      reinterpret_cast<GlobalWord*>(reinterpret_cast<uint64_t>(scale_row) +
-                                    int64_t(d / 32) * scale_channel_stride);
-  const uint32_t packed = *data;
-  const uint16_t word = *sp;
-  const uint16_t clean_scale = word & 0xfff0;
-  half block_scale;
-  __builtin_memcpy(&block_scale, &clean_scale, sizeof(half));
-  const float scale = __half2float(block_scale);
-  const int zp = word & 15;
-  uint32_t pairs[4];
-#pragma unroll
-  for (int pair = 0; pair < 4; ++pair) {
-    const float lo = float(int((packed >> (pair * 8)) & 15) - zp) * scale;
-    const float hi = float(int((packed >> (pair * 8 + 4)) & 15) - zp) * scale;
-    const half2 value =
-        __floats2half2_rn(fminf(65504.0f, fmaxf(-65504.0f, lo)),
-                          fminf(65504.0f, fmaxf(-65504.0f, hi)));
-    __builtin_memcpy(&pairs[pair], &value, sizeof(half2));
-  }
-  return make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
-}
-
 template <typename KV_T, bool IS_FP8, bool IS_INT8 = false,
           bool IS_INT4 = false>
 __global__ __launch_bounds__(128)
@@ -395,7 +318,7 @@ __global__ __launch_bounds__(128)
         const float* __restrict__ k_scale_per_tok,
         const float* __restrict__ v_scale_per_tok,
         const int* __restrict__ cu_query_lens, const int num_seqs,
-        FaInt4Arg<IS_INT4> int4 = {}) {
+        Int4KvArg<IS_INT4> int4 = {}) {
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
   const int split = blockIdx.z;
@@ -495,11 +418,11 @@ __global__ __launch_bounds__(128)
           const int n_local = i / (HEAD_DIM_PAGED_128 / 8);
           const int d = (i % (HEAD_DIM_PAGED_128 / 8)) * 8;
           if (n_local < blk_size) {
-            const uint4 k_eight = fa_int4_eight_from_rows(
+            const uint4 k_eight = int4_eight_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[0][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[0][n_local]),
                 int4.scale_stride[0][3], d);
-            const uint4 v_eight = fa_int4_eight_from_rows(
+            const uint4 v_eight = int4_eight_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[1][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[1][n_local]),
                 int4.scale_stride[1][3], d);
@@ -512,11 +435,11 @@ __global__ __launch_bounds__(128)
           const int n_local = i / (HEAD_DIM_PAGED_128 / 2);
           const int d = (i % (HEAD_DIM_PAGED_128 / 2)) * 2;
           if (n_local < blk_size) {
-            const half2 k_pair = fa_int4_pair_from_rows(
+            const half2 k_pair = int4_pair_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[0][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[0][n_local]),
                 int4.data_stride[0][3], int4.scale_stride[0][3], d);
-            const half2 v_pair = fa_int4_pair_from_rows(
+            const half2 v_pair = int4_pair_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[1][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[1][n_local]),
                 int4.data_stride[1][3], int4.scale_stride[1][3], d);
@@ -588,12 +511,12 @@ __global__ __launch_bounds__(128)
                               h_kv * stride_vc1 + d_sub * stride_vc2 +
                               s_slot[n_local] * stride_vc3 + x_idx * stride_vc4;
           if constexpr (IS_INT4) {
-            sK[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(key_cache), int4,
-                             0, s_blk[n_local], h_kv, s_slot[n_local], d);
-            sV[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(value_cache),
-                             int4, 1, s_blk[n_local], h_kv, s_slot[n_local], d);
+            sK[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(key_cache), int4, 0,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
+            sV[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(value_cache), int4, 1,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
           } else if constexpr (IS_INT8) {
             const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
             const float v_s = v_scale_per_tok[n_global * H_kv + h_kv];
@@ -712,7 +635,7 @@ __global__ __launch_bounds__(256)
         const float* __restrict__ k_scale_per_tok,
         const float* __restrict__ v_scale_per_tok,
         const int* __restrict__ cu_query_lens, const int num_seqs,
-        FaInt4Arg<IS_INT4> int4 = {}) {
+        Int4KvArg<IS_INT4> int4 = {}) {
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
   const int split = blockIdx.z;
@@ -806,11 +729,11 @@ __global__ __launch_bounds__(256)
           const int n_local = i / (256 / 8);
           const int d = (i % (256 / 8)) * 8;
           if (n_local < blk_size) {
-            const uint4 k_eight = fa_int4_eight_from_rows(
+            const uint4 k_eight = int4_eight_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[0][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[0][n_local]),
                 int4.scale_stride[0][3], d);
-            const uint4 v_eight = fa_int4_eight_from_rows(
+            const uint4 v_eight = int4_eight_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[1][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[1][n_local]),
                 int4.scale_stride[1][3], d);
@@ -823,11 +746,11 @@ __global__ __launch_bounds__(256)
           const int n_local = i / (256 / 2);
           const int d = (i % (256 / 2)) * 2;
           if (n_local < blk_size) {
-            const half2 k_pair = fa_int4_pair_from_rows(
+            const half2 k_pair = int4_pair_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[0][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[0][n_local]),
                 int4.data_stride[0][3], int4.scale_stride[0][3], d);
-            const half2 v_pair = fa_int4_pair_from_rows(
+            const half2 v_pair = int4_pair_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[1][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[1][n_local]),
                 int4.data_stride[1][3], int4.scale_stride[1][3], d);
@@ -899,12 +822,12 @@ __global__ __launch_bounds__(256)
                               h_kv * stride_vc1 + d_sub * stride_vc2 +
                               s_slot[n_local] * stride_vc3 + x_idx * stride_vc4;
           if constexpr (IS_INT4) {
-            sK[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(key_cache), int4,
-                             0, s_blk[n_local], h_kv, s_slot[n_local], d);
-            sV[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(value_cache),
-                             int4, 1, s_blk[n_local], h_kv, s_slot[n_local], d);
+            sK[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(key_cache), int4, 0,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
+            sV[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(value_cache), int4, 1,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
           } else if constexpr (IS_INT8) {
             const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
             const float v_s = v_scale_per_tok[n_global * H_kv + h_kv];
@@ -1289,7 +1212,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
     const int x_dim, const int num_seqs, half* __restrict__ O, const int H_q,
     const int H_kv, const int kv_group_num, const float scale, const int causal,
     const int sliding_window, const float k_scale, const float v_scale,
-    FaInt4Arg<IS_INT4> int4 = {}) {
+    Int4KvArg<IS_INT4> int4 = {}) {
   // Grid: (max_q_blocks_per_seq, H_q, num_seqs). Each CTA handles one
   // sequence's query block — blockIdx.z = seq_idx, blockIdx.x = q_block
   // within that sequence. This guarantees every token is covered by
@@ -1385,11 +1308,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
         const int d_swz = fa_swz_d(d, n_local);
         if constexpr (IS_INT4) {
           sK[n_local * 128 + d_swz] =
-              fa_int4_load(reinterpret_cast<const uint8_t*>(key_cache), int4, 0,
-                           block_idx, h_kv, slot, d);
+              int4_load_half(reinterpret_cast<const uint8_t*>(key_cache), int4,
+                             0, block_idx, h_kv, slot, d);
           sV[n_local * 128 + d_swz] =
-              fa_int4_load(reinterpret_cast<const uint8_t*>(value_cache), int4,
-                           1, block_idx, h_kv, slot, d);
+              int4_load_half(reinterpret_cast<const uint8_t*>(value_cache),
+                             int4, 1, block_idx, h_kv, slot, d);
         } else {
           sK[n_local * 128 + d_swz] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
           sV[n_local * 128 + d_swz] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
@@ -1772,7 +1695,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
     const int x_dim, const int num_seqs, half* __restrict__ O, const int H_q,
     const int H_kv, const int kv_group_num, const float scale, const int causal,
     const int sliding_window, const float k_scale, const float v_scale,
-    FaInt4Arg<IS_INT4> int4 = {}) {
+    Int4KvArg<IS_INT4> int4 = {}) {
   // Grid: (max_q_blocks_per_seq, H_q, num_seqs). Each CTA handles one
   // sequence's query block — blockIdx.z = seq_idx, blockIdx.x = q_block
   // within that sequence. This guarantees every token is covered by
@@ -1935,12 +1858,12 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
                               h_kv * stride_vc1 + d_sub * stride_vc2 +
                               s_slot[n_local] * stride_vc3 + x_idx * stride_vc4;
           if constexpr (IS_INT4) {
-            sK[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(key_cache), int4,
-                             0, s_blk[n_local], h_kv, s_slot[n_local], d);
-            sV[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(value_cache),
-                             int4, 1, s_blk[n_local], h_kv, s_slot[n_local], d);
+            sK[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(key_cache), int4, 0,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
+            sV[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(value_cache), int4, 1,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
           } else {
             sK[n_local * DSK + d] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
             sV[n_local * DSK + d] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
@@ -4067,7 +3990,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
     const int H_kv, const int kv_group_num, const float scale, const int causal,
     const int sliding_window, const float k_scale, const float v_scale,
     const float* __restrict__ k_scale_per_tok,
-    const float* __restrict__ v_scale_per_tok, FaInt4Arg<IS_INT4> int4 = {}) {
+    const float* __restrict__ v_scale_per_tok, Int4KvArg<IS_INT4> int4 = {}) {
   constexpr int BR = BR_STEP;
   constexpr int BC = 16;
   constexpr int HEADS = HEADS_PER_CTA;
@@ -4217,11 +4140,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
           const int n_local = i / (HEAD_DIM / 8);
           const int d = (i % (HEAD_DIM / 8)) * 8;
           if (n_local < blk_size) {
-            const uint4 k_eight = fa_int4_eight_from_rows(
+            const uint4 k_eight = int4_eight_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[0][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[0][n_local]),
                 int4.scale_stride[0][3], d);
-            const uint4 v_eight = fa_int4_eight_from_rows(
+            const uint4 v_eight = int4_eight_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[1][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[1][n_local]),
                 int4.scale_stride[1][3], d);
@@ -4234,11 +4157,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
           const int n_local = i / (HEAD_DIM / 2);
           const int d = (i % (HEAD_DIM / 2)) * 2;
           if (n_local < blk_size) {
-            const half2 k_pair = fa_int4_pair_from_rows(
+            const half2 k_pair = int4_pair_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[0][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[0][n_local]),
                 int4.data_stride[0][3], int4.scale_stride[0][3], d);
-            const half2 v_pair = fa_int4_pair_from_rows(
+            const half2 v_pair = int4_pair_from_rows(
                 reinterpret_cast<const uint8_t*>(s_int4_data[1][n_local]),
                 reinterpret_cast<const uint8_t*>(s_int4_scales[1][n_local]),
                 int4.data_stride[1][3], int4.scale_stride[1][3], d);
@@ -4306,12 +4229,12 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_gqa_kernel(
                               h_kv * stride_vc1 + d_sub * stride_vc2 +
                               s_slot[n_local] * stride_vc3 + x_idx * stride_vc4;
           if constexpr (IS_INT4) {
-            sK[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(key_cache), int4,
-                             0, s_blk[n_local], h_kv, s_slot[n_local], d);
-            sV[n_local * DSK + d] =
-                fa_int4_load(reinterpret_cast<const uint8_t*>(value_cache),
-                             int4, 1, s_blk[n_local], h_kv, s_slot[n_local], d);
+            sK[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(key_cache), int4, 0,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
+            sV[n_local * DSK + d] = int4_load_half(
+                reinterpret_cast<const uint8_t*>(value_cache), int4, 1,
+                s_blk[n_local], h_kv, s_slot[n_local], d);
           } else if constexpr (IS_INT8) {
             const int n_global = n + n_local;
             const float ks = k_scale_per_tok[n_global * H_kv + h_kv];
@@ -5190,7 +5113,7 @@ static void fa_int4_prefill_launch(const half* q, const uint8_t* kc,
                                    const int* cu, const int* lens, half* o,
                                    int nt, int hq, int hk, int ns,
                                    int table_stride, int block_size, int window,
-                                   float scale, FaInt4Cache layout,
+                                   float scale, Int4KvLayout layout,
                                    hipStream_t stream) {
   constexpr int TILE_N = 16;
   const int groups = hq / hk;
@@ -5234,7 +5157,7 @@ void fa_rdna2_paged_int4_fp16_block(
                   key_cache.size(2) == block_size &&
                   key_cache.size(3) == D64 / 2,
               "invalid packed cache geometry");
-  FaInt4Cache layout{};
+  Int4KvLayout layout{};
   layout.vector8 = true;
   const torch::Tensor caches[2] = {key_cache, value_cache};
   const torch::Tensor scales[2] = {k_scale, v_scale};
