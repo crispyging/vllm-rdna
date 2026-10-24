@@ -188,6 +188,11 @@ logger = init_logger(__name__)
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        self._mono_mtp_failstop = False
+        if getattr(getattr(vllm_config, "kernel_config", None), "monokernel", False):
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import enabled
+
+            self._mono_mtp_failstop = enabled(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
@@ -2315,6 +2320,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+
+        if self._mono_mtp_failstop:
+            from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import collect_tp_error
+
+            fault = collect_tp_error(self.device)
+            async_output.enqueue_mtp_fault(
+                fault, self.main_stream, self.output_copy_stream
+            )
 
         if phase_timer is not None:
             phase_timer.end("draft")

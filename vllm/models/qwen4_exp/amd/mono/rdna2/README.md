@@ -33,13 +33,26 @@ provably zero-Triton run omits `--monokernel`.
 `layout.py` holds the per-layer weight views, the workspace and the rdna_ar
 attach; `debug.py` the in-serve timing. Kernels: `csrc/rocm/mono_k2_rdna2.cu`
 (K1 + K2), `mono_gdn_rdna2.cu`, `mono_qsa_decode_rdna2.cu`. Torch ops:
-`vllm::qwen4_exp_mono_{k1,k2,gdn,mark}_rdna2`. Wider batches, prefill and the
-MTP drafter keep today's modules.
+`vllm::qwen4_exp_mono_{k1,k2,gdn,mark}_rdna2`. Wider batches and prefill keep
+today's modules. Opt-in MTP K1 can fuse compatible attention
+HyperConnections independently of K2. MTP K2 also has an experimental dense
+FP16 FFN route for the exact unquantized Qwen4Exp drafter geometry; unsupported
+dtype, routing, weight layout, or shape falls back to the vLLM modules. This
+does not change target-model K2, which continues to require symmetric W4A16.
+The dense route is opt-in and needs correctness plus serving qualification
+before production use.
+
+The `tools/rdna/mono/serve_2a.sh` experiment wrapper defaults
+`GMEM=0.92` (override with `GMEM=<fraction>` for a controlled memory study).
+With `KV=auto`, vLLM profiles the model and sizes the KV cache from the memory
+remaining under that utilization target; 0.92 is not a promise that every
+context length fits.
 
 ## Knobs (only read with `--monokernel`)
 
 `--additional-config '{"rocm_mono_decode": {...}}'`, keys of `Options` in
-`__init__.py`: `k1`, `k1_max_rows`, `k2`, `k2_max_rows`, `k2_modes`,
+`__init__.py`: `mtp_drafter` (opt in to supported MTP K1/K2 layouts), `k1`,
+`k1_max_rows`, `k2`, `k2_max_rows`, `k2_modes`,
 `k2_num_wg`, `k2_sleep`, `k2_flags`, `k2_ar` (FFN all-reduce in the kernel),
 `gdn`, `gdn_max_rows`, `gdn_graph` (record the GDN core in FULL graphs),
 `qsa`, `timing`, `modules` (timing reference), `hw_queues`. Unknown keys are an

@@ -123,7 +123,7 @@ def _golden_gaps(G, res, blk, inj):
     return (srt[:, TOPK - 1] - srt[:, TOPK]).tolist()
 
 
-def _today_ffn(L, res, blk, inj):
+def _today_ffn(L, res, blk, inj, *, return_routes=False):
     """Today's decode FFN block on one EP rank (expert base 0)."""
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers import rdna_ops  # noqa: F401
@@ -188,7 +188,10 @@ def _today_ffn(L, res, blk, inj):
         True,
         TOPK,
     )
-    return routed + se, res_out, inj_out
+    result = (routed + se, res_out, inj_out)
+    if return_routes:
+        return (*result, tids, tw)
+    return result
 
 
 @pytest.fixture(scope="module")
@@ -197,7 +200,16 @@ def ffn_layer():
     L, G = _make_layer(gen, keep_golden=True)
     nb = int(torch.ops._rocm_C.mono_k2_rdna2_workspace_bytes(H, R, ND, E, ISE, INTER))
     ws = torch.zeros(nb + 8192, dtype=torch.uint8, device=DEV)
-    mono = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, th=L, eps_a=EPS)
+    mono = SimpleNamespace(
+        t=L,
+        ws=ws,
+        base=0,
+        eps=EPS,
+        th=L,
+        eps_a=EPS,
+        is_mtp=False,
+        dense_mtp=False,
+    )
     return L, G, mono
 
 
@@ -247,6 +259,265 @@ def test_k2_matches_today(ffn_layer, M):
     assert err[0] == 0, f"sticky record {err[:3]}"
 
 
+def test_mtp_control_reset_is_captured_and_clears_sticky_error(ffn_layer):
+    """MTP's graph memset must clear a previous error before the fused launch."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
+
+    L, G, mono = ffn_layer
+    mtp = SimpleNamespace(
+        t=L,
+        ws=mono.ws,
+        base=mono.base,
+        eps=mono.eps,
+        is_mtp=True,
+        dense_mtp=False,
+    )
+    res, blk, inj = _inputs(4, 704)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = k2.run(mtp, res, blk, inj)
+
+    # Model a previous failed launch's sticky header. This tests reset/replay,
+    # not an actual barrier timeout or worker recovery.
+    mono.ws.view(torch.int32)[2].fill_(1)
+    torch.accelerator.synchronize()
+    graph.replay()
+    _check_k2(L, G, got, res, blk, inj)
+    err = torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()
+    assert err[0] == 0, f"MTP replay did not clear the sticky record: {err[:3]}"
+
+
+def test_mtp_preserve_fault_is_captured_and_requires_explicit_recovery(ffn_layer):
+    """Only the internal production mode keeps an injected K2 fault sticky."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
+    from vllm.models.qwen4_exp.amd.mono.rdna2.failstop import (
+        clear_mtp_fault_for_recovery,
+    )
+    from vllm.models.qwen4_exp.amd.mono.rdna2.layout import _WORKSPACES
+
+    L, G, mono = ffn_layer
+    mtp = SimpleNamespace(
+        t=L,
+        ws=mono.ws,
+        base=mono.base,
+        eps=mono.eps,
+        is_mtp=True,
+        dense_mtp=False,
+        preserve_fault=True,
+    )
+    res, blk, inj = _inputs(4, 706)
+    mono.ws.zero_()  # module-scoped fixture: begin with a clean arena
+    torch.accelerator.synchronize()
+    ws_ptr = mono.ws.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = k2.run(mtp, res, blk, inj)
+    graph.replay()
+    _check_k2(L, G, got, res, blk, inj)
+    assert all(torch.isfinite(x).all().item() for x in got)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 0
+
+    mono.ws.view(torch.int32)[2].fill_(1)
+    torch.accelerator.synchronize()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert all(torch.isnan(x).all().item() for x in got)
+    err = torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()
+    assert err[0] == 1, f"MTP replay lost the sticky record: {err[:3]}"
+
+    # The fixture uses an independent workspace, so bind it to the one MTP
+    # scope slot while exercising the explicit offline recovery helper.
+    idx = mono.ws.device.index
+    if idx is None:
+        idx = torch.accelerator.current_device_index()
+    key = (idx, "mtp")
+    prior = _WORKSPACES.get(key)
+    _WORKSPACES[key] = mono.ws
+    try:
+        mono.ws[64:128].fill_(7)  # include non-header scratch
+        clear_mtp_fault_for_recovery(mono.ws.device)
+    finally:
+        if prior is None:
+            del _WORKSPACES[key]
+        else:
+            _WORKSPACES[key] = prior
+    assert mono.ws.data_ptr() == ws_ptr
+    assert torch.count_nonzero(mono.ws).item() == 0
+
+    for dst, src in zip((res, blk, inj), _inputs(4, 707), strict=True):
+        dst.copy_(src)
+    graph.replay()
+    _check_k2(L, G, got, res, blk, inj)
+    assert all(torch.isfinite(x).all().item() for x in got)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 0
+
+    fresh_ws = torch.zeros_like(mono.ws)
+    fresh = SimpleNamespace(
+        t=L,
+        ws=fresh_ws,
+        base=mono.base,
+        eps=mono.eps,
+        is_mtp=True,
+        dense_mtp=False,
+        preserve_fault=True,
+    )
+    fresh_got = k2.run(fresh, res, blk, inj)
+    torch.accelerator.synchronize()
+    for recovered, clean in zip(got, fresh_got, strict=True):
+        torch.testing.assert_close(recovered.float(), clean.float(), atol=5e-3, rtol=0)
+
+
+def test_mtp_k2_fault_survives_k1_and_next_k2_capture(ffn_layer):
+    """K1 between draft K2 launches must not erase a shared MTP fault."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k1, k2
+
+    L, G, mono = ffn_layer
+    mtp = SimpleNamespace(
+        t=L,
+        th=L,
+        ws=mono.ws,
+        base=mono.base,
+        eps=mono.eps,
+        eps_a=mono.eps_a,
+        is_mtp=True,
+        dense_mtp=False,
+        preserve_fault=True,
+    )
+    res, blk, inj = _inputs(4, 708)
+    mono.ws.zero_()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        first = k2.run(mtp, res, blk, inj)
+        # Test-only fault injection between draft steps, captured on the same
+        # stream. The first K2 is clean; K1 and the next K2 share its arena.
+        mono.ws.view(torch.int32)[2].fill_(1)
+        middle = k1.run(mtp, res, blk, inj)
+        last = k2.run(mtp, res, blk, inj)
+
+    mono.ws.zero_()  # graph capture itself ran the injected sequence
+    torch.accelerator.synchronize()
+    graph.replay()
+    torch.accelerator.synchronize()
+    _check_k2(L, G, first, res, blk, inj)
+    assert all(torch.isfinite(x).all().item() for x in first)
+    assert all(torch.isnan(x).all().item() for x in middle)
+    assert all(torch.isnan(x).all().item() for x in last)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 1
+
+    # A direct K1 caller without the internal property keeps legacy reset.
+    legacy = SimpleNamespace(th=L, ws=mono.ws, eps_a=mono.eps_a, is_mtp=True)
+    cleared = k1.run(legacy, res, blk, inj)
+    torch.accelerator.synchronize()
+    assert all(torch.isfinite(x).all().item() for x in cleared)
+    assert torch.ops._rocm_C.mono_k2_rdna2_error(mono.ws).tolist()[0] == 0
+
+
+@pytest.fixture(scope="module")
+def router_boundary_layer():
+    """Fixed fixture used to guard the quantized-target router FP16 boundary."""
+    gen = torch.Generator(device=DEV).manual_seed(50124)
+    layer, _ = _make_layer(gen, keep_golden=False)
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("M", "first_delta", "second_delta"),
+    ((3, 200_000, 100_000), (7, 100_000, 200_000), (24, 100_000, 200_000)),
+)
+def test_quantized_target_router_half_boundary_matches_native(
+    router_boundary_layer, M, first_delta, second_delta
+):
+    """The quantized target Mono route IDs must match native FP16 router logits.
+
+    The layer seed and changed input seed deltas pin the historical failures.
+    Every graph replay is also checked against a fresh eager candidate and
+    today's module path; a near tie is not an exemption for different IDs.
+    """
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
+
+    L = router_boundary_layer
+    ws_bytes = int(
+        torch.ops._rocm_C.mono_k2_rdna2_workspace_bytes(H, R, ND, E, ISE, INTER)
+    )
+    ws = torch.zeros(ws_bytes + 8192, dtype=torch.uint8, device=DEV)
+    mono = SimpleNamespace(
+        t=L,
+        ws=ws,
+        base=0,
+        eps=EPS,
+        is_mtp=False,
+        dense_mtp=False,
+    )
+
+    def check(candidate, res, blk, inj, label):
+        actual, actual_residual, actual_injection, actual_ids, _ = _today_ffn(
+            L, res, blk, inj, return_routes=True
+        )
+        torch.accelerator.synchronize()
+        error = torch.ops._rocm_C.mono_k2_rdna2_error(ws).tolist()
+        assert error[0] == 0, f"{label}: sticky record {error[:3]}"
+
+        # Native fused_topk and Mono may use different slot ordering; selected
+        # expert IDs must match exactly as sets for every row.
+        # Ctrl has eight 32-bit words, eight 64-bit timestamps and the
+        # wg_done[10][256] 64-bit debug array before topk_id. The standalone
+        # C++ topk helper is not registered as a production Torch operator.
+        topk_offset = 8 * 4 + 8 * 8 + 10 * 256 * 8
+        mono_ids = ws.narrow(0, topk_offset, M * TOPK * 4).view(torch.int32)
+        mono_ids = mono_ids.view(M, TOPK).sort(dim=-1).values
+        actual_ids = actual_ids.sort(dim=-1).values
+        assert torch.equal(mono_ids, actual_ids), (
+            f"{label}: router expert IDs differ; "
+            f"Mono={mono_ids.tolist()} native={actual_ids.tolist()}"
+        )
+
+        got_residual, got_ffn, got_injection = candidate
+        max_ffn_error = (got_ffn.float() - actual.float()).abs().max().item()
+        assert max_ffn_error < 5e-3, f"{label}: FFN max abs error {max_ffn_error:.6g}"
+        assert torch.equal(got_residual, actual_residual), f"{label}: residual differs"
+        injection_error = (
+            (got_injection.float() - actual_injection.float()).abs().max().item()
+        )
+        assert injection_error < 5e-3, (
+            f"{label}: injection max abs error {injection_error:.6g}"
+        )
+
+    # Start with the same base input family as the strict scratch sweep.
+    res, blk, inj = _inputs(M, 50124 + M)
+    check(k2.run(mono, res, blk, inj), res, blk, inj, "initial eager")
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = k2.run(mono, res, blk, inj)
+
+    for delta in (first_delta, second_delta):
+        changed = _inputs(M, 50124 + delta + M)
+        for dst, src in zip((res, blk, inj), changed, strict=True):
+            dst.copy_(src)
+        torch.accelerator.synchronize()
+
+        eager_candidate = k2.run(mono, res, blk, inj)
+        check(eager_candidate, res, blk, inj, f"fresh eager seed+{delta}")
+        graph.replay()
+        check(graph_outputs, res, blk, inj, f"graph replay seed+{delta}")
+        for graph_tensor, eager_tensor in zip(
+            graph_outputs, eager_candidate, strict=True
+        ):
+            replay_error = (
+                (graph_tensor.float() - eager_tensor.float()).abs().max().item()
+            )
+            assert replay_error < 5e-3, (
+                f"graph/eager path mismatch at seed+{delta}: {replay_error:.6g}"
+            )
+
+
 @pytest.mark.parametrize("M", range(1, 25))
 def test_k1_matches_today(ffn_layer, M):
     from vllm.model_executor.layers import rdna_ops  # noqa: F401
@@ -286,13 +557,85 @@ def test_k1_matches_today(ffn_layer, M):
     check(got)
 
 
+def test_mtp_k1_runs_when_dense_k2_is_unsupported(monkeypatch):
+    """MTP K1 must remain usable when its dense FFN makes K2 fall back."""
+    from vllm import forward_context
+    from vllm.model_executor.layers import rdna_ops  # noqa: F401
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import k1
+    from vllm.models.qwen4_exp.amd.mono.rdna2.layout import MonoLayer
+    from vllm.models.qwen4_exp.amd.ops.hc import hc_combine_norm
+
+    gen = torch.Generator(device=DEV).manual_seed(704)
+    L, _ = _make_layer(gen, keep_golden=False)
+
+    def hc():
+        return SimpleNamespace(
+            hc_count=HC,
+            use_combine=True,
+            input_mix_weight_down_block_inject=SimpleNamespace(
+                weight=L["wd"], weight_i8=None
+            ),
+            input_mix_weight_up=SimpleNamespace(weight=L["wu"], weight_i8=None),
+            hc_norm=SimpleNamespace(weight=L["norm_w"]),
+            config=SimpleNamespace(rms_norm_eps=EPS),
+        )
+
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(
+            gate=object(), experts=SimpleNamespace(quant_method=SimpleNamespace())
+        ),
+        mlp_hyper_connection=hc(),
+        attn_hyper_connection=hc(),
+    )
+    mono = MonoLayer(layer, is_mtp=True)
+    assert not mono.setup()  # Unsupported dense MTP FFN disables K2.
+    assert mono.setup_k1()
+
+    context = SimpleNamespace(no_compile_layers={"mtp.layers.0": mono})
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    monkeypatch.setattr(k1.OPTS, "k1", True)
+    monkeypatch.setattr(k1, "MODES", {"eager", "full"})
+    is_capturing = torch.cuda.is_current_stream_capturing
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(k1, "mode", lambda: "eager")
+
+    res, blk, inj = _inputs(4, 705)
+
+    def today():
+        ro, xn = hc_combine_norm(res, blk, inj, L["norm_w"], EPS, HC)
+        b, dai = torch.ops.vllm.rdna_hc_mix(
+            xn, L["wd"], None, None, L["wu"], None, None, R, HC
+        )
+        return ro, b, dai[:, R : R + HC]
+
+    def check(got):
+        ro, block_input, injection = got
+        ro_ref, block_input_ref, injection_ref = today()
+        torch.accelerator.synchronize()
+        assert torch.equal(ro, ro_ref)
+        assert (block_input.float() - block_input_ref.float()).abs().max().item() < 5e-3
+        assert (injection.float() - injection_ref.float()).abs().max().item() < 5e-3
+
+    check(k1._k1(res, blk, inj, "mtp.layers.0"))
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", is_capturing)
+    monkeypatch.setattr(k1, "mode", lambda: "full")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = k1._k1(res, blk, inj, "mtp.layers.0")
+    for tensor, new in zip((res, blk, inj), _inputs(4, 706)):
+        tensor.copy_(new)
+    graph.replay()
+    check(got)
+
+
 def test_k2_fail_stop_writes_nan(ffn_layer):
     """A sticky error record makes the next launch write NaN, not stale data."""
     from vllm.models.qwen4_exp.amd.mono.rdna2 import k2
 
     L, _, mono = ffn_layer
     ws = torch.zeros_like(mono.ws)
-    fs = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS)
+    fs = SimpleNamespace(t=L, ws=ws, base=0, eps=EPS, is_mtp=False, dense_mtp=False)
     res, blk, inj = _inputs(3, 7)
     ws[8:12].copy_(torch.tensor([1], dtype=torch.int32).view(torch.uint8))
     out = k2.run(fs, res, blk, inj)[1]
