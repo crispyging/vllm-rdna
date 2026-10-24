@@ -5,7 +5,8 @@
 # FP16 -> INT4 -> INT4 -> FP16 (ABBA), which controls for run-order drift.
 # All four arms share one boot, one config, one source/binary manifest.
 #
-# HIP 2,3,4,5 only. No source sync, no core rebuild, no dependency change.
+# The GPU set is a parameter (the paired runs use HIP 6,7,8,9: the clean PCIe
+# root port). No source sync, no core rebuild, no dependency change.
 set -uo pipefail
 
 gpus=${1:?usage: $0 <gpus> <suffix>}
