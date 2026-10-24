@@ -209,6 +209,8 @@ NOOPs = "NOOPs"
 nin_shortcut = "nin_shortcut"
 cudaDevAttrMaxSharedMemoryPerBlockOptin = "cudaDevAttrMaxSharedMemoryPerBlockOptin"
 sharedMemPerBlockOptin = "sharedMemPerBlockOptin"
+# GDN / HC kernel parameter names (a log, delta b) from the Qwen4Exp work.
+alog = "alog"
 
 depthwise_seperable_out_channel = "depthwise_seperable_out_channel"
 pard_token = "pard_token"
