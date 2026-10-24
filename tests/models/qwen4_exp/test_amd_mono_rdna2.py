@@ -44,8 +44,11 @@ def _config(
 @pytest.fixture
 def deployment(monkeypatch):
     """A deployment the kernels take: gfx10x, every op built."""
+    from vllm import envs
+
     monkeypatch.setattr(md, "_on_gfx10x", lambda: True)
     monkeypatch.setattr(md, "ops_refusal", lambda: None)
+    monkeypatch.setattr(envs, "VLLM_RAISE_ON_LOGIT_NANS", True)
     saved = Options()
     saved.assign(OPTS)
     yield
@@ -98,13 +101,70 @@ def test_mtp_drafter_is_opt_in_and_has_independent_row_caps():
     assert (opts.mtp_k1_max_rows, opts.mtp_k2_max_rows) == (24, 3)
 
 
-def test_mtp_drafter_requires_nan_failstop(monkeypatch, deployment):
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        {},
+        {"k1": True, "k2": False},
+        {"k1": False, "k2": True},
+        {"k1": False, "k2": False, "mtp_drafter": True},
+    ],
+    ids=["default-target", "target-k1-only", "target-k2-only", "drafter-only"],
+)
+def test_timeout_nan_failstop_is_required_for_mono_kernels(
+    monkeypatch, deployment, knobs
+):
     from vllm import envs
 
     monkeypatch.setattr(envs, "VLLM_RAISE_ON_LOGIT_NANS", False)
-    cfg = _config(knobs={"mtp_drafter": True})
-    with pytest.raises(ValueError, match="requires VLLM_RAISE_ON_LOGIT_NANS=1"):
+    cfg = _config(knobs=knobs)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "requires VLLM_RAISE_ON_LOGIT_NANS=1.*"
+            "fail-stop before generated tokens are published"
+        ),
+    ):
         md.install(cfg)
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"k1": False, "k2": False, "mtp_drafter": True}],
+    ids=["default-target", "drafter-only"],
+)
+def test_timeout_nan_failstop_accepts_mono_kernels_when_enabled(
+    monkeypatch, deployment, knobs
+):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_RAISE_ON_LOGIT_NANS", True)
+    # Stop after the guard so this CPU test does not import/register GPU ops.
+    monkeypatch.setattr(md, "ops_refusal", lambda: "guard passed")
+    with pytest.raises(ValueError, match="^--monokernel guard passed\\.$"):
+        md.install(_config(knobs=knobs))
+
+
+def test_timeout_nan_failstop_is_not_required_when_target_kernels_are_disabled(
+    monkeypatch, deployment
+):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_RAISE_ON_LOGIT_NANS", False)
+    # The persistent target kernels are disabled, so install reaches the later
+    # mocked ops check without requiring the global NaN fail-stop setting.
+    monkeypatch.setattr(md, "ops_refusal", lambda: "guard passed")
+    with pytest.raises(ValueError, match="^--monokernel guard passed\\.$"):
+        md.install(_config(knobs={"k1": False, "k2": False}))
+
+
+def test_timeout_nan_failstop_is_not_required_without_monokernel(
+    monkeypatch, deployment
+):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_RAISE_ON_LOGIT_NANS", False)
+    assert md.install(_config(monokernel=False)) is None
 
 
 def _engine_config(monkeypatch, *args, env=None):

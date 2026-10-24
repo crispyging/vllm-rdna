@@ -155,13 +155,14 @@ def install(vllm_config) -> Options | None:
     opts = options(vllm_config)
     if opts is None:
         return None
-    if opts.mtp_drafter:
+    if opts.mtp_drafter or opts.k1 or opts.k2:
         from vllm import envs
 
         if not envs.VLLM_RAISE_ON_LOGIT_NANS:
             raise ValueError(
-                "--monokernel MTP drafter requires VLLM_RAISE_ON_LOGIT_NANS=1 "
-                "to prevent a MonoKernel timeout from reaching sampling"
+                "--monokernel target or MTP drafter requires "
+                "VLLM_RAISE_ON_LOGIT_NANS=1 so timeout-poisoned NaN outputs "
+                "fail-stop before generated tokens are published"
             )
     why = config_refusal(vllm_config) or ops_refusal()
     if why is not None:
