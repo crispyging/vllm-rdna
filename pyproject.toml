@@ -221,6 +221,7 @@ view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
+AER = "AER" # PCIe Advanced Error Reporting in preserved diagnostic logs.
 Hel = "Hel"
 suh = "suh"
 wether = "wether"
