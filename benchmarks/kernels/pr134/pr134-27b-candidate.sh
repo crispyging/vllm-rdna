@@ -10,8 +10,11 @@ set -uo pipefail
 readonly results=/home/chenco_adm/pr134-results
 readonly tree=/home/chenco_adm/vllm-pr-int4fp16
 readonly runtime=/home/chenco_adm/Apps/vllm/venv-pr134-int4fp16
-readonly reference=$results/serve-27b-fp16-coree443-hip6789
-readonly candidate=$results/serve-27b-int4-coree443-hip6789
+# Tag every output directory with the core binary that actually served it, so a
+# rebuilt .so can never be filed under the previous build's results.
+readonly core_tag=$(sha256sum "$tree/vllm/_rocm_C.abi3.so" | cut -c1-8)
+readonly reference=$results/serve-27b-fp16-core$core_tag-hip6789
+readonly candidate=$results/serve-27b-int4-core$core_tag-hip6789
 readonly stop_marker=$results/stop-qualification
 readonly model=/home/chenco_adm/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea
 
