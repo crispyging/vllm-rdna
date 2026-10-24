@@ -597,6 +597,20 @@ document:
 - `docs/explore/kv-int4-fp16-scales/TESTPLAN.md` - the measurement plan, with
   the V620 cells left empty.
 
+The serving evidence is **not** in this PR. The measured arms, the paired
+comparisons, the counterbalanced ABBA artifacts, the baseline reproducibility
+artifacts, the GPU placement proof and the handover live on the separate
+branch `evidence/pr134-serving`, under:
+
+- `bench_results/2026-10-24-pr134-int4fp16/` - the original block-size and
+  MAXBAT attribution;
+- `bench_results/2026-10-25-pr134-levers/` - the W4A8 and decode-stall-cap
+  arms, and the landing validation of the shipped recipe;
+- `bench_results/2026-10-26-pr134-maxbat/` - the prefill-budget A/B.
+
+The implementation that this exploration feeds merged into `rdna_extras` as
+PR #138.
+
 ## What this PR does not contain
 
 - No dtype, no backend change, no kernel. Nothing in the serving path
