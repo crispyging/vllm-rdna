@@ -59,7 +59,7 @@ def main():
             f"## {label} ({cell})",
             "",
             "| metric | FP16 | INT4 | ratio | delta |",
-            "|---|---|---|---|---|",
+            "| --- | --- | --- | --- | --- |",
         ]
         for key, name in ROWS:
             a, b = ref[cell].get(key), cand[cell].get(key)
@@ -71,7 +71,9 @@ def main():
             )
             lines.append(f"| {name} | {fmt(a)} | {fmt(b)} | {ratio} | {delta} |")
         lines.append("")
-    text = "\n".join(lines)
+    # MD047: the file ends with a single newline, so drop the blank separator
+    # the per-cell grouping leaves behind.
+    text = "\n".join(lines).rstrip("\n")
     if args.output:
         args.output.write_text(text + "\n")
     print(text)
