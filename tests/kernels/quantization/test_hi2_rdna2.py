@@ -1,0 +1,386 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""HadamardINT2-FP16 (HI2, spec v3.2) weight support.
+
+The reference below is a port of ``tools/hi2/hi2/format.py`` (the quantizer's
+ground truth for the bit layout): LSB-first word-aligned code packing, the
+8-bit block parameters decoded through the three fp16 row constants, the
+order-16 Walsh-Hadamard on flagged groups, the smoothing vector, and
+``reference_linear`` in float64.
+
+CPU tests (run anywhere): the host helpers in
+``vllm/model_executor/layers/quantization/utils/hi2_utils.py`` (dequantize,
+row/column slicing for tensor parallelism, concatenation for fused layers,
+validation, the dequantized fallback) against the reference.
+
+GPU tests (gfx1030 with the ``_rocm_C`` HI2 ops): the dequant kernel is
+bit-exact against the reference decode; the activation transform and the
+GEMV (decode) and dequant+GEMM (prefill) paths of ``hi2_linear_rdna2`` match
+``reference_linear`` to fp16 accuracy.
+
+Run ``pytest tests/kernels/quantization/test_hi2_rdna2.py``.
+"""
+
+import math
+
+import pytest
+import torch
+
+from vllm.model_executor.layers.quantization.utils import hi2_utils as hu
+
+GROUP = 16
+
+
+# ---- reference (port of tools/hi2/hi2/format.py) -------------------------
+def ref_hadamard16(dtype=torch.float64) -> torch.Tensor:
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < GROUP:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return (h / math.sqrt(GROUP)).to(dtype)
+
+
+def ref_fwht_groups(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    k = x.shape[-1]
+    xg = x.double().reshape(*x.shape[:-1], k // GROUP, GROUP)
+    rot = xg @ ref_hadamard16()
+    out = torch.where(flags.bool().reshape(-1, 1), rot, xg)
+    return out.reshape(x.shape)
+
+
+def ref_decode_params(lo_u8, step_u8, lo_min, lo_scale, step_scale):
+    lo = (
+        (lo_u8.double() * lo_scale.double() + lo_min.double()).float().to(torch.float16)
+    )
+    step = (step_u8.float() * step_scale.float()).to(torch.float16)
+    return lo, step
+
+
+def ref_pack_codes(codes: torch.Tensor, nbits: int) -> torch.Tensor:
+    per_word = 32 // nbits
+    n = codes.shape[-1]
+    c = codes.to(torch.int64).reshape(*codes.shape[:-1], n // per_word, per_word)
+    word = torch.zeros(c.shape[:-1], dtype=torch.int64)
+    for i in range(per_word):
+        word |= c[..., i] << (nbits * i)
+    return torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
+
+
+def ref_unpack_codes(words: torch.Tensor, nbits: int) -> torch.Tensor:
+    per_word = 32 // nbits
+    w = words.to(torch.int64) & 0xFFFFFFFF
+    mask = (1 << nbits) - 1
+    c = torch.stack([(w >> (nbits * i)) & mask for i in range(per_word)], dim=-1)
+    return c.reshape(*words.shape[:-1], -1)
+
+
+def ref_dequantize_stored(t: dict) -> torch.Tensor:
+    """Row by row, straight from the spec: float64 ``[R, K]`` of fp16 values."""
+    r = t["row_nbits"].numel()
+    k = t["had"].numel() * GROUP
+    out = torch.zeros(r, k, dtype=torch.float64)
+    for i in range(r):
+        nb, bs = int(t["row_nbits"][i]), int(t["row_block"][i])
+        c0, c1 = int(t["code_off"][i]), int(t["code_off"][i + 1])
+        p0 = int(t["param_off"][i])
+        codes = ref_unpack_codes(t["codes"][c0:c1], nb).reshape(k // bs, bs)
+        p = t["blk_params"][2 * p0 : 2 * (p0 + k // bs)].reshape(-1, 2)
+        rc = t["row_consts"][i]
+        lo, step = ref_decode_params(p[:, 0], p[:, 1], rc[0], rc[1], rc[2])
+        w = lo.double().unsqueeze(-1) + codes.double() * step.double().unsqueeze(-1)
+        out[i] = w.to(torch.float16).double().reshape(-1)
+    return out
+
+
+def ref_linear(x: torch.Tensor, t: dict) -> torch.Tensor:
+    xd = x.double()
+    if t.get("col_scale") is not None:
+        xd = xd / t["col_scale"].double()
+    return ref_fwht_groups(xd, t["had"]) @ ref_dequantize_stored(t).T
+
+
+# ---- random HI2 tensors ---------------------------------------------------
+def make_hi2(
+    r: int,
+    k: int,
+    nbits=(2, 4, 8),
+    blocks=(16, 32, 64),
+    had: str = "mixed",
+    smooth: bool = True,
+    seed: int = 0,
+) -> dict:
+    """Random tensor in the checkpoint layout (spec 2.4), built with the
+    reference packer. Row widths and block sizes are drawn per row."""
+    g = torch.Generator().manual_seed(seed)
+    nb = torch.tensor(nbits)[torch.randint(len(nbits), (r,), generator=g)]
+    bl = torch.tensor(blocks)[torch.randint(len(blocks), (r,), generator=g)]
+    words, params = [], []
+    code_off, param_off = [0], [0]
+    for i in range(r):
+        n, b = int(nb[i]), int(bl[i])
+        codes = torch.randint(0, 2**n, (k,), generator=g)
+        words.append(ref_pack_codes(codes, n))
+        p = torch.randint(0, 256, (k // b, 2), generator=g, dtype=torch.int64)
+        p[torch.rand(k // b, generator=g) < 0.05, 1] = 0  # degenerate blocks
+        params.append(p.to(torch.uint8).reshape(-1))
+        code_off.append(code_off[-1] + k * n // 32)
+        param_off.append(param_off[-1] + k // b)
+    span = 0.02 + 0.08 * torch.rand(r, generator=g)
+    levels = (2**nb - 1).double()
+    consts = torch.stack(
+        [
+            -span / 2,  # lo_min
+            span / 2 / 255,  # lo_scale
+            (span / levels / 255 * 2).float(),  # step_scale
+        ],
+        dim=1,
+    ).to(torch.float16)
+    if had == "all":
+        flags = torch.ones(k // GROUP, dtype=torch.uint8)
+    elif had == "none":
+        flags = torch.zeros(k // GROUP, dtype=torch.uint8)
+    else:
+        flags = (torch.rand(k // GROUP, generator=g) < 0.5).to(torch.uint8)
+    t = {
+        "codes": torch.cat(words),
+        "code_off": torch.tensor(code_off, dtype=torch.int32),
+        "blk_params": torch.cat(params),
+        "param_off": torch.tensor(param_off, dtype=torch.int32),
+        "row_consts": consts,
+        "row_nbits": nb.to(torch.uint8),
+        "row_block": bl.to(torch.uint8),
+        "had": flags,
+    }
+    if smooth:
+        t["col_scale"] = (0.25 + 1.5 * torch.rand(k, generator=g)).to(torch.float16)
+    return t
+
+
+def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
+    a, b = a.double().cpu(), b.double().cpu()
+    return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+
+# ---- CPU: host helpers ----------------------------------------------------
+@pytest.mark.parametrize("seed", [0, 1])
+def test_utils_dequantize_bit_exact(seed):
+    t = make_hi2(24, 256, seed=seed)
+    hu.validate(t)
+    got = hu.dequantize_stored(t)
+    assert got.dtype == torch.float16
+    assert torch.equal(got.double(), ref_dequantize_stored(t))
+
+
+def test_utils_slicing_and_concat():
+    t = make_hi2(20, 384, seed=3)
+    w = ref_dequantize_stored(t)
+    rows = hu.select_rows(t, 5, 17)
+    hu.validate(rows)
+    assert torch.equal(ref_dequantize_stored(rows), w[5:17])
+    cols = hu.select_cols(t, 128, 320)
+    hu.validate(cols)
+    assert torch.equal(ref_dequantize_stored(cols), w[:, 128:320])
+    assert torch.equal(cols["had"], t["had"][8:20])
+    assert torch.equal(cols["col_scale"], t["col_scale"][128:320])
+    both = hu.concat_rows([hu.select_rows(t, 0, 7), hu.select_rows(t, 7, 20)])
+    hu.validate(both)
+    assert torch.equal(ref_dequantize_stored(both), w)
+    # Row-parallel TP: the two column halves add up to the full product.
+    x = torch.randn(3, 384, dtype=torch.float64)
+    halves = [hu.select_cols(t, 0, 192), hu.select_cols(t, 192, 384)]
+    y = ref_linear(x[:, :192], halves[0]) + ref_linear(x[:, 192:], halves[1])
+    assert rel_err(y, ref_linear(x, t)) < 1e-12
+
+
+def test_utils_validate_rejects_bad_offsets():
+    t = make_hi2(4, 128, seed=4)
+    bad = dict(t)
+    bad["code_off"] = t["code_off"].clone()
+    bad["code_off"][2] += 1
+    with pytest.raises(ValueError):
+        hu.validate(bad)
+    bad = dict(t)
+    bad["row_block"] = torch.full_like(t["row_block"], 128)
+    with pytest.raises(ValueError):
+        hu.validate(bad)
+    with pytest.raises(ValueError):
+        hu.select_cols(t, 16, 64)
+
+
+@pytest.mark.parametrize("smooth", [False, True])
+@pytest.mark.parametrize("had", ["none", "all", "mixed"])
+def test_utils_fallback_linear(smooth, had):
+    t = make_hi2(16, 256, had=had, smooth=smooth, seed=5)
+    x = torch.randn(5, 256, dtype=torch.float32)
+    xt = hu.act_transform(x, t) if hu.needs_transform(t) else x
+    y = xt.double() @ hu.dequantize_stored(t).double().T
+    assert rel_err(y, ref_linear(x, t)) < 1e-6
+
+
+def test_config_module_selection():
+    from vllm.model_executor.layers.quantization.hi2 import HadamardInt2Config
+
+    cfg = HadamardInt2Config.from_config(
+        {"quant_method": "hadamard_int2", "version": "3.2", "mode": "flex"}
+    )
+    names = []
+    for m in ("q_proj", "k_proj", "v_proj"):
+        base = f"model.language_model.layers.0.self_attn.{m}"
+        names += [f"{base}.hi2_{f}" for f in hu.FIELDS + ("col_scale",)]
+    names.append("model.visual.blocks.0.attn.qkv.weight")
+    cfg.set_checkpoint_tensor_names(names)
+    cfg.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    fields = cfg._module_fields("language_model.model.layers.0.self_attn.qkv_proj")
+    assert all(f is not None and "col_scale" in f for f in fields)
+    assert cfg._module_fields("visual.blocks.0.attn.qkv") == [None]
+    with pytest.raises(ValueError):
+        HadamardInt2Config(version="3.1")
+
+
+# ---- GPU: RDNA2 kernels ---------------------------------------------------
+def _kernels_available() -> bool:
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10x
+
+    return (
+        on_gfx10x()
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "hi2_linear_rdna2")
+    )
+
+
+gfx1030_only = pytest.mark.skipif(
+    not _kernels_available(), reason="needs gfx1030 and the _rocm_C HI2 ops"
+)
+
+
+def _dev(t: dict) -> dict:
+    d = {f: hu.canonicalize(t)[f].cuda() for f in hu.FIELDS}
+    s = t.get("col_scale")
+    d["col_scale"] = (
+        s.cuda() if s is not None else torch.empty(0, dtype=torch.float16).cuda()
+    )
+    return d
+
+
+def _linear(x: torch.Tensor, d: dict, transform: bool, max_m: int = 8):
+    from vllm import _custom_ops as ops
+
+    return ops.hi2_linear_rdna2(
+        x,
+        d["col_scale"],
+        d["had"],
+        d["codes"],
+        d["code_off"],
+        d["blk_params"],
+        d["param_off"],
+        d["row_consts"],
+        d["row_nbits"],
+        d["row_block"],
+        transform,
+        max_m,
+    )
+
+
+@gfx1030_only
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_dequant_kernel_bit_exact(seed):
+    from vllm import _custom_ops as ops
+
+    t = make_hi2(72, 512, seed=seed)
+    d = _dev(t)
+    out = torch.empty(72, 512, dtype=torch.float16, device="cuda")
+    ops.hi2_dequant_rdna2(
+        d["codes"],
+        d["code_off"],
+        d["blk_params"],
+        d["param_off"],
+        d["row_consts"],
+        d["row_nbits"],
+        d["row_block"],
+        out,
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(out.cpu().double(), ref_dequantize_stored(t))
+
+
+@gfx1030_only
+@pytest.mark.parametrize("smooth", [False, True])
+@pytest.mark.parametrize("had", ["none", "all", "mixed"])
+def test_act_transform_kernel(smooth, had):
+    from vllm import _custom_ops as ops
+
+    t = make_hi2(1, 1024, had=had, smooth=smooth, seed=7)
+    d = _dev(t)
+    x = torch.randn(6, 1024, dtype=torch.float16)
+    out = torch.empty(6, 1024, dtype=torch.float16, device="cuda")
+    ops.hi2_act_transform_rdna2(x.cuda(), d["col_scale"], d["had"], out)
+    xd = x.double()
+    if smooth:
+        xd = xd / t["col_scale"].double()
+    ref = ref_fwht_groups(xd, t["had"])
+    # One fp16 rounding of an fp32 result.
+    assert rel_err(out, ref) < 1e-3
+    assert (out.cpu().double() - ref).abs().max() <= 1e-3 * ref.abs().max() + 1e-6
+
+
+@gfx1030_only
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 8, 9, 16, 37])
+@pytest.mark.parametrize(
+    "nbits,blocks",
+    [((2,), (32,)), ((4,), (64,)), ((8,), (16,)), ((2, 4, 8), (16, 32, 64))],
+)
+@pytest.mark.parametrize(
+    "had,smooth", [("all", True), ("none", False), ("mixed", True)]
+)
+def test_linear_kernel_vs_reference(m, nbits, blocks, had, smooth):
+    r, k = 200, 1024
+    t = make_hi2(r, k, nbits=nbits, blocks=blocks, had=had, smooth=smooth, seed=m)
+    d = _dev(t)
+    x = torch.randn(m, k, dtype=torch.float16)
+    y = _linear(x.cuda(), d, hu.needs_transform(t))
+    torch.accelerator.synchronize()
+    assert y.shape == (m, r) and y.dtype == torch.float16
+    ref = ref_linear(x, t)
+    # Error sources: fp16 transformed activation, fp16 output, fp32 dot.
+    assert rel_err(y, ref) < 2e-3, (m, nbits, blocks, had, smooth)
+
+
+@gfx1030_only
+@pytest.mark.parametrize("m", [1, 4, 8, 12])
+def test_decode_and_prefill_paths_agree(m):
+    """Same input through the GEMV and the dequant+GEMM paths."""
+    t = make_hi2(96, 768, seed=11)
+    d = _dev(t)
+    x = torch.randn(m, 768, dtype=torch.float16).cuda()
+    y_gemv = _linear(x, d, True, max_m=64)
+    y_gemm = _linear(x, d, True, max_m=0)
+    torch.accelerator.synchronize()
+    assert rel_err(y_gemv, y_gemm) < 1e-3
+
+
+@gfx1030_only
+def test_gemv_strided_output():
+    from vllm import _custom_ops as ops
+
+    t = make_hi2(64, 512, had="none", smooth=False, seed=13)
+    d = _dev(t)
+    x = torch.randn(3, 512, dtype=torch.float16)
+    big = torch.zeros(3, 100, dtype=torch.float16, device="cuda")
+    out = big[:, 20:84]
+    ops.hi2_gemv_rdna2(
+        x.cuda(),
+        d["codes"],
+        d["code_off"],
+        d["blk_params"],
+        d["param_off"],
+        d["row_consts"],
+        d["row_nbits"],
+        d["row_block"],
+        out,
+    )
+    torch.accelerator.synchronize()
+    assert rel_err(out, ref_linear(x, t)) < 2e-3
+    assert not big[:, :20].any() and not big[:, 84:].any()
