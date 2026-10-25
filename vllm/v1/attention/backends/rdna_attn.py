@@ -41,6 +41,11 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
     has_native_kv_cache_layout,
 )
+from vllm.v1.attention.ops.int4_fp16_kv_layout import (
+    int4_fp16_cache_view,
+    int4_fp16_read_views,
+    int4_fp16_record_bytes,
+)
 from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -105,30 +110,15 @@ def _get_fa_rdna2_module():
 def _int4_fp16_cache_view(
     kv_cache: torch.Tensor, num_kv_heads: int, head_size: int
 ) -> torch.Tensor:
-    """Alias logical [pages, 2, slots, heads*record] as the native writer view."""
-    record_bytes = head_size // 2 + 2 * (head_size // 32)
-    if (
-        kv_cache.dtype != torch.uint8
-        or kv_cache.ndim != 4
-        or kv_cache.shape[1] != 2
-        or kv_cache.shape[-1] != num_kv_heads * record_bytes
-        or kv_cache.stride(-1) != 1
-    ):
-        raise ValueError("RDNA_ATTN: invalid int4_fp16_block cache geometry")
-    return kv_cache.transpose(0, 1).unflatten(-1, (num_kv_heads, record_bytes))
+    """Alias the RDNA_ATTN packed cache as [2, pages, slots, heads, record]."""
+    return int4_fp16_cache_view(kv_cache, num_kv_heads, head_size)
 
 
 def _int4_fp16_read_views(
     cache: torch.Tensor, head_size: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return [pages, heads, slots, payload/scale] aliases, preserving strides."""
-    data_bytes = head_size // 2
-    sides = cache.unbind(0)
-    payloads = tuple(side[..., :data_bytes].permute(0, 2, 1, 3) for side in sides)
-    scales = tuple(
-        side[..., data_bytes:].view(torch.uint16).permute(0, 2, 1, 3) for side in sides
-    )
-    return payloads[0], payloads[1], scales[0], scales[1]
+    return int4_fp16_read_views(cache, head_size)
 
 
 def _reinterpret_v_to_5d(
@@ -858,7 +848,7 @@ class RdnaAttentionBackend(AttentionBackend):
                 raise ValueError(
                     "int4_fp16_block requires equal K/V head sizes 128 or 256"
                 )
-            content = spec.num_kv_heads * (spec.head_size // 2 + spec.head_size // 16)
+            content = spec.num_kv_heads * int4_fp16_record_bytes(spec.head_size)
             if spec.state_content_bytes is not None:
                 if spec.num_head_slots != 2 or spec.state_content_bytes != content:
                     raise ValueError("incompatible int4_fp16_block cache specification")
