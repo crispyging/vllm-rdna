@@ -89,8 +89,12 @@ def main() -> None:
                 d["row_nbits"], d["row_block"], True,
             )  # fmt: skip
             row = f"{name:13s} R={r:6d} K={k:5d} M={m:3d}"
-            t_q = timeit(functools.partial(ops.rdna_hint_flex_linear_rdna2, *lin, 64))
-            row += f" | linear {t_q:7.1f} us ({qbytes / t_q / 1e3:5.1f} GB/s)"
+            t_q = timeit(functools.partial(ops.rdna_hint_flex_linear_rdna2, *lin, 48))
+            row += f" | f16 {t_q:7.1f} us ({qbytes / t_q / 1e3:5.1f} GB/s)"
+            t_8 = timeit(
+                functools.partial(ops.rdna_hint_flex_linear_rdna2, *lin, 48, 1)
+            )
+            row += f" | i8 {t_8:7.1f} us"
             if args.variants:
                 xt = torch.empty_like(x)
                 t_t = timeit(
