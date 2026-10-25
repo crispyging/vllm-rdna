@@ -1,9 +1,13 @@
 # Explore: INT4 + FP16 block scales for the RDNA2 KV cache
 
-**Status**: explore. This is a format contract plus a reference codec, not an
-implementation. No dtype is added, no backend changes, nothing changes by
-default. The kernels, the backend hook and the measurement on the V620 are all
-still to be written.
+**Status**: implemented and measured on gfx1030. The format below is now a
+serving dtype. `int4_fp16_block` is a real `CacheDType`; the RDNA2 attention
+backend reads and writes it natively, with the FP16 block scale and the
+zero-point riding inside the packed record. Every other backend refuses the
+dtype up front rather than reading it as the wrong format.
+The format contract, the reference codec and the measurement plan stay here
+because they are the reason the format is what it is. Nothing changes by
+default - the dtype is opt-in through `--kv-cache-dtype int4_fp16_block`.
 
 The question this document answers: *if the fork wants its own 4-bit KV cache
 on gfx1030, what should the format be, and what does it cost?* The short
@@ -478,25 +482,40 @@ accumulate, not the scalar-FMA fallback the shipped format lands on.
 | H4 | An FP16 block scale does not need a global scale | replay the H1 capture with the global on and off | SNR identical to within 0.01 dB | the global becomes mandatory and the format needs a per-tensor side buffer, which is a much larger change |
 | H5 | The zero-point really is free | compare the packed variant against the variant that spends 0.125 bits/value on its own zero-point, on captured activations | within 0.5 dB | store the zero-point separately and pay 0.125 bits/value for it |
 
-## Where it would plug in
-
-Nothing below exists yet. This is the surface a future implementation would
-have to touch.
+## Where it plugs in
 
 | Piece | File | What changes |
 | --- | --- | --- |
-| dtype literal | `vllm/config/cache.py:39` | add `"int4_fp16_block"` to `CacheDType` |
-| dtype to torch dtype | `vllm/utils/torch_utils.py:43` | add the `torch.uint8` entry |
-| quantised-predicate | `vllm/utils/torch_utils.py:78` | `is_quantized_kv_cache` already returns True for any `*per_token_head`; a new dtype needs its own branch |
-| mode enum | `vllm/v1/kv_cache_interface.py:39` | add a `KVQuantMode` value and map it in `get_kv_quant_mode` (`:84`) |
-| page size | `vllm/v1/kv_cache_interface.py:86` | the scale bytes are part of the page, so the spec has to account for `head_size/k` FP16 scales per head |
-| attention ops | `vllm/v1/attention/ops/` | a new module next to `int4_per_token_head.py`, owning nibble pack/unpack, the reshape (write) kernel and the split-dot (read) kernel |
-| backend opt-in | `vllm/v1/attention/backends/rdna_attn.py:601` | `supported_kv_cache_dtypes` |
+| dtype literal | `vllm/config/cache.py` | `"int4_fp16_block"` in `CacheDType` |
+| dtype to torch dtype | `vllm/utils/torch_utils.py` | the `torch.uint8` entry |
+| quantised-predicate | `vllm/utils/torch_utils.py` | `is_quantized_kv_cache` returns True for it |
+| mode enum | `vllm/v1/kv_cache_interface.py` | `KVQuantMode.INT4_FP16_BLOCK`, mapped in `get_kv_quant_mode` |
+| page size | `vllm/v1/kv_cache_interface.py` | the scale bytes are part of the page, so `RDNA_ATTN.customize_spec` accounts for `head_size/k` FP16 scales per head |
+| native read/write | `csrc/rocm/int4_fp16_kv_cache.cu`, `csrc/rocm/fa_rdna2.cu` | the packed writer, the packed reader and the dequantising FA-RDNA2 kernels |
+| op registration | `csrc/rocm/torch_bindings.cpp`, `vllm/v1/attention/ops/fa_rdna2_backend.py` | `reshape_and_cache_int4_fp16_rdna2` and `fa_rdna2_paged_int4_fp16_block` |
+| backend opt-in | `vllm/v1/attention/backends/rdna_attn.py` | `supported_kv_cache_dtypes`, the read views, the native dispatch and the configuration checks |
+| backend refusal | `vllm/v1/attention/backends/triton_attn.py` | the Triton backend refuses the dtype: no Triton kernel packs the record |
 
-The Triton backend already lists `int4_per_token_head`
-(`vllm/v1/attention/backends/triton_attn.py:320`), so H3 is the fork's own
-question: whether the RDNA2 backend is the target, or whether the Triton path
-is.
+The Triton backend already listed `int4_per_token_head`
+(`vllm/v1/attention/backends/triton_attn.py:320`), and it refuses
+`int4_fp16_block` in `supports_combination` (`:373-388`) and again in its
+constructor (`:565-566`): the dtype is absent from `supported_kv_cache_dtypes`
+(`:313-323`), because no Triton kernel packs the packed record. The RDNA2
+backend is the one that writes and reads it natively, in the FA kernel itself.
+
+### Coverage
+
+| Deployment | `int4_fp16_block` | Why |
+| --- | --- | --- |
+| `RDNA_ATTN` (gfx1030, Qwen3.x-style text models) | yes, native read and write | the FA-RDNA2 kernels dequantise in registers and keep the FP16 dot |
+| `TRITON_ATTN` | no | no Triton kernel packs the record, so the backend refuses the dtype up front (`vllm/v1/attention/backends/triton_attn.py`) |
+| `QWEN4_EXP_QSA_TRITON` (Qwen4Exp, Flash-Next) | no | the QSA owner reads the main KV cache as FP16/BF16 words and refuses any other cache dtype (`vllm/models/qwen4_exp/amd/qsa.py`) |
+| `--monokernel` (Qwen4Exp MonoKernel on gfx1030) | no | the mono QSA kernels read K and V as FP16 words; the switch refuses a quantized KV cache up front (`vllm/models/qwen4_exp/amd/mono_decode_rdna2.py`) |
+
+The MonoKernel and the Qwen4Exp QSA owner are a different model family from
+the one this PR was measured on (a Qwen3.8 AWQ dense model), and their
+attention path is not `RDNA_ATTN`. INT4 KV is therefore *refused* for them,
+loudly and early, rather than being read wrongly.
 
 ## The INT8 backport: what it actually costs
 
@@ -594,20 +613,34 @@ document:
 - `docs/explore/kv-int4-fp16-scales/README.md` - this document.
 - `docs/explore/kv-int4-fp16-scales/reference_codec.py` - the reference codec
   and comparison harness. Pure Python, no dependencies, self-checking.
-- `docs/explore/kv-int4-fp16-scales/TESTPLAN.md` - the measurement plan, with
-  the V620 cells left empty.
+- `docs/explore/kv-int4-fp16-scales/TESTPLAN.md` - the measurement plan.
+- `csrc/rocm/int4_fp16_kv_cache.cu` and `csrc/rocm/fa_rdna2.cu` - the packed
+  writer, the packed reader and the dequantising FA-RDNA2 kernels.
+- `vllm/v1/attention/backends/rdna_attn.py` - the backend opt-in, the read
+  views, the native dispatch and the configuration checks.
+- `vllm/v1/attention/ops/fa_rdna2_backend.py` - the registered ops.
+- `benchmarks/kernels/pr134/` - the serving qualification harness: the paired
+  same-boot FP16/INT4 qualification, the hardware-event classifier, the
+  registered-op and CUDA-graph parity checks, and the microbenchmarks.
+
+The serving evidence itself is **not** in this PR. The measured arms, the
+paired comparisons, the counterbalanced ABBA artifacts, the baseline
+reproducibility artifacts, the GPU placement proof and the handover live on
+the separate branch `evidence/pr134-serving`, under
+`bench_results/2026-10-24-pr134-int4fp16/`. Keeping them out of this diff
+means the diff is the implementation and the harness, not 8.8 MB of
+measurement output; the harness on this branch is what regenerates that
+tree (`benchmarks/kernels/pr134/refresh_evidence.sh`).
 
 ## What this PR does not contain
 
-- No dtype, no backend change, no kernel. Nothing in the serving path
-  changes.
-- No performance claim. `TESTPLAN.md` has empty cells; the only numbers in
-  this document come from `reference_codec.py` and are labelled as arithmetic
-  on synthetic data.
-- No element-format decision. INT4 and E2M1 are both in the table above and
-  the choice is open.
-- No claim about a one-byte scale. E8M0 and E4M3 are measured and rejected
-  at the 4.500 bits/value budget, not dismissed.
+- No change for any other platform. The dtype is opt-in; the RDNA2 backend
+  only takes it on gfx10x, and every other backend refuses it.
+- No INT4 KV support for the Qwen4Exp / Flash-Next attention path or for the
+  MonoKernel. Those read the main KV cache as FP16/BF16 words and refuse a
+  quantized cache explicitly (see *Coverage*).
+- No claim about the Qwen4Exp family: the measurement in `bench_results/` is on
+  a Qwen3.8 AWQ dense model.
 
 ## Reproducing the numbers
 

@@ -260,6 +260,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? cu_query_lens=None) -> ()");
   rocm_ops.impl("fa_rdna2_decode_paged", torch::kCUDA, &fa_rdna2_decode_paged);
 
+  rocm_ops.def(
+      "fa_rdna2_paged_int4_fp16_block(Tensor Q, Tensor key_cache, "
+      "Tensor value_cache, Tensor k_scale, Tensor v_scale, Tensor block_table, "
+      "Tensor cu_query_lens, Tensor seq_lens, int block_size, int kv_splits, "
+      "int sliding_window, float scale, bool decode, Tensor(a!) out) -> ()",
+      {at::Tag::needs_exact_strides});
+  rocm_ops.impl("fa_rdna2_paged_int4_fp16_block", torch::kCUDA,
+                &fa_rdna2_paged_int4_fp16_block);
+
   // GDN packed single-token decode for AMD RDNA2 (gfx1030). Dispatched
   // from Qwen3NextGatedDeltaNet._forward_core_decode_non_spec on gfx10x.
   rocm_ops.def(
@@ -553,6 +562,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("reshape_and_cache_int8_rdna2", torch::kCUDA,
                 &reshape_and_cache_int8_rdna2);
 
+  rocm_ops.def(
+      "reshape_and_cache_int4_fp16_rdna2(Tensor key, Tensor value, "
+      "Tensor(a!) cache, Tensor slot_mapping) -> ()",
+      {at::Tag::needs_exact_strides});
+  rocm_ops.impl("reshape_and_cache_int4_fp16_rdna2", torch::kCUDA,
+                &reshape_and_cache_int4_fp16_rdna2);
+
   // fp16 flash KV writer (5D packed K / 4D unpacked V). Stride-aware
   // for hybrid GDN pages. Replaces Triton reshape_and_cache_flash so
   // FA-RDNA2 KV updates can live inside a FULL CUDA graph.
@@ -631,6 +647,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor token_to_req, Tensor? out) -> Tensor");
   rocm_ops.impl("qsa_sparse_paged_attention_rdna2", torch::kCUDA,
                 &qsa_sparse_paged_attention_rdna2);
+
+  // Packed INT4 + FP16 block-scale main KV cache. The scale views alias the
+  // tail of the same physical records as the payload views.
+  rocm_ops.def(
+      "qsa_sparse_paged_attention_int4_rdna2(Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor k_scale, Tensor v_scale, "
+      "Tensor logical_indices, Tensor block_table, "
+      "Tensor token_to_req, Tensor? out) -> Tensor");
+  rocm_ops.impl("qsa_sparse_paged_attention_int4_rdna2", torch::kCUDA,
+                &qsa_sparse_paged_attention_int4_rdna2);
 
   // QSA metadata builder (HIP port of common/qsa_cache.py's
   // _build_qsa_metadata_kernel); runs on gfx10x instead of the Triton builder.

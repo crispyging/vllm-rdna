@@ -340,6 +340,16 @@ if TYPE_CHECKING:
     # dilated short-conv (default off, not yet end-to-end measured).
     VLLM_RDNA_HC_PREFILL_HIP: bool = True
     VLLM_RDNA_QSA_HIP: bool = True
+    # Which fused HIP QSA decode the non-monokernel Qwen4Exp path may use.
+    #   "auto"  - pick the kernel that matches the cache layout: the fp16
+    #             fused decode for an fp16 cache, the packed-int4 fused decode
+    #             for an int4_fp16_block cache, Triton otherwise.
+    #   "int4"  - require the packed-int4 fused decode; refuse if it is not
+    #             available rather than falling back (the Triton kernels
+    #             cannot read the packed record layout, and reading it as
+    #             the wrong format is silent corruption rather than a crash).
+    #   "off"   - never use the fused HIP QSA decode.
+    VLLM_RDNA_QSA_DECODE_MODE: str = "auto"
     VLLM_RDNA_PLE_CONV_HIP: bool = False
     # Umbrella for the whole RDNA2 HIP kernel set (worker/sampler, top-k/top-p
     # masking, QSA metadata, MTP conv1d + GDN spec-verify, unquantized MoE,
@@ -2203,6 +2213,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "1") == "1"
     ),
     "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "1") == "1",
+    "VLLM_RDNA_QSA_DECODE_MODE": lambda: os.getenv("VLLM_RDNA_QSA_DECODE_MODE", "auto"),
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
     "VLLM_RDNA_ALL_HIP": lambda: os.getenv("VLLM_RDNA_ALL_HIP", "1") == "1",
     # Log model inspection after loading.

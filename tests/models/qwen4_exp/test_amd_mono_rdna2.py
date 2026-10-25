@@ -28,10 +28,15 @@ FLASH_NEXT = (
 
 
 def _config(
-    monokernel=True, arch="Qwen4ExpForConditionalGeneration", v2=True, pp=1, knobs=None
+    monokernel=True,
+    arch="Qwen4ExpForConditionalGeneration",
+    v2=True,
+    pp=1,
+    knobs=None,
+    cache_dtype=None,
 ):
     extra = {} if knobs is None else {"rocm_mono_decode": knobs}
-    return SimpleNamespace(
+    cfg = SimpleNamespace(
         kernel_config=SimpleNamespace(monokernel=monokernel),
         model_config=SimpleNamespace(architectures=[arch]),
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
@@ -39,6 +44,9 @@ def _config(
         additional_config=extra,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
+    if cache_dtype is not None:
+        cfg.cache_config = SimpleNamespace(cache_dtype=cache_dtype)
+    return cfg
 
 
 @pytest.fixture
@@ -289,6 +297,26 @@ def test_unsupported_gpu_does_not_set_nan_failstop(monkeypatch, deployment):
     with pytest.raises(ValueError, match="^--monokernel needs a gfx10x"):
         md.check_config(_config())
     assert "VLLM_RAISE_ON_LOGIT_NANS" not in os.environ
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "float16", "bfloat16"])
+def test_fp16_kv_cache_is_accepted(deployment, cache_dtype):
+    """The QSA kernels read the main KV cache as FP16/BF16 words."""
+    assert md.config_refusal(_config(cache_dtype=cache_dtype)) is None
+
+
+@pytest.mark.parametrize(
+    "cache_dtype", ["int4_fp16_block", "fp8", "fp8_e4m3", "int8_per_token_head"]
+)
+def test_quantized_kv_cache_is_refused(deployment, cache_dtype):
+    """A packed or quantized KV cache has a record layout the mono QSA kernels
+    do not read: refuse it at the switch instead of reading garbage."""
+    reason = md.config_refusal(_config(cache_dtype=cache_dtype))
+    assert reason is not None
+    assert "FP16 or BF16 KV cache" in reason
+    assert cache_dtype in reason
+    with pytest.raises(ValueError, match="^--monokernel .*KV cache.*\\.$"):
+        md.install(_config(cache_dtype=cache_dtype))
 
 
 def test_missing_ops_are_named(monkeypatch):
@@ -557,7 +585,11 @@ def test_dense_unquantized_mtp_wrong_shared_shard_falls_back(monkeypatch):
     mono = layout.MonoLayer(layer, is_mtp=True)
     assert not mono.setup()
     assert not mono.dense_mtp
-    assert "geometry" in mono.reason
+    # The shared expert was given the global width where the local TP4 width
+    # was expected, so the reason has to say the layout is unsupported and
+    # name the widths it saw.
+    assert "shared expert layout is unsupported" in mono.reason
+    assert "640" in mono.reason and "160" in mono.reason
 
 
 @pytest.mark.parametrize(

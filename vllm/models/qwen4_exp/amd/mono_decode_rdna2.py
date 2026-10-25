@@ -45,6 +45,11 @@ REQUIRED_OPS = (
     "mono_qsa_decode_rdna2_splits",
 )
 RDNA2_MOE_METHOD = "CompressedTensorsWNA16RDNA2MoEMethod"
+# The QSA owner reads the main KV cache as FP16/BF16 words. A packed or
+# otherwise quantized cache (int4_fp16_block, fp8, ...) has a different record
+# layout that these kernels do not read, so the switch refuses it here rather
+# than letting a later layer fail on it.
+FP16_KV_CACHE_DTYPES = ("auto", "float16", "bfloat16")
 _MAX_ROWS = 24  # K1 / K2 build width (mono/rdna2/layout.py MAX_ROWS)
 _GDN_MAX_ROWS = 64
 
@@ -103,6 +108,11 @@ def config_refusal(vllm_config) -> str | None:
         return "needs Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1)"
     if vllm_config.parallel_config.pipeline_parallel_size > 1:
         return "does not support pipeline parallelism (PP > 1)"
+    cache_dtype = getattr(
+        getattr(vllm_config, "cache_config", None), "cache_dtype", None
+    )
+    if cache_dtype is not None and cache_dtype not in FP16_KV_CACHE_DTYPES:
+        return f"needs an FP16 or BF16 KV cache, got {cache_dtype}"
     return None
 
 

@@ -812,6 +812,35 @@ def qsa_sparse_paged_attention_rdna2(
     )
 
 
+def qsa_sparse_paged_attention_int4_rdna2(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse GQA attention over a packed INT4 + FP16 block-scale KV cache.
+
+    ``k_cache``/``v_cache`` are the payload views and ``k_scale``/``v_scale``
+    the scale views onto the tail of the same records.
+    """
+    return torch.ops._rocm_C.qsa_sparse_paged_attention_int4_rdna2(
+        q,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out,
+    )
+
+
 def qsa_expand_indices_rdna2(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
@@ -3562,6 +3591,26 @@ def reshape_and_cache_flash(
         kv_cache_dtype,
         k_scale,
         v_scale,
+    )
+
+
+def reshape_and_cache_int4_fp16_rdna2(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Write K/V into a packed INT4 + FP16 block-scale KV cache.
+
+    ``cache`` is the ``[2, pages, slots, heads, record_bytes]`` view of the
+    packed cache; the writer quantizes each record to INT4 and stores the
+    FP16 per-32-channel block scales in the record tail.
+    """
+    torch.ops._rocm_C.reshape_and_cache_int4_fp16_rdna2(
+        key,
+        value,
+        cache,
+        slot_mapping,
     )
 
 

@@ -158,11 +158,11 @@ def f16_ceil_6(x: float) -> float:
         The grid value, never below ``x``.
 
     """
-    bits = f16_bits(x)
-    if bits & 0xF:
-        bits = (bits & ~0xF) + 0x10
-    if bits > 0x7BFF:
-        bits = 0x7BFF
+    if not math.isfinite(x) or x <= 0 or x > f16_from_bits(0x7BF0):
+        raise ValueError("scale must fit the positive finite packed FP16 grid")
+    bits = f16_bits(x) & ~0xF
+    if f16_from_bits(bits) < x:
+        bits += 0x10
     return f16_from_bits(bits)
 
 
@@ -413,7 +413,7 @@ class TensorResult:
     """
 
     reconstructed: list[list[float]]
-    scales: list[list[float]]
+    scales: list[list[float]] | list[list[int]]
     global_scale: float | None = None
     underflowed_blocks: int = 0
     clipped_blocks: int = 0
@@ -535,40 +535,60 @@ def quantize_int4_fp16_block_packed(
     codes per block instead of 8, which is worth more than the scale loses.
 
     Args:
-        rows: The rows to quantize.
+        rows: Finite values in the FP16 input range. Constant and one-sided
+            blocks include zero in their quantisation range.
         k: Block size along the head dimension.
 
     Returns:
         The round-trip result. ``scales`` holds the packed 16-bit words, so
-        the format on the wire is exactly one uint16 per block.
+        the format on the wire is exactly one uint16 per block. Reconstruction
+        rounds to FP16 with finite saturation at +/-65504.
 
     """
+    if k <= 0:
+        raise ValueError("block size must be positive")
     reconstructed: list[list[float]] = []
     scales: list[list[int]] = []
     clipped = 0
+    underflowed = 0
     for row in rows:
+        if any(not math.isfinite(v) or abs(v) > FP16_MAX for v in row):
+            raise ValueError("packed codec requires finite FP16-range inputs")
         out: list[float] = []
         row_scales: list[int] = []
         for _, block in _blocks(row, k):
-            lo = min(block)
-            hi = max(block)
+            lo = min(0.0, min(block))
+            hi = max(0.0, max(block))
             ideal = max((hi - lo) / 15.0, 1e-6)
             scale = f16_ceil_6(ideal)
             zp = max(0, min(15, _round_half_away(-lo / scale)))
+            # Opposite half-way endpoints can round away from each other,
+            # spanning 16 integer intervals despite an exact width of 15.
+            if (
+                _round_half_away(lo / scale) + zp < 0
+                or _round_half_away(hi / scale) + zp > 15
+            ):
+                scale = f16_from_bits(f16_bits(scale) + 0x10)
+                zp = max(0, min(15, _round_half_away(-lo / scale)))
             codes: list[int] = []
+            block_clipped = False
             for value in block:
                 code = _round_half_away(value / scale) + zp
                 if code < 0 or code > 15:
-                    clipped += 1
+                    block_clipped = True
                 codes.append(max(0, min(15, code)))
+            clipped += block_clipped
             packed = (f16_bits(scale) & ~0xF) | zp
             stored_scale = f16_from_bits(packed & ~0xF)
             stored_zp = packed & 0xF
+            underflowed += not f16_is_normal(stored_scale)
             row_scales.append(packed)
-            out.extend((code - stored_zp) * stored_scale for code in codes)
+            out.extend(f16_round((code - stored_zp) * stored_scale) for code in codes)
         reconstructed.append(out)
         scales.append(row_scales)
-    return TensorResult(reconstructed, scales, clipped_blocks=clipped)
+    return TensorResult(
+        reconstructed, scales, underflowed_blocks=underflowed, clipped_blocks=clipped
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1585,42 @@ def _self_check() -> None:
     # the requested value, so the block range still fits in 16 codes.
     for value in (1e-4, 0.1, 1.0, 3.3, 7.7, 100.0, 1000.0):
         assert f16_ceil_6(value) >= value
+
+    # Nearest-half rounding before grid rounding used to round values just
+    # above a grid point down, including tiny/subnormal scale requests.
+    for bits in range(0x10, 0x7BF0, 0x10):
+        value = f16_from_bits(bits)
+        above = math.nextafter(value, math.inf)
+        assert f16_ceil_6(value) == value
+        assert f16_bits(f16_ceil_6(above)) == bits + 0x10
+    assert f16_bits(f16_ceil_6(1e-12)) == 0x10
+    assert f16_bits(f16_ceil_6(f16_from_bits(0x7BF0))) == 0x7BF0
+    for invalid in (0.0, -1.0, FP16_MAX, math.inf, math.nan):
+        try:
+            f16_ceil_6(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid packed scale {invalid}")
+
+    # A range that excludes zero cannot represent a nonzero constant with an
+    # integer zero-point. Include zero, and keep FP16 dequant finite at the
+    # input range boundaries even when the snapped scale overshoots them.
+    for value in (0.0, 1e-7, -1e-7, 1.0, -1.0, FP16_MAX, -FP16_MAX):
+        result = quantize_int4_fp16_block_packed([[value] * 32])
+        assert result.clipped_blocks == 0
+        scale = f16_from_bits(result.scales[0][0] & ~0xF)
+        for reconstructed in result.reconstructed[0]:
+            assert math.isfinite(reconstructed)
+            assert f16_round(reconstructed) == reconstructed
+            assert abs(reconstructed - value) <= scale / 2 + abs(value) / 1024
+
+    mixed = quantize_int4_fp16_block_packed([[-FP16_MAX, FP16_MAX] * 16])
+    assert mixed.clipped_blocks == 0
+    assert all(math.isfinite(value) for value in mixed.reconstructed[0])
+    ties = quantize_int4_fp16_block_packed([[-19936.0, FP16_MAX] * 16])
+    assert ties.clipped_blocks == 0
+    assert f16_from_bits(ties.scales[0][0] & ~0xF) > 5696.0
 
     # The proposal's stored scale really is FP16-representable.
     rows = [[0.5 * i for i in range(64)]]

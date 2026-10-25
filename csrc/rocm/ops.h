@@ -254,6 +254,13 @@ void fa_rdna2_decode_paged(torch::Tensor Q, torch::Tensor key_cache,
                            double scale, torch::Tensor out,
                            c10::optional<torch::Tensor> cu_query_lens);
 
+void fa_rdna2_paged_int4_fp16_block(
+    torch::Tensor Q, torch::Tensor key_cache, torch::Tensor value_cache,
+    torch::Tensor k_scale, torch::Tensor v_scale, torch::Tensor block_table,
+    torch::Tensor cu_query_lens, torch::Tensor seq_lens, int64_t block_size,
+    int64_t kv_splits, int64_t sliding_window, double scale, bool decode,
+    torch::Tensor out);
+
 void fa_rdna2_prefill_paged_varlen(torch::Tensor Q, torch::Tensor key_cache,
                                    torch::Tensor value_cache,
                                    torch::Tensor block_table,
@@ -462,6 +469,10 @@ void reshape_and_cache_int8_rdna2(
     torch::Tensor kv_cache,     // [2, num_blocks, H_kv, D + 4, block_size] int8
     torch::Tensor slot_mapping  // [num_tokens] int32 (-1 = skip)
 );
+
+void reshape_and_cache_int4_fp16_rdna2(torch::Tensor key, torch::Tensor value,
+                                       torch::Tensor cache,
+                                       torch::Tensor slot_mapping);
 
 // fp16 flash KV-cache writer for FA-RDNA2. Stride-aware so hybrid GDN
 // pages (block_size=784, padded stride(0)) write correctly. Matches
@@ -895,6 +906,15 @@ void qsa_compress_groups_rdna2(
 
 torch::Tensor qsa_sparse_paged_attention_rdna2(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, c10::optional<at::Tensor> out);
+
+// Packed INT4 + FP16 block-scale main KV cache. k_cache/v_cache are the
+// payload views [pages, heads, slots, D/2]; k_scale/v_scale are the scale
+// views [pages, heads, slots, D/32] onto the tail of the same records.
+torch::Tensor qsa_sparse_paged_attention_int4_rdna2(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    const at::Tensor& k_scale, const at::Tensor& v_scale,
     const at::Tensor& logical_indices, const at::Tensor& block_table,
     const at::Tensor& token_to_req, c10::optional<at::Tensor> out);
 
