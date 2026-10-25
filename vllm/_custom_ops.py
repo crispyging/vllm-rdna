@@ -1415,6 +1415,16 @@ def rdna_hint_flex_moe_rdna2(
     )
 
 
+def rdna_hint_flex_gemm_rdna2(
+    x: torch.Tensor, w: dict[str, torch.Tensor], out: torch.Tensor
+) -> None:
+    """Fused decode-in-GEMM (prefill) on an already transformed activation."""
+    torch.ops._rocm_C.rdna_hint_flex_gemm_rdna2(
+        x, w["codes"], w["code_off"], w["blk_params"], w["param_off"],
+        w["row_consts"], w["row_nbits"], w["row_block"], out,
+    )  # fmt: skip
+
+
 def rdna_hint_flex_act_quant_rdna2(
     x: torch.Tensor,
     col_scale: torch.Tensor,
@@ -1512,6 +1522,10 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
     @register_fake("_rocm_C::rdna_hint_flex_moe_rdna2")
     def _rdna_hint_flex_moe_rdna2_fake(x: torch.Tensor, *args) -> torch.Tensor:
         return torch.empty_like(x)
+
+    @register_fake("_rocm_C::rdna_hint_flex_gemm_rdna2")
+    def _rdna_hint_flex_gemm_rdna2_fake(*args) -> None:
+        return
 
     @register_fake("_rocm_C::rdna_hint_flex_act_quant_rdna2")
     def _rdna_hint_flex_act_quant_rdna2_fake(

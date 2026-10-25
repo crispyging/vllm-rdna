@@ -524,3 +524,18 @@ def test_moe_vs_dense_reference(tokens):
     assert out.shape == (tokens, hidden)
     # fp16 activations between the stages (transform, gate/up, SiLU product).
     assert rel_err(out, ref) < 1e-2
+
+
+@gfx1030_only
+@pytest.mark.parametrize("m,r,k", [(64, 256, 512), (200, 300, 1024), (129, 128, 2048)])
+def test_fused_gemm_vs_reference(m, r, k):
+    from vllm import _custom_ops as ops
+
+    t = make_hi2(r, k, seed=60 + m)
+    d = _dev(t)
+    x = torch.randn(m, k, dtype=torch.float16)
+    xt = hu.act_transform(x, t).cuda()
+    out = torch.empty(m, r, dtype=torch.float16, device="cuda")
+    ops.rdna_hint_flex_gemm_rdna2(xt, d, out)
+    torch.accelerator.synchronize()
+    assert rel_err(out, ref_linear(x, t)) < 2e-3

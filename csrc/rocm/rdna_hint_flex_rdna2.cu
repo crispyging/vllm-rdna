@@ -63,6 +63,13 @@ constexpr int kWave = 32;         // RDNA2 wave32
 constexpr int kRowsPerBlock = 8;  // 8 waves x 32 lanes = 256 threads
 constexpr int kThreads = kRowsPerBlock * kWave;
 
+// Row header of one weight row, as cached in LDS by the prefill GEMM.
+struct RowHdrS {
+  float lo_min, lo_scale, step_scale;
+  int32_t code_off, param_off;
+  int nb, lb;
+};
+
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
 __device__ __forceinline__ void decode_params(uint32_t lo_u8, uint32_t step_u8,
@@ -712,7 +719,203 @@ __global__ void __launch_bounds__(kThreads)
     out[static_cast<int64_t>(row) * ldo + r] = __float2half_rn(acc);
 }
 
+// ---------------------------------------------------------------------------
+// Prefill GEMM with the decode fused in (F16 mode): C[M, R] = X'[M, K] W^T.
+// A 256-thread workgroup computes a GM x GN tile (16 x 16 threads, each a
+// GM/16 x GN/16 micro-tile accumulated with v_dot2_f32_f16 from 16-byte LDS
+// reads). The weight row headers are cached in LDS once per workgroup.
+// K steps of 64 columns: the next step's activation and weight words (and
+// block parameters) are loaded into registers while the current step is
+// computed from LDS; the decode happens when the prefetched words are
+// written to LDS.
+// ---------------------------------------------------------------------------
+constexpr int kGemmPad = 8;  // halves of padding per LDS row
+constexpr int kGemm2BK = 64;
+
+template <int GM, int GN>
+__global__ void __launch_bounds__(kThreads)
+    gemm2_kernel(const half* __restrict__ x, const int M, const int K,
+                 const int32_t* __restrict__ codes,
+                 const int32_t* __restrict__ code_off,
+                 const uint8_t* __restrict__ blk_params,
+                 const int32_t* __restrict__ param_off,
+                 const half* __restrict__ row_consts,
+                 const uint8_t* __restrict__ row_nbits,
+                 const uint8_t* __restrict__ row_block, half* __restrict__ out,
+                 const int64_t ldo, const int R) {
+  constexpr int TM = GM / 16;
+  constexpr int TN = GN / 16;
+  constexpr int BK = kGemm2BK;
+  constexpr int LD = BK + kGemmPad;
+  constexpr int XV = GM * (BK / 8) / kThreads;       // uint4 of X per thread
+  constexpr int WG = GN * (BK / kGroup) / kThreads;  // groups per thread
+  static_assert(XV >= 1 && WG >= 1, "tile too small for 256 threads");
+  __shared__ __align__(16) half xs[GM * LD];
+  __shared__ __align__(16) half ws[GN * LD];
+  __shared__ RowHdrS hdr[GN];
+  const int tid = threadIdx.x;
+  const int m_base = blockIdx.y * GM;
+  const int r_base = blockIdx.x * GN;
+  for (int i = tid; i < GN; i += kThreads) {
+    const int r = r_base + i;
+    RowHdrS h;
+    if (r < R) {
+      h.nb = row_nbits[r];
+      h.lb = log2_block(row_block[r]);
+      h.lo_min = __half2float(row_consts[3 * r + 0]);
+      h.lo_scale = __half2float(row_consts[3 * r + 1]);
+      h.step_scale = __half2float(row_consts[3 * r + 2]);
+      h.code_off = code_off[r];
+      h.param_off = param_off[r];
+    } else {
+      h.nb = 0;
+    }
+    hdr[i] = h;
+  }
+  __syncthreads();
+
+  uint4 xr[XV];
+  uint4 wr[WG];     // up to four words per group (INT8)
+  uint32_t pr[WG];  // lo_u8 | step_u8 << 8
+  auto load = [&](int k0) {
+  #pragma unroll
+    for (int v = 0; v < XV; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / (BK / 8), c = (i % (BK / 8)) * 8;
+      xr[v] = make_uint4(0, 0, 0, 0);
+      if (m_base + row < M)
+        xr[v] = *reinterpret_cast<const uint4*>(
+            x + static_cast<int64_t>(m_base + row) * K + k0 + c);
+    }
+  #pragma unroll
+    for (int v = 0; v < WG; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / (BK / kGroup), gl = i % (BK / kGroup);
+      const RowHdrS& h = hdr[row];
+      wr[v] = make_uint4(0, 0, 0, 0);
+      pr[v] = 0;
+      if (h.nb != 0) {
+        const int g = k0 / kGroup + gl;
+        const uint32_t* words =
+            reinterpret_cast<const uint32_t*>(codes) + h.code_off;
+        if (h.nb == 2)
+          wr[v].x = words[g];
+        else if (h.nb == 4) {
+          const uint2 t = *reinterpret_cast<const uint2*>(words + 2 * g);
+          wr[v].x = t.x;
+          wr[v].y = t.y;
+        } else
+          wr[v] = *reinterpret_cast<const uint4*>(words + 4 * g);
+        const int blk = (g * kGroup) >> h.lb;
+        const uint8_t* p =
+            blk_params + 2 * (static_cast<int64_t>(h.param_off) + blk);
+        pr[v] =
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+      }
+    }
+  };
+  auto store = [&]() {
+  #pragma unroll
+    for (int v = 0; v < XV; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / (BK / 8), c = (i % (BK / 8)) * 8;
+      *reinterpret_cast<uint4*>(xs + row * LD + c) = xr[v];
+    }
+  #pragma unroll
+    for (int v = 0; v < WG; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / (BK / kGroup), gl = i % (BK / kGroup);
+      const RowHdrS& h = hdr[row];
+      union {
+        half2 h2[8];
+        uint4 u[2];
+      } o;
+      if (h.nb == 0) {
+        o.u[0] = make_uint4(0, 0, 0, 0);
+        o.u[1] = o.u[0];
+      } else {
+        half lo, step;
+        decode_params(pr[v] & 0xFFu, pr[v] >> 8, h.lo_min, h.lo_scale,
+                      h.step_scale, lo, step);
+        const half2 lo2 = __half2half2(lo), st2 = __half2half2(step);
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(&wr[v]);
+        if (h.nb == 2)
+          decode16<2>(q, lo2, st2, o.h2);
+        else if (h.nb == 4)
+          decode16<4>(q, lo2, st2, o.h2);
+        else
+          decode16<8>(q, lo2, st2, o.h2);
+      }
+      uint4* dst = reinterpret_cast<uint4*>(ws + row * LD + gl * kGroup);
+      dst[0] = o.u[0];
+      dst[1] = o.u[1];
+    }
+  };
+
+  const int tx = tid % 16, ty = tid / 16;
+  float acc[TM][TN];
+  #pragma unroll
+  for (int i = 0; i < TM; ++i)
+  #pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+
+  load(0);
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    __syncthreads();
+    store();
+    __syncthreads();
+    if (k0 + BK < K) load(k0 + BK);
+  #pragma unroll 2
+    for (int kk = 0; kk < BK; kk += 8) {
+      half2 a[TM][4], b[TN][4];
+  #pragma unroll
+      for (int i = 0; i < TM; ++i) {
+        const uint4 v =
+            *reinterpret_cast<const uint4*>(xs + (ty + 16 * i) * LD + kk);
+        const half2* hv = reinterpret_cast<const half2*>(&v);
+  #pragma unroll
+        for (int t = 0; t < 4; ++t) a[i][t] = hv[t];
+      }
+  #pragma unroll
+      for (int j = 0; j < TN; ++j) {
+        const uint4 v =
+            *reinterpret_cast<const uint4*>(ws + (tx + 16 * j) * LD + kk);
+        const half2* hv = reinterpret_cast<const half2*>(&v);
+  #pragma unroll
+        for (int t = 0; t < 4; ++t) b[j][t] = hv[t];
+      }
+  #pragma unroll
+      for (int i = 0; i < TM; ++i)
+  #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          float c = acc[i][j];
+  #pragma unroll
+          for (int t = 0; t < 4; ++t)
+            c = __builtin_amdgcn_fdot2(a[i][t], b[j][t], c, false);
+          acc[i][j] = c;
+        }
+    }
+  }
+  #pragma unroll
+  for (int i = 0; i < TM; ++i) {
+    const int m = m_base + ty + 16 * i;
+    if (m >= M) continue;
+  #pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int r = r_base + tx + 16 * j;
+      if (r < R)
+        out[static_cast<int64_t>(m) * ldo + r] = __float2half_rn(acc[i][j]);
+    }
+  }
+}
+
 #else  // non-RDNA2 device pass: empty kernels for symbol parity.
+
+template <int GM, int GN>
+__global__ void gemm2_kernel(const half*, const int, const int, const int32_t*,
+                             const int32_t*, const uint8_t*, const int32_t*,
+                             const half*, const uint8_t*, const uint8_t*, half*,
+                             const int64_t, const int) {}
 
 __global__ void moe_act_transform_kernel(const half*, const int64_t, const int,
                                          const int32_t*, const half*,
@@ -1011,6 +1214,41 @@ void launch_moe_gemv(const torch::Tensor& x, int top_k,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <int GM, int GN>
+void launch_gemm_t(const torch::Tensor& x, const Hi2Weight& w,
+                   torch::Tensor& out, int64_t R, cudaStream_t stream) {
+  const int64_t M = x.size(0), K = x.size(1);
+  dim3 grid((R + GN - 1) / GN, (M + GM - 1) / GM);
+  hf::gemm2_kernel<GM, GN><<<grid, hf::kThreads, 0, stream>>>(
+      reinterpret_cast<const half*>(x.data_ptr()), static_cast<int>(M),
+      static_cast<int>(K), w.codes.data_ptr<int32_t>(),
+      w.code_off.data_ptr<int32_t>(), w.blk_params.data_ptr<uint8_t>(),
+      w.param_off.data_ptr<int32_t>(),
+      reinterpret_cast<const half*>(w.row_consts.data_ptr()),
+      w.row_nbits.data_ptr<uint8_t>(), w.row_block.data_ptr<uint8_t>(),
+      reinterpret_cast<half*>(out.data_ptr()), out.stride(0),
+      static_cast<int>(R));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Prefill path for M > decode_max_m: 0 = dequant + rocBLAS GEMM (default),
+// 1 = the fused decode-in-GEMM kernel. The RDNA_HINT_FLEX_PREFILL
+// environment variable selects it (A/B only; see the docs for the numbers).
+int prefill_variant() {
+  static const int v = [] {
+    const char* e = std::getenv("RDNA_HINT_FLEX_PREFILL");
+    return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
+
+void launch_gemm(const torch::Tensor& x, const Hi2Weight& w, torch::Tensor& out,
+                 int64_t R, cudaStream_t stream) {
+  TORCH_CHECK(x.is_contiguous(),
+              "rdna_hint_flex: gemm input must be contiguous");
+  launch_gemm_t<128, 128>(x, w, out, R, stream);
+}
+
 }  // namespace
 
 // x [M, K] fp16 -> out [M, K] fp16 = H16(x / s) on flagged groups.
@@ -1117,6 +1355,26 @@ torch::Tensor rdna_hint_flex_moe_rdna2(
   return out;
 }
 
+// Fused decode-in-GEMM on an already transformed activation -> out [M, R].
+void rdna_hint_flex_gemm_rdna2(torch::Tensor x, torch::Tensor codes,
+                               torch::Tensor code_off, torch::Tensor blk_params,
+                               torch::Tensor param_off,
+                               torch::Tensor row_consts,
+                               torch::Tensor row_nbits, torch::Tensor row_block,
+                               torch::Tensor out) {
+  const Hi2Weight w{codes,      code_off,  blk_params, param_off,
+                    row_consts, row_nbits, row_block};
+  const int64_t R = check_weight(w);
+  check_act(x, x.size(1));
+  TORCH_CHECK(
+      out.is_cuda() && out.scalar_type() == torch::kHalf && out.dim() == 2 &&
+          out.size(0) == x.size(0) && out.size(1) == R && out.stride(1) == 1,
+      "rdna_hint_flex: out must be fp16 [M, R] with unit column stride");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (x.size(0) > 0 && R > 0) launch_gemm(x.contiguous(), w, out, R, stream);
+}
+
 // I8 activation quantization (transform included when `transform`).
 void rdna_hint_flex_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
                                     torch::Tensor had, bool transform,
@@ -1198,6 +1456,8 @@ torch::Tensor rdna_hint_flex_linear_rdna2(
   }
   if (M <= decode_max_m) {
     launch_gemv(xt, w, out, R, stream);
+  } else if (prefill_variant() > 0) {
+    launch_gemm(xt, w, out, R, stream);
   } else {
     auto wd = torch::empty({R, K}, x.options());
     launch_dequant(w, wd, R, K, stream);
