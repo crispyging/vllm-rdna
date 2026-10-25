@@ -77,20 +77,14 @@ def _make_inputs(seq_lens, H, Hg, seed, with_initial_state):
     # comparison meaningless. Normalised k/w keep the recurrence bounded and
     # match the magnitudes the production kernel actually processes (cf. the
     # _l2norm helper in test_gdn_prefill_o_rdna2.py).
-    k = (
-        F.normalize(
-            torch.randn(1, T_total, Hg, K, device=device, generator=gen).float(),
-            dim=-1,
-        )
-        .to(torch.float16)
-    )
-    w = (
-        F.normalize(
-            torch.randn(1, T_total, H, K, device=device, generator=gen).float(),
-            dim=-1,
-        )
-        .to(torch.float16)
-    )
+    k = F.normalize(
+        torch.randn(1, T_total, Hg, K, device=device, generator=gen).float(),
+        dim=-1,
+    ).to(torch.float16)
+    w = F.normalize(
+        torch.randn(1, T_total, H, K, device=device, generator=gen).float(),
+        dim=-1,
+    ).to(torch.float16)
     u = torch.randn(1, T_total, H, V, device=device, dtype=torch.float16, generator=gen)
     # Chunk-local cumulative log-gate: monotonically decreasing within each
     # chunk, restarting at 0 for every chunk (chunk_local_cumsum's contract).
@@ -145,8 +139,18 @@ def _run_hip(k, w, u, g, cu_seqlens, initial_state, output_final_state):
 
     h = torch.empty(B, NT_total, H, V, K, device=device, dtype=torch.float16)
     v_new = torch.empty_like(u)
+    # The state slot follows the cache dtype: fp32 by default, fp16 for an
+    # --mamba-ssm-cache-dtype float16 cache. The kernel is templated on it and
+    # requires the initial and final slots to agree.
     final_state = (
-        torch.empty(N, H, V, K, device=device, dtype=torch.float32)
+        torch.empty(
+            N,
+            H,
+            V,
+            K,
+            device=device,
+            dtype=initial_state.dtype if initial_state is not None else torch.float32,
+        )
         if output_final_state
         else None
     )
@@ -207,6 +211,43 @@ def test_gdn_prefill_delta_h_rdna2_parity(
         torch.testing.assert_close(final_hip, final_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("H,Hg", [(12, 4), (4, 4)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [64],  # exactly 1 chunk
+        [192],  # 3 chunks (NT=3 serial loop)
+        [100],  # chunk-boundary tail (64 + 36, not 16-aligned)
+        [137],  # tail not multiple-of-16 nor of BT
+        [63],  # tail where T_seq < BT (NT=1, t_len=63)
+    ],
+)
+def test_gdn_prefill_delta_h_rdna2_fp16_state_parity(seq_lens, H, Hg):
+    """An fp16 SSM state must behave like the fp32 path fed the same values.
+
+    The recurrence runs in fp32 registers either way; the fp16 instantiation
+    only rounds the h0 load and the final-state store. So the per-chunk h and
+    the v_new must equal the fp32 run bit for bit, and the final state must
+    match it to within the fp16 rounding of the value it stores.
+    """
+    torch.manual_seed(0)
+    k, w, u, g, cu_seqlens, initial_state = _make_inputs(
+        seq_lens, H, Hg, seed=42, with_initial_state=True
+    )
+    state16 = initial_state.to(torch.float16)
+
+    # The fp32 instantiation fed the widened fp16 state: same recurrence.
+    h32, v_new32, final32 = _run_hip(k, w, u, g, cu_seqlens, state16.float(), True)
+    # The fp16 instantiation: same recurrence, fp16 state slot.
+    h16, v_new16, final16 = _run_hip(k, w, u, g, cu_seqlens, state16, True)
+
+    assert final16.dtype == torch.float16
+    torch.testing.assert_close(h16.float(), h32.float(), rtol=0, atol=0)
+    torch.testing.assert_close(v_new16.float(), v_new32.float(), rtol=0, atol=0)
+    # The final state is the fp32 value rounded to fp16 (0.5 ulp of fp16).
+    torch.testing.assert_close(final16.float(), final32.float(), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("H,Hg", [(12, 4)])
 @pytest.mark.parametrize(
     "seq_lens",
@@ -238,9 +279,7 @@ def test_gdn_prefill_delta_h_rdna2_varlen_multi_seq(seq_lens, H, Hg):
     # fp16 ulp IS 1.56e-2, and this varlen case measures exactly that. Bound the
     # comparison by the fp16 ulp of the largest |h| (2 ulps), same as final_state.
     _ulp = 2.0 ** (math.floor(math.log2(max(h_ref.abs().max().item(), 1.0))) - 10)
-    torch.testing.assert_close(
-        h_hip.float(), h_ref.float(), rtol=1e-3, atol=2.0 * _ulp
-    )
+    torch.testing.assert_close(h_hip.float(), h_ref.float(), rtol=1e-3, atol=2.0 * _ulp)
     # See the fp16-ulp note above: the fp32 slot's value still carries fp16
     # quantization from the reference's gated b_v.
     # fs is fp32, but its VALUE passed through the reference's fp16-quantised

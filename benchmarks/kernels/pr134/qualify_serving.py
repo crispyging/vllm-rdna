@@ -350,6 +350,15 @@ def main():
         "until its page covers the mamba page.",
     )
     parser.add_argument(
+        "--mamba-ssm-cache-dtype",
+        choices=("auto", "float32", "float16", "bfloat16"),
+        default="auto",
+        help="SSM state dtype for the mamba cache. 'auto' keeps the model's own "
+        "(float32) and leaves the server command untouched. 'float16' halves "
+        "the mamba state page, which is what the hybrid page alignment uses to "
+        "pick the attention block size.",
+    )
+    parser.add_argument(
         "--gpus", default=GPUS, help="Comma-separated HIP device indices for this arm."
     )
     parser.add_argument(
@@ -388,6 +397,11 @@ def main():
     features = "prefix-caching mamba-align language-model-only skip-mm-profiling"
     if args.recipe == "flashnext-mtp2":
         features += " expert-parallel"
+    # Only pass the SSM dtype when it is not the model's own: the control arm
+    # must run the same server command as the arm it is compared against.
+    extra_args = f"--kv-cache-dtype {args.cache_dtype} --seed 12345"
+    if args.mamba_ssm_cache_dtype != "auto":
+        extra_args += f" --mamba-ssm-cache-dtype {args.mamba_ssm_cache_dtype}"
     command = [
         "bash",
         TREE / "tools/rdna/serve_rdna.sh",
@@ -415,7 +429,7 @@ def main():
         f"VLLM_CACHE_ROOT={args.output}/cache/vllm",
         f"TRITON_CACHE_DIR={args.output}/cache/triton",
         f"TORCHINDUCTOR_CACHE_DIR={args.output}/cache/inductor",
-        f"EXTRA_ARGS=--kv-cache-dtype {args.cache_dtype} --seed 12345",
+        f"EXTRA_ARGS={extra_args}",
     ]
     if not args.run:
         print(
