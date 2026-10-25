@@ -11,6 +11,7 @@
 #           CENSUS_DIR; CENSUS_GLOB narrows it) -> $WORK/census_all.csv
 # tune    : tune every census shape (plus the M=1..8 decode extension) on GPU
 #           -> $WORK/scratch/tunableop_results0.csv
+# tune-part / gather : the same split over several GPUs (PART/PARTS), merged
 # measure : time each shape under heuristic / current rows / new rows
 # curate  : keep a new row only when >= 3 % faster than both (adopt margin)
 # merge   : add the adopted rows to all four rank files of the profile
@@ -39,6 +40,57 @@ case ${1:?phase} in
       --scratch "$WORK/scratch" --rank 0 --iterations 10 --max-ms 25 \
       > "$WORK/tune.json" 2> "$WORK/tune.err"
     echo "rows: $(grep -c '^GemmTunableOp_' "$WORK/scratch/tunableop_results0.csv")"
+    ;;
+  tune-part)
+    # Parallel tuning: shapes not yet in $WORK/scratch, every PARTS-th from
+    # PART, into $WORK/scratch-part$PART (gather merges them back).
+    part=${PART:?PART}
+    "$PY" - "$TREE" "$WORK" "$part" "${PARTS:?PARTS}" <<'PYEOF'
+import csv, sys
+from pathlib import Path
+tree, work, part, parts = sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+sys.path.insert(0, f"{tree}/tools/rdna2_028")
+from tune_prod_shapes import extend_with_small_m, load_shapes
+shapes = load_shapes(work / "census_all.csv")
+extend_with_small_m(shapes)
+done = set()
+f = work / "scratch" / "tunableop_results0.csv"
+if f.exists():
+    done = {r[1] for r in csv.reader(f.open()) if len(r) > 1 and r[0] != "Validator"}
+todo = sorted((k for k in shapes if k not in done),
+              key=lambda k: (shapes[k][1], shapes[k][2], shapes[k][3]))
+mine = todo[part::parts]
+with (work / f"census_part{part}.csv").open("w") as fh:
+    for k in mine:
+        fh.write(f"GemmTunableOp_Half_{shapes[k][0].upper()},{k}\n")
+print(f"part {part}: {len(mine)} of {len(todo)} remaining shapes")
+PYEOF
+    HIP_VISIBLE_DEVICES=${GPU:?GPU} "$PY" "$TREE/tools/rdna2_028/tune_prod_shapes.py" \
+      --shape-source "$WORK/census_part$part.csv" --no-small-m --mode tune \
+      --device 0 --scratch "$WORK/scratch-part$part" --rank 0 --iterations 10 \
+      --max-ms 25 > "$WORK/tune_part$part.json" 2> "$WORK/tune_part$part.err"
+    ;;
+  gather)
+    "$PY" - "$WORK" <<'PYEOF'
+import csv, sys
+from pathlib import Path
+work = Path(sys.argv[1])
+main = work / "scratch" / "tunableop_results0.csv"
+main.parent.mkdir(parents=True, exist_ok=True)
+rows = list(csv.reader(main.open())) if main.exists() else []
+have = {r[1] for r in rows if len(r) > 1 and r[0] != "Validator"}
+for f in sorted(work.glob("scratch-part*/tunableop_results0.csv")):
+    for r in csv.reader(f.open()):
+        if r and r[0] == "Validator":
+            if not any(x[:2] == r[:2] for x in rows):
+                rows.insert(0, r)
+        elif len(r) > 1 and r[1] not in have:
+            rows.append(r)
+            have.add(r[1])
+with main.open("w") as fh:
+    csv.writer(fh, lineterminator="\n").writerows(rows)
+print(f"scratch rows: {len(have)}")
+PYEOF
     ;;
   measure)
     mkdir -p "$WORK/measure"
