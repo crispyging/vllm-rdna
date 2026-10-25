@@ -1,0 +1,18 @@
+{
+  "qualification_mode": "diagnostic-only",
+  "raw_status": "FAIL",
+  "raw_cleanup": "PASS",
+  "reference_mode": "diagnostic-only",
+  "hardware_attribution": "contaminated-corrected-link-noise",
+  "kernel_events": {
+    "verdict": "corrected-only",
+    "corrected_event_groups": 1,
+    "corrected_error_count": 1,
+    "fatal_event_groups": 0,
+    "fatal_events": [],
+    "endpoints_with_nonfatal_err": 0,
+    "endpoints_with_bad_tlp": 1,
+    "aer_recovery_buffer_overflows": []
+  },
+  "note": "Raw status is the unmodified gate result. Corrected-link PCIe/AER noise is classified separately and never relaxes the raw gate."
+}

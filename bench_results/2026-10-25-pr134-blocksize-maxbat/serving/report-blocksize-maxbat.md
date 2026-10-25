@@ -12,7 +12,7 @@ Model `cyankiwi/Qwen3.8-27B-AWQ-INT4` (snapshot `63768c10df38c0395e12ef49edac1bd
 The INT4 KV cache lost ~12% of its 16k x c=8 throughput against the FP16 KV cache:
 
 | arm | attn block | out tok/s | TTFT |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | FP16 KV | 1024 | 42.18 | 50.7 s |
 | INT4 KV | 3072 | 36.88 | 107.5 s |
 
@@ -22,7 +22,7 @@ The full four-cell matrix exonerates the packed format. INT4 wins three of the f
 cells outright and loses only the long-prompt/high-concurrency one:
 
 | cell | FP16 ref | INT4 fp32 SSM | INT4 fp16 SSM |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1024x512 c1 | 81.81 | 84.51 | 84.46 |
 | 1024x512 c8 | 203.75 | 204.97 | 206.46 |
 | 16384x1024 c1 | 31.20 | 33.02 | 32.84 |
@@ -45,7 +45,7 @@ mamba state block size. A packed KV cache has a smaller attention page, so the b
 grows until its page covers the mamba state page:
 
 | KV dtype | SSM state | attention block | KV tokens |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | fp16 | fp32 | 1024 | 438,210 |
 | int4 | fp32 | 3072 | 1,420,392 |
 | int4 | fp16 | 2048 | 1,492,348 |
@@ -65,7 +65,7 @@ This is why the cliff is invisible at c=1 (nothing to share the budget with) and
 One variable per arm, same boot / tree / core build:
 
 | arm | KV | block | MAXBAT | out tok/s | TTFT |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | FP16 | fp16 | 1024 | 2048 | 42.18 | 50.7 s |
 | FP16 | fp16 | 1024 | 2048 (fp16 SSM) | 42.93 | 47.98 s |
 | FP16 | fp16 | 2048 | 2048 | 37.42 | 103.3 s |
@@ -85,7 +85,7 @@ production budget arithmetic of `scheduler.py:848-890`
 (`num_new_tokens = min(remaining, token_budget, max_num_batched_tokens - draft_slots)`):
 
 | attention block | MAXBAT | draft slots | num_new_tokens | chunk |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1024 | 2048 | 3 | 2045 | 1024 |
 | 2048 | 2048 | 3 | 2045 | **0** |
 | 2048 | 4096 | 3 | 4093 | 2048 |
@@ -120,10 +120,32 @@ The INT4 KV cache is now a pure win rather than a trade-off:
 - PPL 4.95 against the reference's 4.94, ratio 1.0020 (limit 1.05); greedy 3/3 PASS.
 - Mamba, prefix caching and `FULL_AND_PIECEWISE` graphs all intact.
 
+## The final cohort, on the tree that carries the fix
+
+Two arms re-run with the fix in place, so the budget was derived from the KV and SSM
+dtypes with no manual flag:
+
+| arm | KV / SSM | derived MAXBAT | state block | 16k x c8 | KV tokens |
+| --- | --- | --- | --- | --- | --- |
+| reference | fp16 / fp32 | 2048 | 1024 | 42.69 tok/s, 48.26 s | 438,210 |
+| candidate | int4 / fp16 | **4096** | 2048 | **41.77 tok/s, 46.23 s** | **1,492,348** |
+
+Both arms' server logs record the derived budget (`max_num_scheduled_tokens=4096`
+against a 2048-token state block for the candidate), both passed every functional gate
+(PPL 4.94 on both, ratio 1.0, greedy 3/3, cleanup PASS), and the candidate carried
+3.4x the KV cache of the reference.
+
 ## Hardware attribution caveat
 
-The FP16 reference arm of the final cohort has a raw FAIL: a corrected PCIe AER error
-at 19:50:50, 98 seconds after an unrelated 4-GPU workload started on the same PLX
-88096 fabric. The harness classifies it `corrected-only` with zero fatal events and
-never relaxes the raw gate, so the candidate was qualified through the documented
-`--diagnostic-reference` path. See `pcie-aer-attribution.json`.
+Both arms of the final cohort carry a raw FAIL: a corrected PCIe AER error on the CPU
+root port to the PLX 88096 switch (`0000:40:03.1`, downstream `41:00.0` = a PEX880xx
+Gen 4 switch), at the Data Link Layer, corrected by hardware. The first one landed at
+19:50:50, 98 seconds after an unrelated 4-GPU workload started on the same host; the
+second at 20:18:42. The harness classifies both `corrected-only` with zero fatal
+events and never relaxes the raw gate, so the pair was qualified through the documented
+`--diagnostic-reference` path and the reference's raw FAIL is preserved. Six earlier
+arms on the same boot, tree and core build recorded `verdict: clean`; the noise
+appeared only while the second 4-GPU workload was up. See `pcie-aer-attribution.json`.
+
+A cohort that needs a strict (non-diagnostic) reference should be run while that
+workload is idle.

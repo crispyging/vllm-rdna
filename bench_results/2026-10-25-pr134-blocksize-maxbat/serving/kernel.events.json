@@ -1,0 +1,56 @@
+{
+  "verdict": "corrected-only",
+  "event_groups": [
+    {
+      "index": 20,
+      "timestamp": 42180.944988,
+      "severity": "corrected",
+      "error_count": 1,
+      "error_types": [
+        "corrected"
+      ],
+      "endpoints": []
+    }
+  ],
+  "corrected_event_groups": 1,
+  "corrected_error_count": 1,
+  "fatal_event_groups": 0,
+  "fatal_events": [],
+  "endpoints": [
+    {
+      "kind": "pcieport",
+      "bdf": "0000:40:03.1",
+      "aer_status": "0x00000040",
+      "labels": [
+        "BadTLP"
+      ]
+    }
+  ],
+  "endpoints_with_nonfatal_err": 0,
+  "endpoints_with_bad_tlp": 1,
+  "aer_recovery_buffer_overflows": [],
+  "corrected_marker_count": 3,
+  "raw_gate_matched_lines": [
+    "[42180.944978] {20}[Hardware Error]: Hardware error from APEI Generic Hardware Error Source: 512",
+    "[42180.944986] {20}[Hardware Error]: It has been corrected by h/w and requires no further action",
+    "[42180.944988] {20}[Hardware Error]: event severity: corrected",
+    "[42180.944991] {20}[Hardware Error]:  Error 0, type: corrected",
+    "[42180.944994] {20}[Hardware Error]:   section_type: PCIe error",
+    "[42180.944996] {20}[Hardware Error]:   port_type: 4, root port",
+    "[42180.944999] {20}[Hardware Error]:   version: 0.2",
+    "[42180.945001] {20}[Hardware Error]:   command: 0x0407, status: 0x0010",
+    "[42180.945004] {20}[Hardware Error]:   device_id: 0000:40:03.1",
+    "[42180.945006] {20}[Hardware Error]:   slot: 4",
+    "[42180.945008] {20}[Hardware Error]:   secondary_bus: 0x41",
+    "[42180.945010] {20}[Hardware Error]:   vendor_id: 0x1022, device_id: 0x1483",
+    "[42180.945013] {20}[Hardware Error]:   class_code: 060400",
+    "[42180.945015] {20}[Hardware Error]:   bridge: secondary_status: 0x0000, control: 0x0012",
+    "[42180.945017] {20}[Hardware Error]:   aer_cor_status: 0x00000040, aer_cor_mask: 0x00000000",
+    "[42180.945019] {20}[Hardware Error]:   aer_uncor_status: 0x00000000, aer_uncor_mask: 0x04000000",
+    "[42180.945022] {20}[Hardware Error]:   aer_uncor_severity: 0x026f6030",
+    "[42180.945024] {20}[Hardware Error]:   TLP Header: 00000000 00000000 00000000 00000000",
+    "[42180.945071] pcieport 0000:40:03.1: aer_status: 0x00000040, aer_mask: 0x00000000",
+    "[42180.945078] pcieport 0000:40:03.1: aer_layer=Data Link Layer, aer_agent=Receiver ID"
+  ],
+  "interpretation": "All PCIe/AER activity was classified by the kernel as corrected ('It has been corrected by h/w'); no device fault, timeout or reset was reported."
+}
