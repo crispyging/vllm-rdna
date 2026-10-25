@@ -1273,3 +1273,25 @@ void spec_insert_resampled_rdna2(
     torch::Tensor resampled_local_argmax, torch::Tensor resampled_local_max,
     int64_t resample_num_blocks, torch::Tensor cu_num_logits,
     torch::Tensor expanded_idx_mapping, torch::Tensor temperature);
+
+// HadamardINT2-FP16 (HI2, spec v3.2) weight kernels for AMD RDNA2 (gfx1030),
+// F16 compute mode. Flat per-row ragged buffers (codes/code_off/blk_params/
+// param_off/row_consts/row_nbits/row_block); see hi2_rdna2.cu.
+void hi2_act_transform_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                             torch::Tensor had, torch::Tensor out);
+void hi2_gemv_rdna2(torch::Tensor x, torch::Tensor codes,
+                    torch::Tensor code_off, torch::Tensor blk_params,
+                    torch::Tensor param_off, torch::Tensor row_consts,
+                    torch::Tensor row_nbits, torch::Tensor row_block,
+                    torch::Tensor out);
+void hi2_dequant_rdna2(torch::Tensor codes, torch::Tensor code_off,
+                       torch::Tensor blk_params, torch::Tensor param_off,
+                       torch::Tensor row_consts, torch::Tensor row_nbits,
+                       torch::Tensor row_block, torch::Tensor out);
+torch::Tensor hi2_linear_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                               torch::Tensor had, torch::Tensor codes,
+                               torch::Tensor code_off, torch::Tensor blk_params,
+                               torch::Tensor param_off,
+                               torch::Tensor row_consts,
+                               torch::Tensor row_nbits, torch::Tensor row_block,
+                               bool transform, int64_t decode_max_m);

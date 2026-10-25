@@ -1057,6 +1057,31 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int bitmask_stride, int vocab_size, int mask_stride) -> ()");
   rocm_ops.impl("apply_grammar_bitmask_rdna2", torch::kCUDA,
                 &apply_grammar_bitmask_rdna2);
+
+  // HadamardINT2-FP16 (HI2, spec v3.2) weight kernels for gfx1030, F16 mode.
+  // hi2_linear_rdna2 picks GEMV (M <= decode_max_m) or dequant + GEMM at
+  // execution time. Fake kernels live in _custom_ops.py.
+  rocm_ops.def(
+      "hi2_act_transform_rdna2(Tensor x, Tensor col_scale, Tensor had, "
+      "Tensor! out) -> ()");
+  rocm_ops.impl("hi2_act_transform_rdna2", torch::kCUDA,
+                &hi2_act_transform_rdna2);
+  rocm_ops.def(
+      "hi2_gemv_rdna2(Tensor x, Tensor codes, Tensor code_off, "
+      "Tensor blk_params, Tensor param_off, Tensor row_consts, "
+      "Tensor row_nbits, Tensor row_block, Tensor! out) -> ()");
+  rocm_ops.impl("hi2_gemv_rdna2", torch::kCUDA, &hi2_gemv_rdna2);
+  rocm_ops.def(
+      "hi2_dequant_rdna2(Tensor codes, Tensor code_off, Tensor blk_params, "
+      "Tensor param_off, Tensor row_consts, Tensor row_nbits, "
+      "Tensor row_block, Tensor! out) -> ()");
+  rocm_ops.impl("hi2_dequant_rdna2", torch::kCUDA, &hi2_dequant_rdna2);
+  rocm_ops.def(
+      "hi2_linear_rdna2(Tensor x, Tensor col_scale, Tensor had, "
+      "Tensor codes, Tensor code_off, Tensor blk_params, Tensor param_off, "
+      "Tensor row_consts, Tensor row_nbits, Tensor row_block, "
+      "bool transform, int decode_max_m) -> Tensor");
+  rocm_ops.impl("hi2_linear_rdna2", torch::kCUDA, &hi2_linear_rdna2);
 #endif
 
   // EXL3 (QTIP-style bitshift trellis) kernels are RDNA-generic
