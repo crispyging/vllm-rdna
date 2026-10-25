@@ -938,6 +938,72 @@ def qsa_select_paged_tokens(
     return out
 
 
+def _qsa_sparse_paged_attention_int4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    int4_scales: tuple[torch.Tensor, torch.Tensor],
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Sparse GQA over a packed INT4 + FP16 block-scale KV cache.
+
+    The packed record layout has no Triton counterpart, so this path needs
+    the native INT4 HIP kernel and refuses loudly otherwise. Reading the
+    packed record as the wrong format would be silent corruption rather than
+    a crash, so there is no fallback.
+    """
+    if not qsa_rdna2.qsa_use_rdna2_int4():
+        raise NotImplementedError(
+            "Qwen4Exp QSA packed INT4 KV cache needs the native INT4 HIP "
+            "kernel; the Triton path cannot read the packed record layout"
+        )
+    k_scale, v_scale = int4_scales
+    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+        raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
+    if k_scale.shape != v_scale.shape:
+        raise ValueError("QSA sparse attention scale views must share a shape")
+    if q.shape[2] != k_cache.shape[3] * 2:
+        raise ValueError(
+            "QSA INT4 sparse attention expects D/2 payload bytes per record"
+        )
+    if q.dtype != torch.float16:
+        raise ValueError("QSA INT4 sparse attention requires an FP16 query")
+    if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:
+        raise ValueError("QSA indices must have one row per query")
+    if token_to_req.shape != (q.shape[0],) or block_table.ndim != 2:
+        raise ValueError("QSA sparse attention metadata has invalid shapes")
+    if not all(k_cache.shape[:3]) or not all(block_table.shape):
+        raise ValueError("QSA sparse attention cache and block table must be nonempty")
+    if logical_indices.shape[1] <= 0:
+        raise ValueError("QSA sparse attention requires a positive selection width")
+    if q.shape[1] % k_cache.shape[1]:
+        raise ValueError("QSA sparse attention requires valid grouped-query heads")
+    assert logical_indices.dtype == block_table.dtype == torch.int32
+    assert token_to_req.dtype == torch.int32
+    if out is None:
+        out = torch.empty_like(q)
+    if out.shape != q.shape:
+        raise ValueError("QSA sparse output must match its query")
+    assert out.dtype == q.dtype and out.device == q.device
+    assert out.stride(2) == 1
+    if not q.shape[0]:
+        return out
+    return qsa_rdna2.qsa_sparse_paged_attention_int4(
+        q,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out,
+    )
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -946,10 +1012,28 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    int4_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged K/V caches.
+
+    ``int4_scales`` selects the packed ``int4_fp16_block`` layout: the
+    payload views in ``k_cache``/``v_cache`` are uint8 and the matching
+    scale views are given here. Only the native INT4 kernel can read that
+    layout, so the request is refused rather than read as the wrong format.
+    """
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
+    if int4_scales is not None:
+        return _qsa_sparse_paged_attention_int4(
+            q,
+            k_cache,
+            v_cache,
+            int4_scales,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+        )
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
     if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:

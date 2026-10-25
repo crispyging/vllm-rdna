@@ -648,6 +648,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("qsa_sparse_paged_attention_rdna2", torch::kCUDA,
                 &qsa_sparse_paged_attention_rdna2);
 
+  // Packed INT4 + FP16 block-scale main KV cache. The scale views alias the
+  // tail of the same physical records as the payload views.
+  rocm_ops.def(
+      "qsa_sparse_paged_attention_int4_rdna2(Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor k_scale, Tensor v_scale, "
+      "Tensor logical_indices, Tensor block_table, "
+      "Tensor token_to_req, Tensor? out) -> Tensor");
+  rocm_ops.impl("qsa_sparse_paged_attention_int4_rdna2", torch::kCUDA,
+                &qsa_sparse_paged_attention_int4_rdna2);
+
   // QSA metadata builder (HIP port of common/qsa_cache.py's
   // _build_qsa_metadata_kernel); runs on gfx10x instead of the Triton builder.
   rocm_ops.def(

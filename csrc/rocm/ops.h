@@ -909,6 +909,15 @@ torch::Tensor qsa_sparse_paged_attention_rdna2(
     const at::Tensor& logical_indices, const at::Tensor& block_table,
     const at::Tensor& token_to_req, c10::optional<at::Tensor> out);
 
+// Packed INT4 + FP16 block-scale main KV cache. k_cache/v_cache are the
+// payload views [pages, heads, slots, D/2]; k_scale/v_scale are the scale
+// views [pages, heads, slots, D/32] onto the tail of the same records.
+torch::Tensor qsa_sparse_paged_attention_int4_rdna2(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    const at::Tensor& k_scale, const at::Tensor& v_scale,
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, c10::optional<at::Tensor> out);
+
 torch::Tensor qsa_expand_indices_rdna2(
     const at::Tensor& block_indices, const at::Tensor& query_positions,
     const at::Tensor& sequence_lengths, const at::Tensor& token_to_req,
