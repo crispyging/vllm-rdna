@@ -55,32 +55,57 @@ def run(args) -> None:
         tensor_parallel_size=args.tp,
         language_model_only=args.language_model_only,
     )
-    greedy = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
-    t0 = time.perf_counter()
-    outs = llm.generate(PROMPTS, greedy)
-    gen_s = time.perf_counter() - t0
     tf = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0)
-    pl = llm.generate([TEXT], tf)[0]
-    ids = pl.prompt_token_ids
-    lps = [
-        None if d is None else d[ids[i]].logprob
-        for i, d in enumerate(pl.prompt_logprobs)
-    ]
-    res = {
-        "model": args.model,
-        "eager": args.eager,
-        "greedy": [
-            {
-                "prompt": p,
-                "text": o.outputs[0].text,
-                "ids": list(o.outputs[0].token_ids),
-            }
-            for p, o in zip(PROMPTS, outs)
-        ],
-        "greedy_wall_s": gen_s,
-        "prompt_ids": list(ids),
-        "prompt_logprobs": lps,
-    }
+    if args.text:
+        # Held-out evaluation as in tools/hi2 (hi2 eval / vllm_ppl.py):
+        # samples x seq_len tokens after skip_tokens.
+        from transformers import AutoTokenizer
+
+        from vllm.inputs import TokensPrompt
+
+        tok = AutoTokenizer.from_pretrained(args.model)
+        with open(args.text) as f:
+            ids_all = tok(f.read(), add_special_tokens=False).input_ids
+        ids_all = ids_all[args.skip_tokens :]
+        seqs = [
+            ids_all[i * args.seq_len : (i + 1) * args.seq_len]
+            for i in range(args.samples)
+        ]
+        assert all(len(q) == args.seq_len for q in seqs), "text too short"
+        outs_tf = llm.generate([TokensPrompt(prompt_token_ids=q) for q in seqs], tf)
+        ids, lps = [], []
+        for q, o in zip(seqs, outs_tf):
+            ids += q
+            lps += [None] + [
+                d[q[i]].logprob for i, d in enumerate(o.prompt_logprobs) if i > 0
+            ]
+        res = {"model": args.model, "eager": args.eager, "greedy": []}
+    else:
+        greedy = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+        t0 = time.perf_counter()
+        outs = llm.generate(PROMPTS, greedy)
+        gen_s = time.perf_counter() - t0
+        pl = llm.generate([TEXT], tf)[0]
+        ids = pl.prompt_token_ids
+        lps = [
+            None if d is None else d[ids[i]].logprob
+            for i, d in enumerate(pl.prompt_logprobs)
+        ]
+        res = {
+            "model": args.model,
+            "eager": args.eager,
+            "greedy": [
+                {
+                    "prompt": p,
+                    "text": o.outputs[0].text,
+                    "ids": list(o.outputs[0].token_ids),
+                }
+                for p, o in zip(PROMPTS, outs)
+            ],  # fmt: skip
+            "greedy_wall_s": gen_s,
+        }
+    res["prompt_ids"] = list(ids)
+    res["prompt_logprobs"] = lps
     vals = [v for v in lps if v is not None]
     res["mean_nll"] = -sum(vals) / len(vals)
     res["ppl"] = math.exp(res["mean_nll"])
@@ -125,6 +150,10 @@ def main() -> None:
     p.add_argument("--gpu-mem", type=float, default=0.35)
     p.add_argument("--max-num-seqs", type=int, default=16)
     p.add_argument("--tp", type=int, default=1)
+    p.add_argument("--text", help="held-out text file (tools/hi2 protocol)")
+    p.add_argument("--skip-tokens", type=int, default=800000)
+    p.add_argument("--samples", type=int, default=8)
+    p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--compare", nargs=2)
     args = p.parse_args()
     if args.compare:
