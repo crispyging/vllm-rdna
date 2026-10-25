@@ -69,10 +69,12 @@ def triton_gate(monkeypatch):
 def test_qsa_op_registered(op):
     assert _op(op), f"{op} not registered (rebuild _rocm_C.abi3.so)"
 
+
 def test_qsa_env_gate_defaults_on():
     from vllm.envs import VLLM_RDNA_QSA_HIP
 
     assert VLLM_RDNA_QSA_HIP is True, "HIP QSA path is on by default (S6)"
+
 
 def test_qsa_dispatcher_env_gate(monkeypatch):
     monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
@@ -93,9 +95,18 @@ def test_mqa_paged_routes_to_hip_only_for_fp16(monkeypatch):
 
     seen: list[torch.dtype] = []
 
-    def spy(q, k_cache, page_table, token_to_req, query_positions,
-            sequence_lengths, compress_ratio, score_divisor, logits,
-            visible_blocks):
+    def spy(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        score_divisor,
+        logits,
+        visible_blocks,
+    ):
         seen.append(q.dtype)
         return True
 
@@ -256,9 +267,7 @@ def _compress_inputs(rows, head_dim, ratio, num_requests, num_blocks, load_rope)
     state_size = max(ratio * 2, 2)
     torch.manual_seed(rows + head_dim + ratio + num_requests + int(load_rope))
     raw_keys = torch.randn(rows, 1, head_dim, dtype=torch.float16, device=device)
-    raw_positions = torch.randint(
-        0, 64, (rows, 1, 3), dtype=torch.int64, device=device
-    )
+    raw_positions = torch.randint(0, 64, (rows, 1, 3), dtype=torch.int64, device=device)
     state_cache = torch.zeros(
         num_blocks, state_size, 1, head_dim, dtype=torch.float16, device=device
     )
@@ -267,27 +276,25 @@ def _compress_inputs(rows, head_dim, ratio, num_requests, num_blocks, load_rope)
         0, 512, (num_blocks, state_size, 1, 3), dtype=torch.int64, device=device
     )
     # Half the requests fall back to the raw rows (NULL_BLOCK_ID).
-    state_table = torch.full(
-        (num_requests, 1), -1, dtype=torch.int32, device=device
+    state_table = torch.full((num_requests, 1), -1, dtype=torch.int32, device=device)
+    state_table[::2, 0] = (
+        torch.arange((num_requests + 1) // 2, dtype=torch.int32, device=device)
+        % num_blocks
     )
-    state_table[::2, 0] = torch.arange(
-        (num_requests + 1) // 2, dtype=torch.int32, device=device
-    ) % num_blocks
 
     per_request = max(rows // num_requests, 1)
-    token_to_req = (torch.arange(rows, device=device) // per_request).clamp_max(
-        num_requests - 1
-    ).to(torch.int32)
+    token_to_req = (
+        (torch.arange(rows, device=device) // per_request)
+        .clamp_max(num_requests - 1)
+        .to(torch.int32)
+    )
     query_start_loc = torch.empty(num_requests + 1, dtype=torch.int32, device=device)
     query_start_loc[0] = 0
-    query_start_loc[1:] = torch.arange(
-        1, num_requests + 1, device=device
-    ) * per_request
+    query_start_loc[1:] = torch.arange(1, num_requests + 1, device=device) * per_request
     query_start_loc[-1] = rows
     # Positions advance within each request so chunk_start_position moves too.
     logical_positions = (
-        torch.arange(rows, device=device) - query_start_loc[token_to_req.long()]
-        + ratio
+        torch.arange(rows, device=device) - query_start_loc[token_to_req.long()] + ratio
     ).to(torch.int64)
     logical_positions[::9] = -1  # unmapped rows
     compressed_slots = torch.full((rows,), -1, dtype=torch.int64, device=device)
@@ -316,9 +323,7 @@ def test_compress_groups_parity(
     triton_gate, rows, head_dim, ratio, num_requests, load_rope
 ):
     num_blocks = max(num_requests, 2)
-    args = _compress_inputs(
-        rows, head_dim, ratio, num_requests, num_blocks, load_rope
-    )
+    args = _compress_inputs(rows, head_dim, ratio, num_requests, num_blocks, load_rope)
     (
         raw_keys,
         raw_positions,
@@ -386,12 +391,28 @@ def test_compress_groups_all_null_state_table(triton_gate):
     state_table = torch.full((num_requests, 1), -1, dtype=torch.int32, device=device)
 
     ref_pooled, ref_first = qsa_ops.qsa_compress_groups_with_ratio(
-        raw_keys, raw_positions, state_cache, state_table, token_to_req,
-        query_start_loc, logical_positions, compressed_slots, ratio, rope_cache,
+        raw_keys,
+        raw_positions,
+        state_cache,
+        state_table,
+        token_to_req,
+        query_start_loc,
+        logical_positions,
+        compressed_slots,
+        ratio,
+        rope_cache,
     )
     hip_pooled, hip_first = qsa_rdna2.qsa_compress_groups_with_ratio_compat(
-        raw_keys, raw_positions, state_cache, state_table, token_to_req,
-        query_start_loc, logical_positions, compressed_slots, ratio, rope_cache,
+        raw_keys,
+        raw_positions,
+        state_cache,
+        state_table,
+        token_to_req,
+        query_start_loc,
+        logical_positions,
+        compressed_slots,
+        ratio,
+        rope_cache,
     )
     torch.accelerator.synchronize()
     torch.testing.assert_close(hip_pooled, ref_pooled, atol=ATOL, rtol=RTOL)
@@ -413,9 +434,7 @@ def _mqa_inputs(
     )
     table = torch.randperm(num_pages, device=device)[: num_requests * table_width]
     table = table.to(torch.int32).reshape(num_requests, table_width)
-    token_to_req = (
-        torch.arange(rows, device=device) % num_requests
-    ).to(torch.int32)
+    token_to_req = (torch.arange(rows, device=device) % num_requests).to(torch.int32)
     token_to_req[::11] = -1  # padding rows
     query_positions = torch.arange(rows, dtype=torch.int64, device=device) + ratio
     query_positions[::13] = -1
@@ -439,8 +458,17 @@ def _mqa_inputs(
         (1, 4, 128, 8, 16, 4, 1, 8),
     ],
 )
-def test_mqa_paged_parity(triton_gate, rows, heads, head_dim, num_pages, page_size,
-                          table_width, num_requests, ratio):
+def test_mqa_paged_parity(
+    triton_gate,
+    rows,
+    heads,
+    head_dim,
+    num_pages,
+    page_size,
+    table_width,
+    num_requests,
+    ratio,
+):
     q, k_cache, table, token_to_req, positions, seq_lens = _mqa_inputs(
         rows, heads, head_dim, num_pages, page_size, table_width, num_requests, ratio
     )
@@ -491,16 +519,21 @@ def test_mqa_paged_smaller_num_columns_matches_capacity(triton_gate):
     )
     narrow = 8
     hip_logits, _ = qsa_rdna2.qsa_mqa_paged(
-        q, k_cache, table, token_to_req, positions, seq_lens, 4, narrow,
+        q,
+        k_cache,
+        table,
+        token_to_req,
+        positions,
+        seq_lens,
+        4,
+        narrow,
         128**0.5,
     )
     torch.accelerator.synchronize()
     ref = wide_logits[:, :narrow]
     finite = ~torch.isneginf(ref)
     assert torch.equal(torch.isneginf(ref), torch.isneginf(hip_logits))
-    torch.testing.assert_close(
-        hip_logits[finite], ref[finite], atol=ATOL, rtol=RTOL
-    )
+    torch.testing.assert_close(hip_logits[finite], ref[finite], atol=ATOL, rtol=RTOL)
 
 
 def test_mqa_paged_rejects_bf16():
@@ -589,8 +622,16 @@ def test_dispatched_compress_and_store_match_gate_off(monkeypatch):
 
     def run():
         pooled, first = qsa_ops.qsa_compress_groups_with_ratio(
-            raw_keys, raw_positions, state_cache, state_table, token_to_req,
-            query_start_loc, logical_positions, compressed_slots, ratio, rope_cache,
+            raw_keys,
+            raw_positions,
+            state_cache,
+            state_table,
+            token_to_req,
+            query_start_loc,
+            logical_positions,
+            compressed_slots,
+            ratio,
+            rope_cache,
         )
         cache = torch.zeros(2, 64, 1, head_dim, dtype=torch.float16, device=device)
         qsa_ops.qsa_store_cache_rows(cache, store_slots, store_rows)
@@ -628,12 +669,8 @@ def test_dispatched_indexer_selection_matches_gate_off(monkeypatch):
         .reshape(1, -1)
         .repeat(num_requests, 1)
     )
-    token_to_req = torch.tensor(
-        [0, 0, 0, 1, 1, 1], dtype=torch.int32, device=device
-    )
-    positions = torch.tensor(
-        [8, 9, 10, 40, 41, 42], dtype=torch.int64, device=device
-    )
+    token_to_req = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32, device=device)
+    positions = torch.tensor([8, 9, 10, 40, 41, 42], dtype=torch.int64, device=device)
     seq_lens = torch.tensor([100, 200], dtype=torch.int32, device=device)
 
     monkeypatch.setattr(qsa_rdna2, "qsa_use_rdna2", lambda dtype=None: False)
@@ -680,11 +717,26 @@ def test_qsa_hip_ops_are_cudagraph_safe(triton_gate):
             store_rows, store_slots, store_cache, store_cache.shape[1], head_dim
         )
         qsa_rdna2.qsa_compress_groups_with_ratio_compat(
-            raw_keys, raw_positions, state_cache, state_table, ctoken_to_req,
-            query_start_loc, logical_positions, compressed_slots, 4, rope_cache,
+            raw_keys,
+            raw_positions,
+            state_cache,
+            state_table,
+            ctoken_to_req,
+            query_start_loc,
+            logical_positions,
+            compressed_slots,
+            4,
+            rope_cache,
         )
         qsa_rdna2.qsa_mqa_paged(
-            q, k_cache, table, token_to_req, positions, seq_lens, 4, columns,
+            q,
+            k_cache,
+            table,
+            token_to_req,
+            positions,
+            seq_lens,
+            4,
+            columns,
             head_dim**0.5,
         )
 
@@ -723,9 +775,7 @@ def _expand_inputs(rows, block_topk, ratio, num_requests, seed=0, strided=False)
     if strided:
         # Force a non-unit row stride: the kernel takes both strides, so this
         # exercises the stride path rather than assuming contiguity.
-        wide = torch.full(
-            (rows, block_topk * 2), -7, device=device, dtype=torch.int32
-        )
+        wide = torch.full((rows, block_topk * 2), -7, device=device, dtype=torch.int32)
         wide[:, ::2] = blocks
         blocks = wide[:, ::2]
     token_to_req = torch.randint(
@@ -737,8 +787,12 @@ def _expand_inputs(rows, block_topk, ratio, num_requests, seed=0, strided=False)
     # expanded, some have an open tail, and some exceed the sequence length.
     query_positions = torch.arange(rows, device=device, dtype=torch.int64) * ratio + 1
     sequence_lengths = torch.randint(
-        ratio, ratio * (rows + 2) + 1, (num_requests,), device=device,
-        dtype=torch.int32, generator=gen,
+        ratio,
+        ratio * (rows + 2) + 1,
+        (num_requests,),
+        device=device,
+        dtype=torch.int32,
+        generator=gen,
     )
     return blocks, query_positions, sequence_lengths, token_to_req
 
@@ -838,7 +892,14 @@ def test_expand_indices_routes_to_hip_behind_the_gate(monkeypatch):
 
 
 def _sparse_inputs(
-    rows, heads, kv_heads, head_dim, topk, page_size, num_pages, num_requests,
+    rows,
+    heads,
+    kv_heads,
+    head_dim,
+    topk,
+    page_size,
+    num_pages,
+    num_requests,
     seed=0,
 ):
     """Paged K/V plus an index selection for the sparse attention.
@@ -856,17 +917,21 @@ def _sparse_inputs(
     v_cache = torch.randn(
         num_pages, page_size, kv_heads, head_dim, device=device, generator=gen
     ).half()
-    block_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).reshape(num_requests, table_width)
+    block_table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        num_requests, table_width
+    )
     token_to_req = torch.randint(
         0, num_requests, (rows,), dtype=torch.int32, device=device, generator=gen
     )
     if rows:
         token_to_req[0] = -1  # invalid request -> fully masked row
     logical = torch.randint(
-        0, table_width * page_size, (rows, topk), dtype=torch.int32,
-        device=device, generator=gen,
+        0,
+        table_width * page_size,
+        (rows, topk),
+        dtype=torch.int32,
+        device=device,
+        generator=gen,
     )
     if topk > 1:
         logical[:, -1] = -1
@@ -886,7 +951,14 @@ def test_sparse_paged_attention_parity(
     """HIP sparse attention must match the Triton splitk + merge pair."""
     page_size, num_pages, num_requests = 16, 64, 4
     q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
-        rows, heads, kv_heads, head_dim, topk, page_size, num_pages, num_requests,
+        rows,
+        heads,
+        kv_heads,
+        head_dim,
+        topk,
+        page_size,
+        num_pages,
+        num_requests,
         seed=rows * 7 + topk,
     )
     ref = qsa_ops.qsa_sparse_paged_attention(
