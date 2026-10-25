@@ -559,7 +559,18 @@ class RdnaAttentionImpl(AttentionImpl):
                 True,
                 dst,
             )
-        elif nd_tokens and nd_tokens * self.num_heads <= _SPLIT_DECODE_MAX_ROWS:
+        elif nd_tokens:
+            # Mixed batch: the decode rows take the split-K decode kernel and
+            # the prefill rows the streaming prefill kernel.
+            #
+            # There is deliberately no row-count gate here. The prefill
+            # kernel has no split-K over the KV range, so a decode row routed
+            # through it gets one CTA that walks the whole context: at a 16k
+            # context that is a handful of CTAs on a 36-CU GPU. The decode
+            # kernel splits the KV range 16 ways, so it stays occupied
+            # whatever the batch size. Gating the split on the row count
+            # therefore turned a high-concurrency batch into a streaming
+            # kernel with almost no parallelism.
             if metadata.decode_query_start_loc is None:
                 raise ValueError("int4_fp16_block decode query ranges are missing")
             run(
