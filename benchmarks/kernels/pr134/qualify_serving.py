@@ -342,6 +342,14 @@ def main():
         "attribution; the reference's raw FAIL is preserved.",
     )
     parser.add_argument(
+        "--block-size",
+        type=int,
+        default=1024,
+        help="Attention block size to request. The hybrid alignment may raise "
+        "it: a packed INT4 page is smaller, so the attention block grows "
+        "until its page covers the mamba page.",
+    )
+    parser.add_argument(
         "--gpus", default=GPUS, help="Comma-separated HIP device indices for this arm."
     )
     parser.add_argument(
@@ -398,7 +406,7 @@ def main():
         f"MAXLEN={args.max_model_len}",
         "MAXBAT=2048",
         f"KV={args.kv_bytes}",
-        "BLOCK_SIZE=1024",
+        f"BLOCK_SIZE={args.block_size}",
         f"GPU_MAX_HW_QUEUES={args.hw_queues}",
         "OMP_NUM_THREADS=4",
         "TUNABLEOP=1",
