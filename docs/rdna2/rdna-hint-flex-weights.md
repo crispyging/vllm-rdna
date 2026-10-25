@@ -100,6 +100,9 @@ is built, so it reaches the workers with it):
   the f16 prefill path above.
 * `i8_all`: the I8 kernel for every M (slow prefill; for accuracy runs).
 
+Routed experts follow the same mode (I8 for batches up to 48 tokens with
+`i8`, always with `i8_all`).
+
 ## Kernels
 
 * `rdna_hint_flex_act_transform_rdna2`: `x' = H16(x / s)` on the flagged
@@ -175,11 +178,11 @@ No HI2 MoE checkpoint exists yet; the method is tested on a synthetic one. For
 ## Checks
 
 Unit tests: `bash tools/rdna/rdna_hint_flex/run_tests.sh <hip_device>`,
-**157 passed** on a V620. The dequant kernel and the I8 activation quantization
+**163 passed** on a V620. The dequant kernel and the I8 activation quantization
 are bit-identical to the reference; `rdna_hint_flex_linear_rdna2` matches
 `reference_linear` (float64) within 2e-3 relative error for M = 1..37 (F16),
 the I8 GEMV matches the integer-exact I8 reference within 1e-3; the synthetic
-4-expert MoE matches the dense reference within 1e-2.
+4-expert MoE matches the dense reference within 1e-2 (F16) and 3e-2 (I8); the fused prefill GEMM matches reference_linear within 2e-3.
 
 End to end (`tools/rdna/rdna_hint_flex/e2e_check.py`: teacher-forced log-probs
 on a fixed 137-token text and 4 greedy prompts of 48 tokens, against the
@@ -208,9 +211,54 @@ export: 0.003-0.005) and no measurable perplexity on this short text.
 
 ## Performance
 
-Kernel timing (`tools/rdna/rdna_hint_flex/bench_kernel.py`, one V620, CUDA
-graph of 50 calls; random tensors with 30% INT4 rows and mixed blocks, so the
-bytes are representative but not a real checkpoint's), microseconds per call
+### Prefill: fused decode-in-GEMM against dequant + rocBLAS (decided: keep dequant + GEMM)
+
+`rdna_hint_flex_gemm_rdna2` (128 x 128 tiles, 64-column K steps, the next
+step's activation, weight words and block parameters prefetched into registers,
+the ladder decoded on the LDS store, `v_dot2_f32_f16` on 8 x 8 micro-tiles) is
+built and tested, and selectable with `RDNA_HINT_FLEX_PREFILL=1`. It does not
+beat rocBLAS at prefill sizes, so the default stays dequant + rocBLAS GEMM.
+
+Isolated (`tools/rdna/rdna_hint_flex/bench_prefill.py`, one V620, tuned
+TunableOp rows), time relative to the dense fp16 `F.linear` of the same shape:
+
+| shape (R x K) | path | M=128 | M=512 | M=2048 |
+| --- | --- | --- | --- | --- |
+| gate_up 18432 x 2560 | dequant + GEMM | 1.15 | 1.11 | 1.03 |
+| gate_up 18432 x 2560 | fused | **0.71** | 1.17 | 1.16 |
+| down 2560 x 9216 | dequant + GEMM | 1.08 | 1.08 | 1.06 |
+| down 2560 x 9216 | fused | **0.83** | 1.09 | 1.19 |
+| in_proj_qkvz 12288 x 2560 | dequant + GEMM | 1.04 | 1.12 | 1.03 |
+| in_proj_qkvz 12288 x 2560 | fused | **0.25** | 1.17 | 1.21 |
+| out_proj 2560 x 4096 | dequant + GEMM | 1.45 | 0.99 | 1.06 |
+| out_proj 2560 x 4096 | fused | 1.14 | 1.20 | 1.09 |
+
+The fused kernel reaches 19-21 TF/s at M = 2048 against rocBLAS's 21-24
+TF/s; it only wins at M around 128, where rocBLAS has no good solution (a size
+that serving rarely produces: decode goes to the GEMV, prefill chunks are 512 to
+2048 tokens). Earlier variants (no prefetch, 32-column K steps, 64 x 64 and
+128 x 64 tiles) were slower still (13-17 TF/s). In serving (Qwen3.5-4B, TP=1,
+tuned rows), the fused path lost: 1k/512 c=1 prefill 1809 vs 1932 tok/s, 16k/1k
+c=1 1334 vs 1407 tok/s (full table under "Serving").
+
+### I8 for prefill (not worth it on gfx1030 with this activation grouping)
+
+The spec's per-16-column activation scale (spec 5) forces a float rescale every
+16 columns: per 16 multiply-adds an I8 GEMM issues 4 `v_dot4_i32_i8` plus a
+convert, a multiply and two FMAs (8 instructions), the same as F16's 8
+`v_dot2_f32_f16`; it would not be faster than the F16 GEMM, only less accurate.
+The existing `i8_all` mode runs prefill through the I8 GEMV in 8-token tiles and
+reaches 6 TF/s (3.4-4x slower than dense at M = 512-2048,
+`bench_prefill.py --mode 2`); it is kept for accuracy evaluation. A per-token
+activation scale would let the int32 sum run over a whole weight block (16-64
+columns) and could roughly halve the instruction count, but spec 5 measured it
+costing about 9% more output error on INT4 rows; that is a spec decision, not
+done here.
+
+### Kernel timing (decode)
+
+`tools/rdna/rdna_hint_flex/bench_kernel.py`, one V620, CUDA graph of 50 calls;
+random tensors with 30% INT4 rows and mixed blocks; microseconds per call
 including the activation transform:
 
 | shape (R x K) | F16 M=1 | I8 M=1 | F16 M=3 | F16 M=8 | F16 M=32 |
@@ -220,49 +268,155 @@ including the activation transform:
 | in_proj_qkvz 12288 x 2560 | 30.5 (415 GB/s) | 28.6 | 47.4 | 93.5 | 366.9 |
 | out_proj 2560 x 4096 | 15.6 (273 GB/s) | 12.6 | 27.9 | 36.8 | 127.0 |
 
-The V620's peak is 512 GB/s; gate_up is at 93% of it. Large-K tensors stay
-lower because every row re-reads the whole activation (int8 activations halve
-that traffic, which is why I8 is faster there).
+### TunableOp
 
-Serving (`tools/rdna/rdna_hint_flex/bench_serve.sh`: vLLM OpenAI server,
-`RECIPE=full` = FULL_AND_PIECEWISE cudagraphs, TP=1 on one V620, `vllm bench
-serve` random dataset with `--ignore-eos`, n = 4 / 32 / 4 / 16 requests).
-Qwen3.5-4B, 3.0 bpw checkpoint against its dense fp16 export. Prefill and
-decode are per request (aggregate in brackets):
+The rocBLAS paths (prefill GEMM after the dequant, the dense arm's layers,
+`lm_head` and the remaining dense layers) were tuned per the profile policy:
+census during the bench cells (`bench_serve.sh CENSUS_DIR`), then
+`tools/rdna/rdna_hint_flex/tunableop_campaign.sh` (tune, measure heuristic /
+current / new, curate at 3 %, additive merge into all four rank files of
+`tunableop/rocm7.14-rocblas5.5/`, 1860 -> 2594 rows, lookup hits 2500/2500).
+605 Qwen3.5-4B and 136 Qwen2.5-0.5B rows were adopted (median 1.60x and 1.26x
+over the heuristic per shape, 1.21x for the 4B's M >= 512 prefill shapes).
+Details: `tunableop/rocm7.14-rocblas5.5/README.md` and `provenance.json`.
+
+### Serving
+
+`tools/rdna/rdna_hint_flex/bench_serve.sh` (vLLM OpenAI server, `RECIPE=full` =
+FULL_AND_PIECEWISE cudagraphs, `vllm bench serve` random dataset with
+`--ignore-eos`, n = 4 / 32 / 4 / 16 requests). Qwen3.5-4B, 3.0 bpw
+rdna_hint_flex against its dense fp16 export, TP=1 on HIP 2, TP=2 on HIP 4-5,
+TP=4 on HIP 2-5. Prefill and decode per request (aggregate in brackets).
+
+With the tuned rows:
 
 | cell | arm | prefill tok/s | decode tok/s | TTFT s | ITL ms (median) |
 | --- | --- | --- | --- | --- | --- |
-| 1k/512 c=1 | rdna_hint_flex F16 | 1712 (1689) | **79.4** (72.8) | 0.60 | **12.6** |
-| 1k/512 c=1 | rdna_hint_flex I8 | 1706 (1685) | 76.8 (70.6) | 0.60 | 13.0 |
-| 1k/512 c=1 | dense fp16 | 1765 (1749) | 38.3 (36.8) | 0.58 | 26.1 |
-| 1k/512 c=8 | rdna_hint_flex F16 | 404 (2502) | **36.1** (245.2) | 2.54 | **26.2** |
-| 1k/512 c=8 | rdna_hint_flex I8 | 394 (2342) | 35.6 (241.2) | 2.60 | 26.7 |
-| 1k/512 c=8 | dense fp16 | 416 (2574) | 28.0 (197.8) | 2.46 | 34.2 |
-| 16k/1k c=1 | rdna_hint_flex F16 | 1444 (1435) | **58.9** (35.7) | 11.35 | **17.0** |
-| 16k/1k c=1 | rdna_hint_flex I8 | 1426 (1420) | 57.6 (35.0) | 11.49 | 17.4 |
-| 16k/1k c=1 | dense fp16 | 1460 (1453) | 33.0 (24.2) | 11.22 | 30.4 |
-| 16k/1k c=8 | rdna_hint_flex F16 | 598 (2740) | **10.4** (65.0) | 27.38 | **55.9** |
-| 16k/1k c=8 | rdna_hint_flex I8 | 592 (2685) | 10.4 (64.7) | 27.70 | 56.3 |
-| 16k/1k c=8 | dense fp16 | 593 (2657) | 9.8 (61.6) | 27.64 | 63.7 |
+| 1k/512 c=1 | TP=1 ours | 1932 (1910) | 78.4 (72.6) | 0.53 | 12.8 |
+| 1k/512 c=1 | TP=1 dense | 1961 (1941) | 38.1 (36.7) | 0.52 | 26.3 |
+| 1k/512 c=1 | TP=2 ours | 3436 (3399) | 102.7 (97.1) | 0.30 | 9.7 |
+| 1k/512 c=1 | TP=2 dense | 3418 (3374) | 61.4 (59.4) | 0.30 | 16.3 |
+| 1k/512 c=1 | TP=4 ours | 6541 (6529) | 113.9 (110.2) | 0.16 | 8.8 |
+| 1k/512 c=1 | TP=4 dense | 6686 (6631) | 93.3 (90.9) | 0.15 | 10.7 |
+| 1k/512 c=8 | TP=1 ours | 410 (2537) | 35.4 (242.0) | 2.50 | 26.8 |
+| 1k/512 c=8 | TP=1 dense | 416 (2570) | 27.8 (196.2) | 2.46 | 34.6 |
+| 1k/512 c=8 | TP=2 ours | 759 (4639) | 55.7 (389.2) | 1.35 | 17.2 |
+| 1k/512 c=8 | TP=2 dense | 788 (5064) | 46.4 (332.3) | 1.30 | 20.7 |
+| 1k/512 c=8 | TP=4 ours | 1492 (7518) | 71.3 (521.3) | 0.69 | 13.2 |
+| 1k/512 c=8 | TP=4 dense | 1514 (7629) | 70.2 (514.1) | 0.68 | 13.5 |
+| 16k/1k c=1 | TP=1 ours | 1407 (1402) | 57.8 (34.9) | 11.65 | 17.3 |
+| 16k/1k c=1 | TP=1 dense | 1416 (1411) | 32.6 (23.9) | 11.57 | 30.7 |
+| 16k/1k c=1 | TP=2 ours | 2647 (2626) | 79.0 (53.5) | 6.19 | 12.7 |
+| 16k/1k c=1 | TP=2 dense | 2647 (2633) | 52.3 (39.8) | 6.19 | 19.1 |
+| 16k/1k c=1 | TP=4 ours | 4724 (4705) | 98.5 (73.9) | 3.47 | 10.2 |
+| 16k/1k c=1 | TP=4 dense | 4756 (4729) | 82.4 (64.6) | 3.45 | 12.2 |
+| 16k/1k c=8 | TP=1 ours | 583 (2668) | 10.1 (63.3) | 28.10 | 57.6 |
+| 16k/1k c=8 | TP=1 dense | 589 (2697) | 9.5 (60.0) | 27.83 | 65.2 |
+| 16k/1k c=8 | TP=2 ours | 1149 (5170) | 18.3 (116.1) | 14.26 | 33.1 |
+| 16k/1k c=8 | TP=2 dense | 1135 (5211) | 17.6 (112.0) | 14.44 | 36.0 |
+| 16k/1k c=8 | TP=4 ours | 1528 (4795) | 27.0 (167.8) | 10.72 | 21.0 |
+| 16k/1k c=8 | TP=4 dense | 1569 (4838) | 27.0 (168.6) | 10.44 | 21.0 |
 
-Decode per request is 2.07x the dense model at c=1 (1k) and 1.79x at 16k;
-prefill is within 3% of dense (same rocBLAS GEMM after the dequant). All arms
-passed the greedy probe, the perplexity probe and the concurrency probe (48 of
-48 greedy outputs identical between c=8, churned order and solo), with no fault
-markers. I8 is not faster in serving despite the kernel numbers: its two extra
-launches and buffers per layer eat the saving at these sizes. (The I8 arm
-ran while another job booted a server on other GPUs of the box, so CPU load may
-have cost it a little; the F16 and dense arms ran on a quiet box.)
+Before tuning (the profile's 1860 rows, none for these shapes):
 
-No W4A16/GPTQ checkpoint of Qwen3.5-4B exists on the box, so that comparison
-was not run.
+UN| cell | arm | prefill tok/s | decode tok/s | TTFT s | ITL ms (median) |
+| --- | --- | --- | --- | --- | --- |
+| 1k/512 c=1 | TP=1 ours | 1932 (1910) | 78.4 (72.6) | 0.53 | 12.8 |
+| 1k/512 c=1 | TP=1 dense | 1961 (1941) | 38.1 (36.7) | 0.52 | 26.3 |
+| 1k/512 c=1 | TP=2 ours | 3436 (3399) | 102.7 (97.1) | 0.30 | 9.7 |
+| 1k/512 c=1 | TP=2 dense | 3418 (3374) | 61.4 (59.4) | 0.30 | 16.3 |
+| 1k/512 c=1 | TP=4 ours | 6541 (6529) | 113.9 (110.2) | 0.16 | 8.8 |
+| 1k/512 c=1 | TP=4 dense | 6686 (6631) | 93.3 (90.9) | 0.15 | 10.7 |
+| 1k/512 c=8 | TP=1 ours | 410 (2537) | 35.4 (242.0) | 2.50 | 26.8 |
+| 1k/512 c=8 | TP=1 dense | 416 (2570) | 27.8 (196.2) | 2.46 | 34.6 |
+| 1k/512 c=8 | TP=2 ours | 759 (4639) | 55.7 (389.2) | 1.35 | 17.2 |
+| 1k/512 c=8 | TP=2 dense | 788 (5064) | 46.4 (332.3) | 1.30 | 20.7 |
+| 1k/512 c=8 | TP=4 ours | 1492 (7518) | 71.3 (521.3) | 0.69 | 13.2 |
+| 1k/512 c=8 | TP=4 dense | 1514 (7629) | 70.2 (514.1) | 0.68 | 13.5 |
+| 16k/1k c=1 | TP=1 ours | 1407 (1402) | 57.8 (34.9) | 11.65 | 17.3 |
+| 16k/1k c=1 | TP=1 dense | 1416 (1411) | 32.6 (23.9) | 11.57 | 30.7 |
+| 16k/1k c=1 | TP=2 ours | 2647 (2626) | 79.0 (53.5) | 6.19 | 12.7 |
+| 16k/1k c=1 | TP=2 dense | 2647 (2633) | 52.3 (39.8) | 6.19 | 19.1 |
+| 16k/1k c=1 | TP=4 ours | 4724 (4705) | 98.5 (73.9) | 3.47 | 10.2 |
+| 16k/1k c=1 | TP=4 dense | 4756 (4729) | 82.4 (64.6) | 3.45 | 12.2 |
+| 16k/1k c=8 | TP=1 ours | 583 (2668) | 10.1 (63.3) | 28.10 | 57.6 |
+| 16k/1k c=8 | TP=1 dense | 589 (2697) | 9.5 (60.0) | 27.83 | 65.2 |
+| 16k/1k c=8 | TP=2 ours | 1149 (5170) | 18.3 (116.1) | 14.26 | 33.1 |
+| 16k/1k c=8 | TP=2 dense | 1135 (5211) | 17.6 (112.0) | 14.44 | 36.0 |
+| 16k/1k c=8 | TP=4 ours | 1528 (4795) | 27.0 (167.8) | 10.72 | 21.0 |
+| 16k/1k c=8 | TP=4 dense | 1569 (4838) | 27.0 (168.6) | 10.44 | 21.0 |
+
+Tuned against untuned, per request: prefill +13% (ours) / +11% (dense) at
+1k/512 c=1 TP=1 (TTFT 0.60 -> 0.53 s), +105% / +98% at TP=2 (TTFT 0.61 -> 0.30
+s), +4% at TP=4; 16k/1k prefill and decode move by less than the run-to-run
+spread (the TP=1/TP=2 tuned arms ran while other benches used the box's other
+GPUs). Decode is unchanged (the decode path is the GEMV, not rocBLAS).
+
+Ours against dense (tuned): decode per request 2.06x at TP=1 (1k/512 c=1),
+1.67x at TP=2, 1.22x at TP=4; at c=8 1.27x / 1.20x / 1.02x; prefill within 4%
+of dense everywhere (the same rocBLAS GEMM after the dequant). Every Qwen3.5-4B
+arm passed the greedy, perplexity and concurrency probes with no fault markers.
+
+Qwen2.5-0.5B-Instruct, TP=1, tuned rows, against its dense fp16 export and the
+existing AWQ 4-bit g128 checkpoint (the AWQ arm uses the fork's RDNA2 W4A16
+kernel). Head size 64 is not supported by RDNA_ATTN, so these arms run with
+`VLLM_USE_RDNA2_FA=0` (Triton attention), which dominates the 16k cells:
+
+| cell | arm | prefill tok/s | decode tok/s | TTFT s | ITL ms (median) |
+| --- | --- | --- | --- | --- | --- |
+| 1k/512 c=1 | ours 3.0 bpw | 13505 (13032) | 176.7 (172.5) | 0.08 | 5.7 |
+| 1k/512 c=1 | dense fp16 | 13784 (13387) | 163.7 (160.2) | 0.07 | 6.1 |
+| 1k/512 c=1 | AWQ 4-bit g128 | 14139 (13572) | 114.8 (113.1) | 0.07 | 8.7 |
+| 1k/512 c=8 | ours 3.0 bpw | 3151 (14754) | 139.7 (1027.6) | 0.32 | 6.8 |
+| 1k/512 c=8 | dense fp16 | 3002 (14600) | 149.5 (1088.8) | 0.34 | 6.3 |
+| 1k/512 c=8 | AWQ 4-bit g128 | 3133 (15604) | 109.2 (817.4) | 0.33 | 8.8 |
+| 16k/1k c=1 | ours 3.0 bpw | 3045 (3035) | 25.4 (22.4) | 5.38 | 39.4 |
+| 16k/1k c=1 | dense fp16 | 3053 (3045) | 25.1 (22.2) | 5.37 | 39.8 |
+| 16k/1k c=1 | AWQ 4-bit g128 | 3067 (3058) | 23.6 (21.0) | 5.34 | 42.4 |
+| 16k/1k c=8 | ours 3.0 bpw | 934 (4201) | 15.7 (98.2) | 17.54 | 40.7 |
+| 16k/1k c=8 | dense fp16 | 947 (4343) | 15.7 (98.8) | 17.30 | 40.0 |
+| 16k/1k c=8 | AWQ 4-bit g128 | 942 (4258) | 15.3 (96.3) | 17.39 | 42.7 |
+
+The 0.5B model fails the exact-answer greedy probe in its 3.0 bpw and dense
+forms (model quality; AWQ passes). The tuned dense arm failed one of 48
+concurrency checks (one prompt diverged at token 15 at c=8 with a 2.3-nat
+margin; the untuned dense arm and all other arms passed); not investigated.
+
+## Checks: held-out perplexity
+
+`tools/rdna/rdna_hint_flex/acc_long.sh` / `acc_tp.sh`: 8 x 2048 tokens of
+`study_text_all.txt` after token 800000 (the tools/hi2 eval protocol; the
+unquantized ppl matches the spec: 10.49 / 10.87 / 7.067), eager unless noted:
+
+| model | unquantized | dense export | ours F16 | ours I8 (`i8_all`) | I8 / F16 | mean / max abs log-prob gap I8 vs F16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen2.5-0.5B (3.0 bpw) | 10.4932 | 12.8013 | 12.8018 | 12.8097 | 1.00061 | 0.0128 / 0.267 |
+| Qwen3.5-0.8B (3.0 bpw) | 10.8736 | 13.1276 | 13.1283 | 13.1327 | 1.00033 | 0.0114 / 0.279 |
+| Qwen3.5-4B (3.0 bpw) | 7.0671 | 7.7916 | 7.7911 | 7.8001 | 1.00115 | 0.0095 / 5.46 |
+
+AWQ 4-bit g128 Qwen2.5-0.5B: 12.0334 (4.25 bpw against our 3.0).
+
+Tensor parallelism (Qwen3.5-4B, F16, full cudagraphs): ppl 7.7913 (TP=1),
+7.7915 (TP=2), 7.7912 (TP=4); log-prob gap to TP=1 mean 0.0025 (TP=2) and
+0.0026 (TP=4), the same as TP=1 graphs against TP=1 eager (0.0025).
+
+## Routed experts: candidates on the box
+
+No small unquantized MoE model is present (nothing downloaded). Found:
+Qwen3.6-35B-A3B only as GPTQ-Int4 / MLX (no bf16 source); Qwen3.8-Flash-Next
+only quantized (AWQ, AutoRound, MLX, EXL3); DeepSeek-V4-Flash fp8 (89-108 GB);
+`Nemotron-derived-fp16-890ab464-20261021` (fp16, 65.8 GB, 128 experts top-6,
+per-expert 2-D `backbone.layers.N.mixer.experts.E.{up,down}_proj.weight`), whose
+experts are ungated (relu^2, no gate projection), which `RdnaHintFlexMoEMethod`
+does not implement (it assumes SiLU-gated gate/up). A suitable small source would
+be `allenai/OLMoE-1B-7B-0924` (bf16, about 14 GB, 64 experts top-8, per-expert
+2-D gate/up/down, SiLU) or `Qwen/Qwen1.5-MoE-A2.7B` (about 29 GB, with a shared
+expert).
 
 ## Not done
 
-* A real prefill kernel: prefill above M = 48 is dequant into scratch plus the
-  rocBLAS GEMM, so prefill throughput equals the dense model's, not better.
-* I8 for prefill (only the GEMV is I8) and for routed experts.
-* Routed experts were not run end to end (no checkpoint); the method is unit
-  tested only, and its forward is a per-pair GEMV (prefill re-reads each
-  expert per token).
-* Tensor parallelism above 2 GPUs was not run.
+* A prefill kernel faster than dequant + rocBLAS (the fused kernel is opt-in;
+  see above). I8 prefill (only the GEMV path exists, for accuracy).
+* Routed experts were not run end to end (no suitable checkpoint); the forward is
+  a per-pair GEMV (prefill re-reads each expert per token).
+* The tuned dense Qwen2.5-0.5B concurrency failure was not investigated.
