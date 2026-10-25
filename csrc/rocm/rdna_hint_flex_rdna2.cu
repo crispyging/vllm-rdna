@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -147,46 +148,78 @@ __global__ void act_transform_kernel(const half* __restrict__ x,
 // GEMV: one wave per output row. NB = code width of the row.
 // ---------------------------------------------------------------------------
 template <int MT, int NB>
+__device__ __forceinline__ void word_dot(
+    const uint32_t q, const int w, const half* __restrict__ x, const int K,
+    const int m0, const int M, const uint8_t* __restrict__ params, const int lb,
+    const float lo_min, const float lo_scale, const float step_scale,
+    float (&acc)[MT]) {
+  constexpr int CPW = 32 / NB;  // codes per word; a word never crosses a block
+  constexpr uint32_t MASK = (1u << NB) - 1u;
+  const int k0 = w * CPW;
+  const int blk = k0 >> lb;
+  half lo, step;
+  decode_params(params[2 * blk], params[2 * blk + 1], lo_min, lo_scale,
+                step_scale, lo, step);
+  const half2 lo2 = __half2half2(lo);
+  const half2 st2 = __half2half2(step);
+  half2 wv[CPW / 2];
+  #pragma unroll
+  for (int i = 0; i < CPW / 2; ++i) {
+    const uint32_t c0 = (q >> (NB * (2 * i))) & MASK;
+    const uint32_t c1 = (q >> (NB * (2 * i + 1))) & MASK;
+    wv[i] = __hfma2(codes_to_half2(c0, c1), st2, lo2);
+  }
+  #pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    if (m0 + m < M) {
+      const half2* xp = reinterpret_cast<const half2*>(
+          x + static_cast<int64_t>(m0 + m) * K + k0);
+      float a = acc[m];
+  #pragma unroll
+      for (int i = 0; i < CPW / 2; ++i)
+        a = __builtin_amdgcn_fdot2(wv[i], xp[i], a, /*clamp=*/false);
+      acc[m] = a;
+    }
+  }
+}
+
+// Words [w_lo, w_hi) of one row; lanes take consecutive words (coalesced),
+// two per step so two weight loads are in flight per lane.
+template <int MT, int NB>
+__device__ __forceinline__ void row_dot_range(
+    const half* __restrict__ x, const int K, const int m0, const int M,
+    const uint32_t* __restrict__ words, const uint8_t* __restrict__ params,
+    const int lb, const float lo_min, const float lo_scale,
+    const float step_scale, const int lane, const int w_lo, const int w_hi,
+    float (&acc)[MT]) {
+  int w = w_lo + lane;
+  for (; w + kWave < w_hi; w += 2 * kWave) {
+    const uint32_t qa = words[w];
+    const uint32_t qb = words[w + kWave];
+    word_dot<MT, NB>(qa, w, x, K, m0, M, params, lb, lo_min, lo_scale,
+                     step_scale, acc);
+    word_dot<MT, NB>(qb, w + kWave, x, K, m0, M, params, lb, lo_min, lo_scale,
+                     step_scale, acc);
+  }
+  if (w < w_hi)
+    word_dot<MT, NB>(words[w], w, x, K, m0, M, params, lb, lo_min, lo_scale,
+                     step_scale, acc);
+}
+
+template <int MT, int NB>
 __device__ __forceinline__ void row_dot(
     const half* __restrict__ x, const int K, const int m0, const int M,
     const uint32_t* __restrict__ words, const uint8_t* __restrict__ params,
     const int lb, const float lo_min, const float lo_scale,
     const float step_scale, const int lane, float (&acc)[MT]) {
-  constexpr int CPW = 32 / NB;  // codes per word; a word never crosses a block
-  constexpr uint32_t MASK = (1u << NB) - 1u;
-  const int nwords = K / CPW;
-  for (int w = lane; w < nwords; w += kWave) {
-    const uint32_t q = words[w];
-    const int k0 = w * CPW;
-    const int blk = k0 >> lb;
-    half lo, step;
-    decode_params(params[2 * blk], params[2 * blk + 1], lo_min, lo_scale,
-                  step_scale, lo, step);
-    const half2 lo2 = __half2half2(lo);
-    const half2 st2 = __half2half2(step);
-    half2 wv[CPW / 2];
-  #pragma unroll
-    for (int i = 0; i < CPW / 2; ++i) {
-      const uint32_t c0 = (q >> (NB * (2 * i))) & MASK;
-      const uint32_t c1 = (q >> (NB * (2 * i + 1))) & MASK;
-      wv[i] = __hfma2(codes_to_half2(c0, c1), st2, lo2);
-    }
-  #pragma unroll
-    for (int m = 0; m < MT; ++m) {
-      if (m0 + m < M) {
-        const half2* xp = reinterpret_cast<const half2*>(
-            x + static_cast<int64_t>(m0 + m) * K + k0);
-        float a = acc[m];
-  #pragma unroll
-        for (int i = 0; i < CPW / 2; ++i)
-          a = __builtin_amdgcn_fdot2(wv[i], xp[i], a, /*clamp=*/false);
-        acc[m] = a;
-      }
-    }
-  }
+  row_dot_range<MT, NB>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
+                        step_scale, lane, 0, K / (32 / NB), acc);
 }
 
-template <int MT>
+// SPLIT waves share one row, each taking a contiguous share of its words;
+// partial sums meet in LDS. Small-R tensors use it to keep enough waves in
+// flight; SPLIT = 1 is one wave per row.
+template <int MT, int SPLIT>
 __global__ void __launch_bounds__(kThreads)
     gemv_kernel(const half* __restrict__ x, const int M, const int K,
                 const int32_t* __restrict__ codes,
@@ -197,51 +230,112 @@ __global__ void __launch_bounds__(kThreads)
                 const uint8_t* __restrict__ row_nbits,
                 const uint8_t* __restrict__ row_block, half* __restrict__ out,
                 const int64_t ldo, const int R) {
+  constexpr int RPB = kRowsPerBlock / SPLIT;
   const int wave = threadIdx.x / kWave;
   const int lane = threadIdx.x % kWave;
-  const int r = blockIdx.x * kRowsPerBlock + wave;
-  if (r >= R) return;  // wave-uniform; no barriers below
+  const int r = blockIdx.x * RPB + wave / SPLIT;
+  const int part = wave % SPLIT;
   const int m0 = blockIdx.y * MT;
-  const int nb = row_nbits[r];
-  const int lb = log2_block(row_block[r]);
-  const float lo_min = __half2float(row_consts[3 * r + 0]);
-  const float lo_scale = __half2float(row_consts[3 * r + 1]);
-  const float step_scale = __half2float(row_consts[3 * r + 2]);
-  const uint32_t* words =
-      reinterpret_cast<const uint32_t*>(codes) + code_off[r];
-  const uint8_t* params = blk_params + 2 * static_cast<int64_t>(param_off[r]);
-
   float acc[MT];
   #pragma unroll
   for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
-  switch (nb) {
-    case 2:
-      row_dot<MT, 2>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
-                     step_scale, lane, acc);
-      break;
-    case 4:
-      row_dot<MT, 4>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
-                     step_scale, lane, acc);
-      break;
-    default:
-      row_dot<MT, 8>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
-                     step_scale, lane, acc);
-      break;
+  if (r < R) {
+    const int nb = row_nbits[r];
+    const int lb = log2_block(row_block[r]);
+    const float lo_min = __half2float(row_consts[3 * r + 0]);
+    const float lo_scale = __half2float(row_consts[3 * r + 1]);
+    const float step_scale = __half2float(row_consts[3 * r + 2]);
+    const uint32_t* words =
+        reinterpret_cast<const uint32_t*>(codes) + code_off[r];
+    const uint8_t* params = blk_params + 2 * static_cast<int64_t>(param_off[r]);
+    const int nw = K * nb / 32;
+    const int share = (nw + SPLIT * kWave - 1) / (SPLIT * kWave) * kWave;
+    const int w_lo = part * share;
+    const int w_hi = min(nw, w_lo + share);
+    switch (nb) {
+      case 2:
+        row_dot_range<MT, 2>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
+                             step_scale, lane, w_lo, w_hi, acc);
+        break;
+      case 4:
+        row_dot_range<MT, 4>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
+                             step_scale, lane, w_lo, w_hi, acc);
+        break;
+      default:
+        row_dot_range<MT, 8>(x, K, m0, M, words, params, lb, lo_min, lo_scale,
+                             step_scale, lane, w_lo, w_hi, acc);
+        break;
+    }
   }
   #pragma unroll
   for (int m = 0; m < MT; ++m) {
-    float v = acc[m];
   #pragma unroll
     for (int off = kWave / 2; off > 0; off >>= 1)
-      v += __shfl_xor(v, off, kWave);
-    if (lane == 0 && m0 + m < M)
-      out[static_cast<int64_t>(m0 + m) * ldo + r] = __float2half_rn(v);
+      acc[m] += __shfl_xor(acc[m], off, kWave);
+  }
+  if constexpr (SPLIT == 1) {
+    if (r < R && lane == 0) {
+  #pragma unroll
+      for (int m = 0; m < MT; ++m)
+        if (m0 + m < M)
+          out[static_cast<int64_t>(m0 + m) * ldo + r] = __float2half_rn(acc[m]);
+    }
+  } else {
+    __shared__ float red[kRowsPerBlock][MT];
+    if (lane == 0) {
+  #pragma unroll
+      for (int m = 0; m < MT; ++m) red[wave][m] = acc[m];
+    }
+    __syncthreads();
+    if (part == 0 && r < R && lane == 0) {
+  #pragma unroll
+      for (int m = 0; m < MT; ++m) {
+        float v = red[wave][m];
+  #pragma unroll
+        for (int p = 1; p < SPLIT; ++p) v += red[wave + p][m];
+        if (m0 + m < M)
+          out[static_cast<int64_t>(m0 + m) * ldo + r] = __float2half_rn(v);
+      }
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
 // Dequant: W_stored[r, :] in fp16. grid.x = rows, grid.y strides the words.
 // ---------------------------------------------------------------------------
+// The 16 codes of one 16-column group (one INT2 word, two INT4 words, four
+// INT8 words), decoded to fp16 pairs: w = fma(code, step, lo).
+template <int NB>
+__device__ __forceinline__ void decode16(const uint32_t* __restrict__ w,
+                                         const half2 lo2, const half2 st2,
+                                         half2 (&wv)[8]) {
+  constexpr uint32_t MASK = (1u << NB) - 1u;
+  constexpr int CPW = 32 / NB;
+  uint32_t q[NB / 2];
+  if constexpr (NB == 2) {
+    q[0] = w[0];
+  } else if constexpr (NB == 4) {
+    const uint2 v = *reinterpret_cast<const uint2*>(w);
+    q[0] = v.x;
+    q[1] = v.y;
+  } else {
+    const uint4 v = *reinterpret_cast<const uint4*>(w);
+    q[0] = v.x;
+    q[1] = v.y;
+    q[2] = v.z;
+    q[3] = v.w;
+  }
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int c = 2 * i;
+    const uint32_t ca = (q[c / CPW] >> (NB * (c % CPW))) & MASK;
+    const uint32_t cb = (q[(c + 1) / CPW] >> (NB * ((c + 1) % CPW))) & MASK;
+    wv[i] = __hfma2(codes_to_half2(ca, cb), st2, lo2);
+  }
+}
+
+// Dequant: W_stored[r, :] in fp16, one 16-column group per thread with two
+// 16-byte stores. grid.x = rows.
 __global__ void __launch_bounds__(kThreads) dequant_kernel(
     const int32_t* __restrict__ codes, const int32_t* __restrict__ code_off,
     const uint8_t* __restrict__ blk_params,
@@ -251,8 +345,6 @@ __global__ void __launch_bounds__(kThreads) dequant_kernel(
   const int r = blockIdx.x;
   const int nb = row_nbits[r];
   const int lb = log2_block(row_block[r]);
-  const int cpw = 32 / nb;
-  const uint32_t mask = (1u << nb) - 1u;
   const float lo_min = __half2float(row_consts[3 * r + 0]);
   const float lo_scale = __half2float(row_consts[3 * r + 1]);
   const float step_scale = __half2float(row_consts[3 * r + 2]);
@@ -260,19 +352,26 @@ __global__ void __launch_bounds__(kThreads) dequant_kernel(
       reinterpret_cast<const uint32_t*>(codes) + code_off[r];
   const uint8_t* params = blk_params + 2 * static_cast<int64_t>(param_off[r]);
   half* wr = w + static_cast<int64_t>(r) * K;
-  const int nwords = K / cpw;
-  for (int wi = blockIdx.y * blockDim.x + threadIdx.x; wi < nwords;
-       wi += gridDim.y * blockDim.x) {
-    const uint32_t q = words[wi];
-    const int k0 = wi * cpw;
-    const int blk = k0 >> lb;
+  const int groups = K / kGroup;
+  for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+    const int blk = (g * kGroup) >> lb;
     half lo, step;
     decode_params(params[2 * blk], params[2 * blk + 1], lo_min, lo_scale,
                   step_scale, lo, step);
-    for (int i = 0; i < cpw; ++i) {
-      const uint32_t c = (q >> (nb * i)) & mask;
-      wr[k0 + i] = __hfma(code_to_half(c), step, lo);
-    }
+    const half2 lo2 = __half2half2(lo), st2 = __half2half2(step);
+    union {
+      half2 h[8];
+      uint4 u[2];
+    } o;
+    if (nb == 2)
+      decode16<2>(words + g, lo2, st2, o.h);
+    else if (nb == 4)
+      decode16<4>(words + 2 * g, lo2, st2, o.h);
+    else
+      decode16<8>(words + 4 * g, lo2, st2, o.h);
+    uint4* dst = reinterpret_cast<uint4*>(wr + g * kGroup);
+    dst[0] = o.u[0];
+    dst[1] = o.u[1];
   }
 }
 
@@ -639,7 +738,7 @@ __global__ void gemv_i8_kernel(const int8_t*, const half*, const int32_t*,
 __global__ void act_transform_kernel(const half*, const int64_t, const half*,
                                      const uint8_t*, half*, const int,
                                      const int) {}
-template <int MT>
+template <int MT, int SPLIT>
 __global__ void gemv_kernel(const half*, const int, const int, const int32_t*,
                             const int32_t*, const uint8_t*, const int32_t*,
                             const half*, const uint8_t*, const uint8_t*, half*,
@@ -729,12 +828,13 @@ void launch_transform(const torch::Tensor& x, const torch::Tensor& col_scale,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int MT>
-void launch_gemv_mt(const torch::Tensor& x, const Hi2Weight& w,
+template <int MT, int SPLIT>
+void launch_gemv_ms(const torch::Tensor& x, const Hi2Weight& w,
                     torch::Tensor& out, int64_t R, cudaStream_t stream) {
   const int64_t M = x.size(0), K = x.size(1);
-  dim3 grid((R + hf::kRowsPerBlock - 1) / hf::kRowsPerBlock, (M + MT - 1) / MT);
-  hf::gemv_kernel<MT><<<grid, hf::kThreads, 0, stream>>>(
+  constexpr int RPB = hf::kRowsPerBlock / SPLIT;
+  dim3 grid((R + RPB - 1) / RPB, (M + MT - 1) / MT);
+  hf::gemv_kernel<MT, SPLIT><<<grid, hf::kThreads, 0, stream>>>(
       reinterpret_cast<const half*>(x.data_ptr()), static_cast<int>(M),
       static_cast<int>(K), w.codes.data_ptr<int32_t>(),
       w.code_off.data_ptr<int32_t>(), w.blk_params.data_ptr<uint8_t>(),
@@ -744,6 +844,37 @@ void launch_gemv_mt(const torch::Tensor& x, const Hi2Weight& w,
       reinterpret_cast<half*>(out.data_ptr()), out.stride(0),
       static_cast<int>(R));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Waves per row: enough row-waves to fill the GPU, then split K. The
+// RDNA_HINT_FLEX_GEMV_SPLIT environment variable (1, 2, 4, 8) overrides it
+// for tuning.
+int gemv_split(int64_t R) {
+  static const int forced = [] {
+    const char* e = std::getenv("RDNA_HINT_FLEX_GEMV_SPLIT");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (forced > 0) return forced;
+  return R >= 8192 ? 1 : (R >= 4096 ? 2 : 4);
+}
+
+template <int MT>
+void launch_gemv_mt(const torch::Tensor& x, const Hi2Weight& w,
+                    torch::Tensor& out, int64_t R, cudaStream_t stream) {
+  switch (gemv_split(R)) {
+    case 1:
+      launch_gemv_ms<MT, 1>(x, w, out, R, stream);
+      break;
+    case 2:
+      launch_gemv_ms<MT, 2>(x, w, out, R, stream);
+      break;
+    case 4:
+      launch_gemv_ms<MT, 4>(x, w, out, R, stream);
+      break;
+    default:
+      launch_gemv_ms<MT, 8>(x, w, out, R, stream);
+      break;
+  }
 }
 
 void launch_gemv(const torch::Tensor& x, const Hi2Weight& w, torch::Tensor& out,
@@ -765,11 +896,7 @@ void launch_gemv(const torch::Tensor& x, const Hi2Weight& w, torch::Tensor& out,
 void launch_dequant(const Hi2Weight& w, torch::Tensor& out, int64_t R,
                     int64_t K, cudaStream_t stream) {
   if (R == 0) return;
-  // Enough y-blocks that each thread decodes a handful of words.
-  const int64_t max_words = K / 4;  // INT8 rows have the most words
-  const int64_t ny =
-      std::max<int64_t>(1, (max_words + hf::kThreads - 1) / hf::kThreads);
-  dim3 grid(static_cast<unsigned>(R), static_cast<unsigned>(ny));
+  dim3 grid(static_cast<unsigned>(R));
   hf::dequant_kernel<<<grid, hf::kThreads, 0, stream>>>(
       w.codes.data_ptr<int32_t>(), w.code_off.data_ptr<int32_t>(),
       w.blk_params.data_ptr<uint8_t>(), w.param_off.data_ptr<int32_t>(),

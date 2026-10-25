@@ -52,6 +52,7 @@ def run(args) -> None:
         enforce_eager=args.eager,
         seed=0,
         max_num_seqs=args.max_num_seqs,
+        tensor_parallel_size=args.tp,
         language_model_only=args.language_model_only,
     )
     greedy = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
@@ -123,6 +124,7 @@ def main() -> None:
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--gpu-mem", type=float, default=0.35)
     p.add_argument("--max-num-seqs", type=int, default=16)
+    p.add_argument("--tp", type=int, default=1)
     p.add_argument("--compare", nargs=2)
     args = p.parse_args()
     if args.compare:

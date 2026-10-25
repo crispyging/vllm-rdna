@@ -60,7 +60,9 @@ SPEC_VERSIONS = ("3.2",)
 # sets it; the VLLM_RDNA_HINT_FLEX_COMPUTE_MODE environment variable overrides it.
 COMPUTE_MODES = {"f16": 0, "i8": 1, "i8_all": 2}
 # M at or below this runs the GEMV kernel; above it, dequant + rocBLAS GEMM.
-DECODE_MAX_M = 8
+# The GEMV re-reads the compact weights once per 8 tokens and stays faster
+# than dequant + GEMM up to about M = 48-64 on Qwen3.5-4B shapes (V620).
+DECODE_MAX_M = 48
 _FIELD_PREFIX = "hi2_"
 
 
