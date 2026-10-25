@@ -1397,6 +1397,8 @@ def rdna_hint_flex_moe_rdna2(
     w2_transform: bool,
     num_experts: int,
     intermediate: int,
+    mode: int = 0,
+    decode_max_m: int = 48,
 ) -> torch.Tensor:
     """Routed experts on stacked rdna_hint_flex tensors (see the op comment in
     csrc/rocm/rdna_hint_flex_rdna2.cu)."""
@@ -1412,6 +1414,8 @@ def rdna_hint_flex_moe_rdna2(
         w2_transform,
         num_experts,
         intermediate,
+        mode,
+        decode_max_m,
     )
 
 

@@ -219,7 +219,9 @@ class RdnaHintFlexConfig(QuantizationConfig):
                 RdnaHintFlexMoEMethod,
             )
 
-            return RdnaHintFlexMoEMethod(layer.moe_config)
+            return RdnaHintFlexMoEMethod(
+                layer.moe_config, COMPUTE_MODES[self.compute_mode]
+            )
         if not isinstance(layer, LinearBase):
             return None
         if self._rdna_hint_flex_modules is None:

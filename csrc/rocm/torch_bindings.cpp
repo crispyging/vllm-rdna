@@ -1107,7 +1107,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor w2_code_off, Tensor w2_blk_params, Tensor w2_param_off, "
       "Tensor w2_row_consts, Tensor w2_row_nbits, Tensor w2_row_block, "
       "Tensor w2_col_scale, Tensor w2_had, bool w2_transform, "
-      "int num_experts, int intermediate) -> Tensor");
+      "int num_experts, int intermediate, int mode, int decode_max_m) "
+      "-> Tensor");
   rocm_ops.impl("rdna_hint_flex_moe_rdna2", torch::kCUDA,
                 &rdna_hint_flex_moe_rdna2);
   rocm_ops.def(

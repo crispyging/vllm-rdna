@@ -1319,7 +1319,8 @@ torch::Tensor rdna_hint_flex_moe_rdna2(
     torch::Tensor w2_param_off, torch::Tensor w2_row_consts,
     torch::Tensor w2_row_nbits, torch::Tensor w2_row_block,
     torch::Tensor w2_col_scale, torch::Tensor w2_had, bool w2_transform,
-    int64_t num_experts, int64_t intermediate);
+    int64_t num_experts, int64_t intermediate, int64_t mode,
+    int64_t decode_max_m);
 void rdna_hint_flex_gemm_rdna2(torch::Tensor x, torch::Tensor codes,
                                torch::Tensor code_off, torch::Tensor blk_params,
                                torch::Tensor param_off,

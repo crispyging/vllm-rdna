@@ -488,8 +488,9 @@ class _Experts(torch.nn.Module):
 
 
 @gfx1030_only
+@pytest.mark.parametrize("mode", [0, 2])
 @pytest.mark.parametrize("tokens", [1, 3, 9])
-def test_moe_vs_dense_reference(tokens):
+def test_moe_vs_dense_reference(tokens, mode):
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.quantization.rdna_hint_flex_moe import (
@@ -501,7 +502,7 @@ def test_moe_vs_dense_reference(tokens):
     gate, up, down = _synthetic_experts(e, hidden, inter, seed=100)
     with torch.device("cuda"):
         layer = _Experts()
-        method = RdnaHintFlexMoEMethod(None)
+        method = RdnaHintFlexMoEMethod(None, mode)
         method.create_weights(layer, e, hidden, inter, torch.float16)
     layer.moe_config = SimpleNamespace(tp_size=1, tp_rank=0)
     layer.activation = "silu"
@@ -522,8 +523,9 @@ def test_moe_vs_dense_reference(tokens):
     torch.accelerator.synchronize()
     ref = moe_reference(x, ids, w, gate, up, down)
     assert out.shape == (tokens, hidden)
-    # fp16 activations between the stages (transform, gate/up, SiLU product).
-    assert rel_err(out, ref) < 1e-2
+    # fp16 activations between the stages (transform, gate/up, SiLU product);
+    # I8 adds the per-16-column int8 activation error of spec 5.
+    assert rel_err(out, ref) < (1e-2 if mode == 0 else 3e-2)
 
 
 @gfx1030_only

@@ -16,7 +16,8 @@ differ is rejected.
 The forward is ``rdna_hint_flex_moe_rdna2``: one transform per (token, expert)
 pair, a GEMV per pair for gate/up, SiLU-and-mul, the down-projection GEMV with
 the routing-weighted top-k sum done in the kernel (no atomics). Fixed shapes,
-so it is cudagraph-capturable. F16 compute mode only.
+so it is cudagraph-capturable. F16 and I8 compute modes (the config's
+compute_mode).
 """
 
 from typing import TYPE_CHECKING
@@ -68,8 +69,11 @@ def stack_experts(
 
 
 class RdnaHintFlexMoEMethod(FusedMoEMethodBase):
-    def __init__(self, moe) -> None:
+    def __init__(self, moe, compute_mode: int = 0) -> None:
         super().__init__(moe)
+        # 0 = F16, 1 = I8 for decode-sized batches, 2 = I8 always (see
+        # COMPUTE_MODES in rdna_hint_flex.py).
+        self.compute_mode = compute_mode
 
     def get_fused_moe_quant_config(
         self, layer: "RoutedExperts"
@@ -188,6 +192,7 @@ class RdnaHintFlexMoEMethod(FusedMoEMethodBase):
             layer._rdna_hint_flex_w2_tr,
             self._num_experts,
             self._inter,
+            self.compute_mode,
         )
 
 

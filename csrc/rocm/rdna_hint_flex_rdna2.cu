@@ -909,7 +909,147 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// I8 routed experts: per (token, expert) pair, the expert's transform then the
+// per-16-column int8 quantization of spec 6.2 (pairs with expert < 0 get
+// zeros); the GEMV reads the pair's quantized row.
+__global__ void moe_act_quant_kernel(
+    const half* __restrict__ x, const int64_t ldx, const int src_div,
+    const int32_t* __restrict__ expert, const half* __restrict__ col_scale,
+    const uint8_t* __restrict__ had, int8_t* __restrict__ xq,
+    half* __restrict__ sx, int32_t* __restrict__ sumq, const int P,
+    const int K) {
+  const int groups = K / kGroup;
+  const int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= static_cast<int64_t>(P) * groups) return;
+  const int p = static_cast<int>(g / groups);
+  const int gi = static_cast<int>(g % groups);
+  const int e = expert[p];
+  float v[kGroup];
+  if (e >= 0) {
+    const half* xp = x + (p / src_div) * ldx + gi * kGroup;
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i) v[i] = __half2float(xp[i]);
+    const half* s = col_scale != nullptr
+                        ? col_scale + static_cast<int64_t>(e) * K + gi * kGroup
+                        : nullptr;
+    transform16(v, s,
+                had != nullptr && had[static_cast<int64_t>(e) * groups + gi]);
+  } else {
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i) v[i] = 0.0f;
+  }
+  float amax = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < kGroup; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  const half sh = __float2half_rn(amax / 127.0f);
+  const float sf = __half2float(sh);
+  union {
+    int8_t b[kGroup];
+    uint4 u;
+  } q;
+  int sum = 0;
+  #pragma unroll
+  for (int i = 0; i < kGroup; ++i) {
+    float r = sf > 0.0f ? rintf(v[i] / sf) : 0.0f;
+    r = fminf(fmaxf(r, -127.0f), 127.0f);
+    q.b[i] = static_cast<int8_t>(r);
+    sum += q.b[i];
+  }
+  *reinterpret_cast<uint4*>(xq + static_cast<int64_t>(p) * K + gi * kGroup) =
+      q.u;
+  sx[static_cast<int64_t>(p) * groups + gi] = sh;
+  sumq[static_cast<int64_t>(p) * groups + gi] = sum;
+}
+
+__device__ __forceinline__ float row_dot1_i8(
+    const int8_t* __restrict__ xq, const half* __restrict__ sx,
+    const int32_t* __restrict__ sumq, const int K, const int gr,
+    const int32_t* __restrict__ codes, const int32_t* __restrict__ code_off,
+    const uint8_t* __restrict__ blk_params,
+    const int32_t* __restrict__ param_off, const half* __restrict__ row_consts,
+    const uint8_t* __restrict__ row_nbits,
+    const uint8_t* __restrict__ row_block, const int lane) {
+  const int nb = row_nbits[gr];
+  const int lb = log2_block(row_block[gr]);
+  const float lo_min = __half2float(row_consts[3 * gr + 0]);
+  const float lo_scale = __half2float(row_consts[3 * gr + 1]);
+  const float step_scale = __half2float(row_consts[3 * gr + 2]);
+  const uint32_t* words =
+      reinterpret_cast<const uint32_t*>(codes) + code_off[gr];
+  const uint8_t* params = blk_params + 2 * static_cast<int64_t>(param_off[gr]);
+  float acc[1] = {0.0f};
+  switch (nb) {
+    case 2:
+      row_dot_i8<1, 2>(xq, sx, sumq, K, 0, 1, words, params, lb, lo_min,
+                       lo_scale, step_scale, lane, acc);
+      break;
+    case 4:
+      row_dot_i8<1, 4>(xq, sx, sumq, K, 0, 1, words, params, lb, lo_min,
+                       lo_scale, step_scale, lane, acc);
+      break;
+    default:
+      row_dot_i8<1, 8>(xq, sx, sumq, K, 0, 1, words, params, lb, lo_min,
+                       lo_scale, step_scale, lane, acc);
+      break;
+  }
+  return acc[0];
+}
+
+template <bool REDUCE>
+__global__ void __launch_bounds__(kThreads) moe_gemv_i8_kernel(
+    const int8_t* __restrict__ xq, const half* __restrict__ sx,
+    const int32_t* __restrict__ sumq, const int K, const int top_k,
+    const int32_t* __restrict__ expert, const float* __restrict__ topk_w,
+    const int32_t* __restrict__ codes, const int32_t* __restrict__ code_off,
+    const uint8_t* __restrict__ blk_params,
+    const int32_t* __restrict__ param_off, const half* __restrict__ row_consts,
+    const uint8_t* __restrict__ row_nbits,
+    const uint8_t* __restrict__ row_block, const int n_out,
+    half* __restrict__ out, const int64_t ldo) {
+  const int wave = threadIdx.x / kWave;
+  const int lane = threadIdx.x % kWave;
+  const int r = blockIdx.x * kRowsPerBlock + wave;
+  if (r >= n_out) return;
+  const int row = blockIdx.y;
+  const int groups = K / kGroup;
+  float acc = 0.0f;
+  auto pair = [&](int p, int e) {
+    return row_dot1_i8(xq + static_cast<int64_t>(p) * K,
+                       sx + static_cast<int64_t>(p) * groups,
+                       sumq + static_cast<int64_t>(p) * groups, K,
+                       e * n_out + r, codes, code_off, blk_params, param_off,
+                       row_consts, row_nbits, row_block, lane);
+  };
+  if constexpr (REDUCE) {
+    for (int k = 0; k < top_k; ++k) {
+      const int p = row * top_k + k;
+      const int e = expert[p];
+      if (e >= 0) acc += topk_w[p] * pair(p, e);
+    }
+  } else {
+    const int e = expert[row];
+    if (e >= 0) acc = pair(row, e);
+  }
+  #pragma unroll
+  for (int off = kWave / 2; off > 0; off >>= 1)
+    acc += __shfl_xor(acc, off, kWave);
+  if (lane == 0)
+    out[static_cast<int64_t>(row) * ldo + r] = __float2half_rn(acc);
+}
+
 #else  // non-RDNA2 device pass: empty kernels for symbol parity.
+
+__global__ void moe_act_quant_kernel(const half*, const int64_t, const int,
+                                     const int32_t*, const half*,
+                                     const uint8_t*, int8_t*, half*, int32_t*,
+                                     const int, const int) {}
+template <bool REDUCE>
+__global__ void moe_gemv_i8_kernel(const int8_t*, const half*, const int32_t*,
+                                   const int, const int, const int32_t*,
+                                   const float*, const int32_t*, const int32_t*,
+                                   const uint8_t*, const int32_t*, const half*,
+                                   const uint8_t*, const uint8_t*, const int,
+                                   half*, const int64_t) {}
 
 template <int GM, int GN>
 __global__ void gemm2_kernel(const half*, const int, const int, const int32_t*,
@@ -1249,6 +1389,52 @@ void launch_gemm(const torch::Tensor& x, const Hi2Weight& w, torch::Tensor& out,
   launch_gemm_t<128, 128>(x, w, out, R, stream);
 }
 
+void launch_moe_act_quant(const torch::Tensor& x, int src_div,
+                          const torch::Tensor& expert,
+                          const torch::Tensor& col_scale,
+                          const torch::Tensor& had, bool transform,
+                          torch::Tensor& xq, torch::Tensor& sx,
+                          torch::Tensor& sumq, cudaStream_t stream) {
+  const int64_t P = xq.size(0), K = xq.size(1);
+  const int64_t n = P * (K / hf::kGroup);
+  if (n == 0) return;
+  const half* s = transform && col_scale.numel() > 0
+                      ? reinterpret_cast<const half*>(col_scale.data_ptr())
+                      : nullptr;
+  const uint8_t* h =
+      transform && had.numel() > 0 ? had.data_ptr<uint8_t>() : nullptr;
+  const int threads = 256;
+  hf::moe_act_quant_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+      reinterpret_cast<const half*>(x.data_ptr()), x.stride(0), src_div,
+      expert.data_ptr<int32_t>(), s, h, xq.data_ptr<int8_t>(),
+      reinterpret_cast<half*>(sx.data_ptr()), sumq.data_ptr<int32_t>(),
+      static_cast<int>(P), static_cast<int>(K));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <bool REDUCE>
+void launch_moe_gemv_i8(const torch::Tensor& xq, const torch::Tensor& sx,
+                        const torch::Tensor& sumq, int top_k,
+                        const torch::Tensor& expert,
+                        const torch::Tensor& topk_w, const Hi2Weight& w,
+                        int64_t n_out, torch::Tensor& out,
+                        cudaStream_t stream) {
+  const int64_t rows = out.size(0);
+  if (rows == 0 || n_out == 0) return;
+  dim3 grid((n_out + hf::kRowsPerBlock - 1) / hf::kRowsPerBlock, rows);
+  hf::moe_gemv_i8_kernel<REDUCE><<<grid, hf::kThreads, 0, stream>>>(
+      xq.data_ptr<int8_t>(), reinterpret_cast<const half*>(sx.data_ptr()),
+      sumq.data_ptr<int32_t>(), static_cast<int>(xq.size(1)), top_k,
+      expert.data_ptr<int32_t>(), topk_w.data_ptr<float>(),
+      w.codes.data_ptr<int32_t>(), w.code_off.data_ptr<int32_t>(),
+      w.blk_params.data_ptr<uint8_t>(), w.param_off.data_ptr<int32_t>(),
+      reinterpret_cast<const half*>(w.row_consts.data_ptr()),
+      w.row_nbits.data_ptr<uint8_t>(), w.row_block.data_ptr<uint8_t>(),
+      static_cast<int>(n_out), reinterpret_cast<half*>(out.data_ptr()),
+      out.stride(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 // x [M, K] fp16 -> out [M, K] fp16 = H16(x / s) on flagged groups.
@@ -1317,7 +1503,8 @@ torch::Tensor rdna_hint_flex_moe_rdna2(
     torch::Tensor w2_param_off, torch::Tensor w2_row_consts,
     torch::Tensor w2_row_nbits, torch::Tensor w2_row_block,
     torch::Tensor w2_col_scale, torch::Tensor w2_had, bool w2_transform,
-    int64_t num_experts, int64_t intermediate) {
+    int64_t num_experts, int64_t intermediate, int64_t mode,
+    int64_t decode_max_m) {
   const Hi2Weight w13{w13_codes,     w13_code_off,   w13_blk_params,
                       w13_param_off, w13_row_consts, w13_row_nbits,
                       w13_row_block};
@@ -1341,6 +1528,27 @@ torch::Tensor rdna_hint_flex_moe_rdna2(
   auto stream = at::cuda::getCurrentCUDAStream();
   auto out = torch::empty({T, H}, x.options());
   if (T == 0) return out;
+  if (mode == 2 || (mode == 1 && T <= decode_max_m)) {
+    const auto i8 = x.options().dtype(torch::kInt8);
+    const auto i32 = x.options().dtype(torch::kInt32);
+    auto xq = torch::empty({P, H}, i8);
+    auto sx = torch::empty({P, H / 16}, x.options());
+    auto sq = torch::empty({P, H / 16}, i32);
+    launch_moe_act_quant(x, top_k, topk_ids, w13_col_scale, w13_had,
+                         w13_transform, xq, sx, sq, stream);
+    auto g13 = torch::empty({P, 2 * N}, x.options());
+    launch_moe_gemv_i8<false>(xq, sx, sq, top_k, topk_ids, topk_weights, w13,
+                              2 * N, g13, stream);
+    auto h = at::silu(g13.narrow(1, 0, N)) * g13.narrow(1, N, N);
+    auto hq = torch::empty({P, N}, i8);
+    auto hs = torch::empty({P, N / 16}, x.options());
+    auto hsq = torch::empty({P, N / 16}, i32);
+    launch_moe_act_quant(h, 1, topk_ids, w2_col_scale, w2_had, w2_transform, hq,
+                         hs, hsq, stream);
+    launch_moe_gemv_i8<true>(hq, hs, hsq, top_k, topk_ids, topk_weights, w2, H,
+                             out, stream);
+    return out;
+  }
   auto xp = torch::empty({P, H}, x.options());
   launch_moe_transform(x, top_k, topk_ids, w13_col_scale, w13_had,
                        w13_transform, xp, stream);
