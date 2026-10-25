@@ -517,7 +517,6 @@ def main():
             "MTP",
             "SEQS",
             "MAXLEN",
-            "MAXBAT",
             "KV",
             "BLOCK_SIZE",
             "GPU_MAX_HW_QUEUES",
@@ -530,6 +529,14 @@ def main():
             assert reference_args[key] == current_args[key], (
                 f"reference configuration differs: {key}"
             )
+        # MAXBAT is deliberately not a pairing constraint: the budget is
+        # derived from the attention block size, which the hybrid page
+        # alignment picks per KV dtype (1024 for FP16 KV, 2048 for a packed
+        # KV cache with an FP16 SSM state, 3072 with FP32). A packed
+        # candidate and its FP16 reference therefore carry different budgets
+        # for the same requested block size. The invariant that matters is
+        # per arm: the budget must cover two mamba state blocks, which the
+        # server log assertion above enforces on both arms.
         assert reference_run["kv_cache_layout"] == args.layout
         assert reference_run["boot_id"] == boot_id()
         assert (
