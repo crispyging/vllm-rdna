@@ -30,6 +30,9 @@
 // path -- chunk.py:61-71 never passes it -- and is therefore not a
 // parameter of the wrapper: it is structurally impossible to silently
 // diverge on it. h0 (initial_state) IS supported (default None == zeros).
+// The SSM state slot may be fp32 (the default cache) or fp16
+// (--mamba-ssm-cache-dtype float16): the recurrence runs in fp32 registers
+// either way, so only the h0 load and the final-state store convert.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -55,6 +58,25 @@ __device__ __forceinline__ float gdn_ksum(float x) {
   return x;
 }
 
+// SSM state dtype conversions. The state cache may be fp32 (the default) or
+// fp16 (--mamba-ssm-cache-dtype float16); the recurrence itself always runs
+// in fp32 registers, so only the load and the store convert. This mirrors
+// gdn_decode_rdna2.cu, which already accepts an fp16 state.
+__device__ __forceinline__ float gdn_to_f32(float x) { return x; }
+__device__ __forceinline__ float gdn_to_f32(__half x) {
+  return __half2float(x);
+}
+template <typename ST>
+__device__ __forceinline__ ST gdn_to_st(float x);
+template <>
+__device__ __forceinline__ float gdn_to_st<float>(float x) {
+  return x;
+}
+template <>
+__device__ __forceinline__ __half gdn_to_st<__half>(float x) {
+  return __float2half_rn(x);
+}
+
 // V_DOT2_F32_F16: acc += a.x*b.x + a.y*b.y (fp32 accumulate, no clamp).
 __device__ __forceinline__ float gdn_fdot2(__half2 a, __half2 b, float acc) {
   return __builtin_amdgcn_fdot2(a, b, acc, /*clamp=*/false);
@@ -70,6 +92,7 @@ __device__ __forceinline__ __half2 gdn_load_f16x2(const __half* p) {
 // multi-sequence batch can be resident: +16..17 % vs Triton at N=2 instead of
 // -19 %. The unroll factor below is what keeps the allocation inside that
 // budget (193 -> 113 VGPRs, no spill).
+template <typename ST>
 __global__ void __launch_bounds__(GDN_THREADS)
     __attribute__((amdgpu_waves_per_eu(4, 8)))
     gdn_prefill_delta_h_packed_kernel(
@@ -77,9 +100,9 @@ __global__ void __launch_bounds__(GDN_THREADS)
         const __half* __restrict__ u,  // [B*T, H, V]
         const __half* __restrict__ w,  // [B*T, H, K]
         const float* __restrict__ g,   // [B*T, H] g_cumsum, fp32
-        const float* __restrict__ h0,  // [N, H, V, K] fp32, nullable
+        const ST* __restrict__ h0,     // [N, H, V, K] state dtype, nullable
         __half* __restrict__ h,        // [B, NT, H, V, K] fp16 out (5D always)
-        float* __restrict__ ht,        // [N, H, V, K] fp32, nullable
+        ST* __restrict__ ht,           // [N, H, V, K] state dtype, nullable
         __half* __restrict__ v_new,    // [B*T, H, V] fp16 out
         const int* __restrict__ cu_seqlens,     // [N+1] varlen, or nullptr
         const int* __restrict__ chunk_offsets,  // [N+1] varlen, or nullptr
@@ -136,10 +159,9 @@ __global__ void __launch_bounds__(GDN_THREADS)
   // wants, but we also handle it here for convenience).
   float hreg[16];
   if (h0 != nullptr) {
-    const float* p_h0 =
-        h0 + (long)i_nh * GDN_V * GDN_K + (long)o_v * GDN_K + k0;
+    const ST* p_h0 = h0 + (long)i_nh * GDN_V * GDN_K + (long)o_v * GDN_K + k0;
 #pragma unroll
-    for (int j = 0; j < 16; ++j) hreg[j] = v_ok ? p_h0[j] : 0.0f;
+    for (int j = 0; j < 16; ++j) hreg[j] = v_ok ? gdn_to_f32(p_h0[j]) : 0.0f;
   } else {
 #pragma unroll
     for (int j = 0; j < 16; ++j) hreg[j] = 0.0f;
@@ -181,8 +203,8 @@ __global__ void __launch_bounds__(GDN_THREADS)
     for (int idx = lane; idx < n_u; idx += GDN_THREADS) {
       const int t = idx / GDN_BV;
       const int lv = idx - t * GDN_BV;
-      us[idx] = u_base[(long)(chunk_start + t) * H * GDN_V +
-                       (long)i_h * GDN_V + i_v * GDN_BV + lv];
+      us[idx] = u_base[(long)(chunk_start + t) * H * GDN_V + (long)i_h * GDN_V +
+                       i_v * GDN_BV + lv];
     }
     if (lane < t_len) {
       gs[lane] = p_g[(long)(chunk_start + lane) * H];
@@ -298,12 +320,12 @@ __global__ void __launch_bounds__(GDN_THREADS)
     p_h += stride_h;
   }
 
-  // Epilogue: persist the post-final h register state to the float
-  // final_state slot (fp32, no rounding).
+  // Epilogue: persist the post-final h register state to the state slot
+  // (fp32 keeps the full precision, fp16 rounds to nearest even).
   if (store_final_state && v_ok) {
-    float* p_ht = ht + (long)i_nh * GDN_V * GDN_K + (long)o_v * GDN_K + k0;
+    ST* p_ht = ht + (long)i_nh * GDN_V * GDN_K + (long)o_v * GDN_K + k0;
 #pragma unroll
-    for (int j = 0; j < 16; ++j) p_ht[j] = hreg[j];
+    for (int j = 0; j < 16; ++j) p_ht[j] = gdn_to_st<ST>(hreg[j]);
   }
 }
 
@@ -371,10 +393,12 @@ void gdn_prefill_delta_h_rdna2(torch::Tensor k, torch::Tensor u,
 
   const bool has_h0 = initial_state.has_value() && initial_state->defined();
   if (has_h0) {
-    TORCH_CHECK(initial_state->scalar_type() == at::kFloat &&
-                    initial_state->dim() == 4 && initial_state->stride(-1) == 1,
-                "initial_state must be fp32 [N, H, V, K] contiguous in last "
-                "dim");
+    TORCH_CHECK(
+        (initial_state->scalar_type() == at::kFloat ||
+         initial_state->scalar_type() == at::kHalf) &&
+            initial_state->dim() == 4 && initial_state->stride(-1) == 1,
+        "initial_state must be fp32/fp16 [N, H, V, K] contiguous in last "
+        "dim");
     TORCH_CHECK(initial_state->size(0) == N && initial_state->size(1) == H &&
                     initial_state->size(2) == V && initial_state->size(3) == K,
                 "initial_state shape mismatch");
@@ -382,13 +406,20 @@ void gdn_prefill_delta_h_rdna2(torch::Tensor k, torch::Tensor u,
 
   const bool store_final = final_state.has_value() && final_state->defined();
   if (store_final) {
-    TORCH_CHECK(final_state->scalar_type() == at::kFloat &&
+    TORCH_CHECK((final_state->scalar_type() == at::kFloat ||
+                 final_state->scalar_type() == at::kHalf) &&
                     final_state->dim() == 4 && final_state->stride(-1) == 1,
-                "final_state must be fp32 [N, H, V, K] contiguous in last "
+                "final_state must be fp32/fp16 [N, H, V, K] contiguous in last "
                 "dim");
     TORCH_CHECK(final_state->size(0) == N && final_state->size(1) == H &&
                     final_state->size(2) == V && final_state->size(3) == K,
                 "final_state shape mismatch");
+  }
+  // The kernel is templated on the state dtype, so the two slots must agree.
+  if (has_h0 && store_final) {
+    TORCH_CHECK(initial_state->scalar_type() == final_state->scalar_type(),
+                "initial_state and final_state must have the same dtype (both "
+                "fp32 or both fp16)");
   }
 
   if (T == 0 || N == 0) return;
@@ -408,18 +439,36 @@ void gdn_prefill_delta_h_rdna2(torch::Tensor k, torch::Tensor u,
   const at::cuda::OptionalCUDAGuard guard(k.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 grid((V + GDN_BV - 1) / GDN_BV, N * H);
-  constexpr int kSmem = (2 * GDN_BT * GDN_K + GDN_BT * GDN_BV) *
-                            (int)sizeof(__half) +
-                        GDN_BT * (int)sizeof(float);
-  gdn_prefill_delta_h_packed_kernel<<<grid, GDN_THREADS, kSmem, stream>>>(
-      reinterpret_cast<const __half*>(k.data_ptr()),
-      reinterpret_cast<const __half*>(u.data_ptr()),
-      reinterpret_cast<const __half*>(w.data_ptr()), g.data_ptr<float>(),
-      has_h0 ? initial_state->data_ptr<float>() : nullptr,
-      reinterpret_cast<__half*>(h.data_ptr()),
-      store_final ? final_state->data_ptr<float>() : nullptr,
-      reinterpret_cast<__half*>(v_new.data_ptr()),
-      varlen ? cu_seqlens->data_ptr<int>() : nullptr,
-      varlen ? chunk_offsets->data_ptr<int>() : nullptr, T, H, Hg, N, B,
-      NT_total, store_final ? 1 : 0);
+  constexpr int kSmem =
+      (2 * GDN_BT * GDN_K + GDN_BT * GDN_BV) * (int)sizeof(__half) +
+      GDN_BT * (int)sizeof(float);
+  // The state dtype picks the kernel instantiation: fp32 (default) or fp16
+  // (--mamba-ssm-cache-dtype float16).
+  const auto state_ty =
+      has_h0 ? initial_state->scalar_type()
+             : (store_final ? final_state->scalar_type() : at::kFloat);
+#define GDN_PREFILL_LAUNCH(ST, H0PTR, HTPTR)                                   \
+  gdn_prefill_delta_h_packed_kernel<ST><<<grid, GDN_THREADS, kSmem, stream>>>( \
+      reinterpret_cast<const __half*>(k.data_ptr()),                           \
+      reinterpret_cast<const __half*>(u.data_ptr()),                           \
+      reinterpret_cast<const __half*>(w.data_ptr()), g.data_ptr<float>(),      \
+      H0PTR, reinterpret_cast<__half*>(h.data_ptr()), HTPTR,                   \
+      reinterpret_cast<__half*>(v_new.data_ptr()),                             \
+      varlen ? cu_seqlens->data_ptr<int>() : nullptr,                          \
+      varlen ? chunk_offsets->data_ptr<int>() : nullptr, T, H, Hg, N, B,       \
+      NT_total, store_final ? 1 : 0)
+  if (state_ty == at::kHalf) {
+    GDN_PREFILL_LAUNCH(
+        __half,
+        has_h0 ? reinterpret_cast<const __half*>(initial_state->data_ptr())
+               : nullptr,
+        store_final ? reinterpret_cast<__half*>(final_state->data_ptr())
+                    : nullptr);
+  } else {
+    GDN_PREFILL_LAUNCH(float,
+                       has_h0 ? initial_state->data_ptr<float>() : nullptr,
+                       store_final ? final_state->data_ptr<float>() : nullptr);
+  }
+#undef GDN_PREFILL_LAUNCH
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
