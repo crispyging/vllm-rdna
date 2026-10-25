@@ -39,6 +39,8 @@
 #include <cuda_fp16.h>
 
 #include "rocm/ops.h"  // paged_mqa_logits_decode_rdna2
+// Packed INT4 + FP16 block-scale KV cache layout and its dequant helpers.
+#include "int4_kv_layout_common.cuh"
 
 namespace {
 
@@ -888,7 +890,7 @@ constexpr int QSA_LDS_DIM_256 = 256 + 8;
 
 __device__ __forceinline__ float qsa_exp2(float x) { return exp2f(x); }
 
-template <int BLOCK_N, int LDS_DIM, typename TIdx>
+template <int BLOCK_N, int LDS_DIM, typename TIdx, bool IS_INT4 = false>
 __global__ void __launch_bounds__(QSA_MAX_THREADS)
     qsa_sparse_paged_gqa_splitk_kernel(
         const half* __restrict__ q, const half* __restrict__ k_cache,
@@ -904,7 +906,8 @@ __global__ void __launch_bounds__(QSA_MAX_THREADS)
         int64_t stride_output_row, int64_t stride_output_head, int num_rows,
         int64_t num_cache_blocks, int num_requests, int topk, int page_size,
         int page_table_width, int group_size, int head_dim, int num_query_heads,
-        int num_splits, int num_tiles, int single_split, int vec8) {
+        int num_splits, int num_tiles, int single_split, int vec8,
+        vllm::int4_kv::Int4KvArg<IS_INT4> int4 = {}) {
   const int row = blockIdx.x;
   const int kv_head = blockIdx.y;
   const int split_id = blockIdx.z;
@@ -930,6 +933,10 @@ __global__ void __launch_bounds__(QSA_MAX_THREADS)
   // shares it. Both loops used to redo it per column in every warp.
   __shared__ int64_t s_koff[BLOCK_N];
   __shared__ int64_t s_voff[BLOCK_N];
+  // Scale-tail bases. Only the INT4 path reads them: the FP16 cache has no
+  // separate scale region, so the arrays stay size 1 there.
+  __shared__ int64_t s_kscale[IS_INT4 ? BLOCK_N : 1];
+  __shared__ int64_t s_vscale[IS_INT4 ? BLOCK_N : 1];
   // Probabilities, kept as fp16 to match Triton's `probabilities.to(dtype)`.
   __shared__ half s_p[QSA_MAX_GROUP][BLOCK_N];
   // This tile's K and V, staged once and shared by every warp in the group.
@@ -995,16 +1002,41 @@ __global__ void __launch_bounds__(QSA_MAX_THREADS)
                 min(logical_page, page_table_width - 1)];
             valid = (physical_page >= 0) && (physical_page < num_cache_blocks);
           }
-          s_koff[c] = valid
-              ? (int64_t)physical_page * stride_k_block +
-                    (int64_t)page_offset * stride_k_token +
-                    (int64_t)kv_head * stride_k_head
-              : (int64_t)-1;
-          s_voff[c] = valid
-              ? (int64_t)physical_page * stride_v_block +
-                    (int64_t)page_offset * stride_v_token +
-                    (int64_t)kv_head * stride_v_head
-              : (int64_t)-1;
+          if constexpr (IS_INT4) {
+            // The packed cache is viewed as [pages, heads, slots, channels]
+            // and the descriptor carries byte strides in that order, so the
+            // record base is page + head + slot. The scale words live in the
+            // tail of the same record and have their own strides.
+            s_koff[c] = valid
+                            ? (int64_t)physical_page * int4.data_stride[0][0] +
+                                  (int64_t)kv_head * int4.data_stride[0][1] +
+                                  (int64_t)page_offset * int4.data_stride[0][2]
+                            : (int64_t)-1;
+            s_kscale[c] =
+                valid ? (int64_t)physical_page * int4.scale_stride[0][0] +
+                            (int64_t)kv_head * int4.scale_stride[0][1] +
+                            (int64_t)page_offset * int4.scale_stride[0][2]
+                      : (int64_t)-1;
+            s_voff[c] = valid
+                            ? (int64_t)physical_page * int4.data_stride[1][0] +
+                                  (int64_t)kv_head * int4.data_stride[1][1] +
+                                  (int64_t)page_offset * int4.data_stride[1][2]
+                            : (int64_t)-1;
+            s_vscale[c] =
+                valid ? (int64_t)physical_page * int4.scale_stride[1][0] +
+                            (int64_t)kv_head * int4.scale_stride[1][1] +
+                            (int64_t)page_offset * int4.scale_stride[1][2]
+                      : (int64_t)-1;
+          } else {
+            s_koff[c] = valid ? (int64_t)physical_page * stride_k_block +
+                                    (int64_t)page_offset * stride_k_token +
+                                    (int64_t)kv_head * stride_k_head
+                              : (int64_t)-1;
+            s_voff[c] = valid ? (int64_t)physical_page * stride_v_block +
+                                    (int64_t)page_offset * stride_v_token +
+                                    (int64_t)kv_head * stride_v_head
+                              : (int64_t)-1;
+          }
         }
       }
       __syncthreads();
@@ -1013,7 +1045,60 @@ __global__ void __launch_bounds__(QSA_MAX_THREADS)
       // this each of the group_size warps re-reads the same rows from global
       // (6x on this model), and the loads are the measured bottleneck.
       const int nthreads = (int)blockDim.x;
-      if (vec8 != 0) {
+      if constexpr (IS_INT4) {
+        // The packed record is dequantized into the same fp16 LDS tile the
+        // FP16 path fills, so the softmax/dot-product code below is shared.
+        // Only the load differs: 4 payload bytes plus one scale word per 8
+        // channels, instead of one 16-byte fp16 load. The 8-wide path needs
+        // the record bases 4-byte aligned, which the layout reports.
+        if (int4.vector8) {
+          const int n8 = head_dim >> 3;
+          const int chunks = BLOCK_N * n8;
+          for (int i = (int)threadIdx.x; i < chunks; i += nthreads) {
+            const int c = i / n8;
+            const int j = i - c * n8;
+            const int d = 8 * j;
+            const int64_t koff = s_koff[c];
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u);
+            if (koff >= 0) {
+              kv = vllm::int4_kv::int4_eight_from_rows(
+                  reinterpret_cast<const uint8_t*>(k_cache) + koff,
+                  int4.scales[0] + s_kscale[c], int4.scale_stride[0][3], d);
+            }
+            *reinterpret_cast<uint4*>(&s_k[c][d]) = kv;
+            const int64_t voff = s_voff[c];
+            uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+            if (voff >= 0) {
+              vv = vllm::int4_kv::int4_eight_from_rows(
+                  reinterpret_cast<const uint8_t*>(v_cache) + voff,
+                  int4.scales[1] + s_vscale[c], int4.scale_stride[1][3], d);
+            }
+            *reinterpret_cast<uint4*>(&s_v[c][d]) = vv;
+          }
+        } else {
+          for (int i = (int)threadIdx.x; i < BLOCK_N * head_dim;
+               i += nthreads) {
+            const int c = i / head_dim;
+            const int d = i - c * head_dim;
+            const int64_t koff = s_koff[c];
+            s_k[c][d] =
+                (koff >= 0)
+                    ? vllm::int4_kv::int4_half_from_rows(
+                          reinterpret_cast<const uint8_t*>(k_cache) + koff,
+                          int4.scales[0] + s_kscale[c], int4.data_stride[0][3],
+                          int4.scale_stride[0][3], d)
+                    : __float2half(0.0f);
+            const int64_t voff = s_voff[c];
+            s_v[c][d] =
+                (voff >= 0)
+                    ? vllm::int4_kv::int4_half_from_rows(
+                          reinterpret_cast<const uint8_t*>(v_cache) + voff,
+                          int4.scales[1] + s_vscale[c], int4.data_stride[1][3],
+                          int4.scale_stride[1][3], d)
+                    : __float2half(0.0f);
+          }
+        }
+      } else if (vec8 != 0) {
         const int n8 = head_dim >> 3;
         const int chunks = BLOCK_N * n8;
         for (int i = (int)threadIdx.x; i < chunks; i += nthreads) {
@@ -1287,13 +1372,19 @@ __global__ void qsa_merge_splitk_kernel(
 
 }  // namespace
 
-torch::Tensor qsa_sparse_paged_attention_rdna2(
+// The shared implementation behind the fp16 and the packed-INT4 entry
+// points. The two differ only in how the K/V tile is read: the FP16 cache
+// is loaded straight into LDS, the packed record is dequantized into the
+// same fp16 LDS tile. Everything downstream (dot product, online softmax,
+// split-K merge) is shared.
+template <bool IS_INT4>
+static torch::Tensor qsa_sparse_paged_attention_rdna2_impl(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     const at::Tensor& logical_indices, const at::Tensor& block_table,
-    const at::Tensor& token_to_req, c10::optional<at::Tensor> out) {
-  TORCH_CHECK(q.scalar_type() == at::kHalf && k_cache.scalar_type() == at::kHalf &&
-                  v_cache.scalar_type() == at::kHalf,
-              "qsa_sparse_paged_attention_rdna2 is fp16-only (gfx1030)");
+    const at::Tensor& token_to_req, c10::optional<at::Tensor> out,
+    const vllm::int4_kv::Int4KvArg<IS_INT4>& int4_layout) {
+  TORCH_CHECK(q.scalar_type() == at::kHalf,
+              "qsa_sparse_paged_attention_rdna2: q must be fp16");
   TORCH_CHECK(q.dim() == 3, "qsa_sparse_paged_attention_rdna2: q must be 3D");
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.sizes() == k_cache.sizes(),
               "qsa_sparse_paged_attention_rdna2: k_cache/v_cache must share a "
@@ -1341,7 +1432,9 @@ torch::Tensor qsa_sparse_paged_attention_rdna2(
 
   const int64_t num_query_heads = q.size(1);
   const int64_t head_dim = q.size(2);
-  const int64_t num_kv_heads = k_cache.size(2);
+  // The fp16 cache is [blocks, page_size, kv_heads, head_dim]; the packed
+  // cache is [pages, heads, slots, channels] so its head and slot dims swap.
+  const int64_t num_kv_heads = IS_INT4 ? k_cache.size(1) : k_cache.size(2);
   TORCH_CHECK(num_kv_heads > 0 && num_query_heads % num_kv_heads == 0,
               "qsa_sparse_paged_attention_rdna2: query heads must be a multiple "
               "of kv heads (GQA)");
@@ -1349,7 +1442,7 @@ torch::Tensor qsa_sparse_paged_attention_rdna2(
   TORCH_CHECK(group_size >= 1,
               "qsa_sparse_paged_attention_rdna2: group_size must be >= 1");
   const int64_t topk = logical_indices.size(1);
-  const int64_t page_size = k_cache.size(1);
+  const int64_t page_size = IS_INT4 ? k_cache.size(2) : k_cache.size(1);
   const int64_t page_table_width = block_table.size(1);
   const int64_t num_requests = block_table.size(0);
   const int64_t num_cache_blocks = k_cache.size(0);
@@ -1398,14 +1491,23 @@ torch::Tensor qsa_sparse_paged_attention_rdna2(
   // The 8-wide (16-byte) load paths need every address they touch to be
   // 16-byte aligned. That holds whenever head_dim and every cache stride is a
   // multiple of 8 halves; otherwise the kernel falls back to half2 loads.
-  const bool vec8 =
-      (head_dim % 8 == 0) && (q.stride(0) % 8 == 0) && (q.stride(1) % 8 == 0) &&
-      (k_cache.stride(0) % 8 == 0) && (k_cache.stride(1) % 8 == 0) &&
-      (k_cache.stride(2) % 8 == 0) && (v_cache.stride(0) % 8 == 0) &&
-      (v_cache.stride(1) % 8 == 0) && (v_cache.stride(2) % 8 == 0) &&
-      ((reinterpret_cast<uintptr_t>(q.const_data_ptr()) & 15) == 0) &&
-      ((reinterpret_cast<uintptr_t>(k_cache.const_data_ptr()) & 15) == 0) &&
-      ((reinterpret_cast<uintptr_t>(v_cache.const_data_ptr()) & 15) == 0);
+  // The 8-wide (16-byte) load paths need every address they touch to be
+  // 16-byte aligned. That holds whenever head_dim and every cache stride is a
+  // multiple of 8 halves; otherwise the kernel falls back to half2 loads.
+  // The packed-INT4 path loads the query the same way, but its K/V tile is
+  // gated by the layout's own 4-byte alignment report, so the cache strides
+  // (byte strides here) must not be mixed into the query's test.
+  bool vec8 = (head_dim % 8 == 0) && (q.stride(0) % 8 == 0) &&
+              (q.stride(1) % 8 == 0) &&
+              ((reinterpret_cast<uintptr_t>(q.const_data_ptr()) & 15) == 0);
+  if constexpr (!IS_INT4) {
+    vec8 =
+        vec8 && (k_cache.stride(0) % 8 == 0) && (k_cache.stride(1) % 8 == 0) &&
+        (k_cache.stride(2) % 8 == 0) && (v_cache.stride(0) % 8 == 0) &&
+        (v_cache.stride(1) % 8 == 0) && (v_cache.stride(2) % 8 == 0) &&
+        ((reinterpret_cast<uintptr_t>(k_cache.const_data_ptr()) & 15) == 0) &&
+        ((reinterpret_cast<uintptr_t>(v_cache.const_data_ptr()) & 15) == 0);
+  }
   // The staged K/V tiles live in LDS rows of QSA_LDS_DIM_{128,256} halves.
   TORCH_CHECK(head_dim <= 256,
               "qsa_sparse_paged_attention_rdna2: head_dim must be <= 256");
@@ -1418,22 +1520,23 @@ torch::Tensor qsa_sparse_paged_attention_rdna2(
     using TIdx = decltype(idx_tag);
     auto* idx_ptr = reinterpret_cast<const TIdx*>(
         logical_indices.const_data_ptr());
-#define QSA_ATTN_LAUNCH(BN, LD)                                                \
-  qsa_sparse_paged_gqa_splitk_kernel<BN, LD, TIdx>                             \
+#define QSA_ATTN_LAUNCH(BN, LD)                                               \
+  qsa_sparse_paged_gqa_splitk_kernel<BN, LD, TIdx, IS_INT4>                   \
       <<<grid, attn_threads, 0, stream>>>(                                    \
-          reinterpret_cast<const half*>(q.const_data_ptr()),                   \
-          reinterpret_cast<const half*>(k_cache.const_data_ptr()),             \
-          reinterpret_cast<const half*>(v_cache.const_data_ptr()), idx_ptr,    \
-          block_table.const_data_ptr<int32_t>(),                               \
-          token_to_req.const_data_ptr<int32_t>(), partial_output_ptr,          \
-          partial_lse_ptr, out_ptr, q.stride(0), q.stride(1),                  \
-          k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),             \
-          v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),             \
-          logical_indices.stride(0), block_table.stride(0), result.stride(0),  \
-          result.stride(1), (int)rows, num_cache_blocks, (int)num_requests,    \
-          (int)topk, (int)page_size, (int)page_table_width, (int)group_size,   \
-          (int)head_dim, (int)num_query_heads, (int)num_splits, (int)num_tiles, \
-          (num_splits == 1) ? 1 : 0, vec8 ? 1 : 0)
+          reinterpret_cast<const half*>(q.const_data_ptr()),                  \
+          reinterpret_cast<const half*>(k_cache.const_data_ptr()),            \
+          reinterpret_cast<const half*>(v_cache.const_data_ptr()), idx_ptr,   \
+          block_table.const_data_ptr<int32_t>(),                              \
+          token_to_req.const_data_ptr<int32_t>(), partial_output_ptr,         \
+          partial_lse_ptr, out_ptr, q.stride(0), q.stride(1),                 \
+          k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),            \
+          v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),            \
+          logical_indices.stride(0), block_table.stride(0), result.stride(0), \
+          result.stride(1), (int)rows, num_cache_blocks, (int)num_requests,   \
+          (int)topk, (int)page_size, (int)page_table_width, (int)group_size,  \
+          (int)head_dim, (int)num_query_heads, (int)num_splits,               \
+          (int)num_tiles, (num_splits == 1) ? 1 : 0, vec8 ? 1 : 0,            \
+          int4_layout)
     if (head_dim <= 128) {
       if (block_n <= 16) {
         QSA_ATTN_LAUNCH(16, QSA_LDS_DIM_128);
@@ -1473,4 +1576,65 @@ torch::Tensor qsa_sparse_paged_attention_rdna2(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return result;
+}
+
+// fp16 main KV cache. The public entry point keeps the fp16-only contract:
+// a packed or otherwise quantized cache has a different record layout and
+// must use the INT4 entry point below rather than be read as fp16.
+torch::Tensor qsa_sparse_paged_attention_rdna2(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, c10::optional<at::Tensor> out) {
+  TORCH_CHECK(
+      k_cache.scalar_type() == at::kHalf && v_cache.scalar_type() == at::kHalf,
+      "qsa_sparse_paged_attention_rdna2 is fp16-only (gfx1030)");
+  vllm::int4_kv::NoInt4KvLayout unused{};
+  return qsa_sparse_paged_attention_rdna2_impl<false>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
+      unused);
+}
+
+// Packed INT4 + FP16 block-scale main KV cache. `k_cache`/`v_cache` are the
+// payload views [pages, heads, slots, D/2] and `k_scale`/`v_scale` are the
+// matching scale views [pages, heads, slots, D/32]; the scale words are a
+// window onto the tail of the same physical records, so they carry their own
+// strides. The dequantized values land in the same fp16 LDS tile the fp16
+// path fills, so the attention math is identical.
+torch::Tensor qsa_sparse_paged_attention_int4_rdna2(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    const at::Tensor& k_scale, const at::Tensor& v_scale,
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, c10::optional<at::Tensor> out) {
+  TORCH_CHECK(
+      k_cache.scalar_type() == at::kByte && v_cache.scalar_type() == at::kByte,
+      "qsa_sparse_paged_attention_int4_rdna2: packed cache must be "
+      "uint8");
+  TORCH_CHECK(k_scale.scalar_type() == torch::kUInt16 ||
+                  k_scale.scalar_type() == torch::kInt16 ||
+                  k_scale.scalar_type() == torch::kHalf,
+              "qsa_sparse_paged_attention_int4_rdna2: scale words must be "
+              "16-bit raw values");
+  const int64_t head_dim = q.size(2);
+  TORCH_CHECK(k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
+              "qsa_sparse_paged_attention_int4_rdna2: k_cache/v_cache must be "
+              "4D and share a shape");
+  TORCH_CHECK(k_scale.dim() == 4 && k_scale.sizes() == v_scale.sizes(),
+              "qsa_sparse_paged_attention_int4_rdna2: k_scale/v_scale must be "
+              "4D and share a shape");
+  TORCH_CHECK(k_cache.size(3) == head_dim / 2,
+              "qsa_sparse_paged_attention_int4_rdna2: packed cache must hold "
+              "D/2 payload bytes per record");
+  TORCH_CHECK(k_scale.size(3) == head_dim / 32,
+              "qsa_sparse_paged_attention_int4_rdna2: scale view must hold "
+              "D/32 scale words per record");
+  TORCH_CHECK(k_cache.size(0) == k_scale.size(0) &&
+                  k_cache.size(1) == k_scale.size(1) &&
+                  k_cache.size(2) == k_scale.size(2),
+              "qsa_sparse_paged_attention_int4_rdna2: the scale view must "
+              "cover the same pages, heads and slots as the payload");
+  const auto layout =
+      vllm::int4_kv::make_layout(k_cache, v_cache, k_scale, v_scale);
+  return qsa_sparse_paged_attention_rdna2_impl<true>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
+      layout);
 }
