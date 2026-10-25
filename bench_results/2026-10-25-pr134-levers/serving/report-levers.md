@@ -8,6 +8,8 @@ mamba align, FULL_AND_PIECEWISE graphs, one boot, one source/binary manifest.
 | fp16-core4292ace2-w4a8-ssm16-hip6789 | fp16 | 1 | recipe | PASS | 87.3 / 0.7s | 234.2 / 2.0s | 36.1 / 15.2s | 52.4 / 35.6s |
 | fp16-core4292ace2-w4a8-ssm16-real-hip6789 | fp16 | 1 | recipe | PASS | 87.6 / 0.7s | 233.3 / 2.0s | 36.1 / 15.2s | 52.3 / 34.4s |
 | int4-core4292ace2-w4a8-ssm16-real-hip6789 | int4_fp16_block | 1 | recipe | PASS | 81.6 / 0.7s | 230.0 / 2.1s | 37.5 / 15.0s | 50.5 / 39.5s |
+| fp16-core4292ace2-stall0-w4a8-ssm16-real-hip6789 | fp16 | 1 | 0 | PASS | 87.3 / 0.7s | 239.1 / 1.6s | 36.1 / 15.2s | 52.7 / 34.5s |
+| int4-core4292ace2-stall0-w4a8-ssm16-real-hip6789 | int4_fp16_block | 1 | 0 | PASS | 81.8 / 0.7s | 231.3 / 1.7s | 37.3 / 14.9s | 51.7 / 34.9s |
 
 Cells read `aggregate output tok/s / mean TTFT`.
 
@@ -23,7 +25,7 @@ The model was rebuilt from the intact blobs into /home/chenco_adm/pr134-model-re
 
 None on the measurements: every arm after the repair loaded the same model weights from the same blobs, and the arm command lines are identical apart from the model directory. The two arms measured before the repair (the first FP16 reference) bracket the repaired ones: they differ by 0.4 % or less in every cell, which is the run-to-run noise of the box.
 
-### fp16: {'w4a8': '1', 'decode_stall_ms': 'recipe'} -> {'w4a8': '1', 'decode_stall_ms': 'recipe'}
+### fp16 KV, fp16-core4292ace2-w4a8-ssm16-hip6789 -> fp16-core4292ace2-w4a8-ssm16-real-hip6789
 
 | cell | output | TTFT | prefill | decode |
 | --- | --- | --- | --- | --- |
@@ -31,3 +33,21 @@ None on the measurements: every arm after the repair loaded the same model weigh
 | 1k x c=8 | -0.38 % | +0.00 % | -0.84 % | -0.46 % |
 | 16k x c=1 | -0.06 % | +0.07 % | -0.09 % | +0.01 % |
 | 16k x c=8 | -0.10 % | -3.23 % | +4.61 % | -0.91 % |
+
+### fp16 KV, fp16-core4292ace2-w4a8-ssm16-hip6789 -> fp16-core4292ace2-stall0-w4a8-ssm16-real-hip6789
+
+| cell | output | TTFT | prefill | decode |
+| --- | --- | --- | --- | --- |
+| 1k x c=1 | +0.05 % | +0.00 % | -0.49 % | +0.12 % |
+| 1k x c=8 | +2.11 % | -17.35 % | +22.84 % | +0.77 % |
+| 16k x c=1 | +0.03 % | +0.07 % | -0.06 % | +0.17 % |
+| 16k x c=8 | +0.61 % | -2.92 % | +1.16 % | -0.71 % |
+
+### fp16 KV, fp16-core4292ace2-w4a8-ssm16-real-hip6789 -> fp16-core4292ace2-stall0-w4a8-ssm16-real-hip6789
+
+| cell | output | TTFT | prefill | decode |
+| --- | --- | --- | --- | --- |
+| 1k x c=1 | -0.30 % | +0.00 % | -0.60 % | -0.24 % |
+| 1k x c=8 | +2.49 % | -17.35 % | +23.88 % | +1.23 % |
+| 16k x c=1 | +0.08 % | +0.00 % | +0.04 % | +0.15 % |
+| 16k x c=8 | +0.71 % | +0.32 % | -3.30 % | +0.20 % |
