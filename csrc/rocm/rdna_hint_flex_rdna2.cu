@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// HadamardINT2-FP16 (HI2, spec v3.2) weight kernels for RDNA2 (gfx1030),
-// F16 compute mode (spec 6.1), fp16 only.
+// rdna_hint_flex (HadamardINT2-FP16 spec v3.2) weight kernels for RDNA2
+// (gfx1030), F16 compute mode (spec 6.1), fp16 only.
 //
 // Storage (one tensor W[R, K], spec 2.4; all buffers flat, per-row ragged):
 //   codes      int32 [sum_r K*nbits_r/32]  codes LSB-first, word aligned
@@ -24,14 +24,15 @@
 // the flagged groups (spec 2.3), so y = x' . W_stored^T.
 //
 // Kernels:
-//   hi2_act_transform : x' = H16(x / s), fp32 math, one fp16 rounding.
-//   hi2_gemv          : decode path (small M). One wave32 per output row,
+//   act_transform : x' = H16(x / s), fp32 math, one fp16 rounding.
+//   gemv          : decode path (small M). One wave32 per output row,
 //                       lanes stride over the row's words (coalesced), code ->
 //                       fp16 by the 0x6400 magic, v_pk_fma_f16 with the block
 //                       lo/step, v_dot2_f32_f16 against x', wave reduction.
-//   hi2_dequant       : stored-basis fp16 W [R, K]; the prefill path is
+//   dequant       : stored-basis fp16 W [R, K]; the prefill path is
 //                       dequant + rocBLAS GEMM (correct and simple, not tuned).
-//   hi2_linear_rdna2  : composite (transform + gemv or dequant+GEMM), chosen
+//   rdna_hint_flex_linear_rdna2  : composite (transform + gemv or
+//   dequant+GEMM), chosen
 //                       at execution time from M so torch.compile cannot bake
 //                       the warmup shape into the dispatch.
 //
@@ -54,7 +55,7 @@
 #endif
 
 namespace vllm {
-namespace hi2 {
+namespace rdna_hint_flex {
 
 constexpr int kGroup = 16;        // Hadamard group (spec 2.3)
 constexpr int kWave = 32;         // RDNA2 wave32
@@ -100,12 +101,12 @@ __device__ __forceinline__ int log2_block(int b) {
 // Activation transform: y[m, g*16 + i] = (H16 (x / s))_i on flagged groups.
 // One thread per (row, group).
 // ---------------------------------------------------------------------------
-__global__ void hi2_act_transform_kernel(const half* __restrict__ x,
-                                         const int64_t ldx,
-                                         const half* __restrict__ col_scale,
-                                         const uint8_t* __restrict__ had,
-                                         half* __restrict__ y, const int M,
-                                         const int K) {
+__global__ void act_transform_kernel(const half* __restrict__ x,
+                                     const int64_t ldx,
+                                     const half* __restrict__ col_scale,
+                                     const uint8_t* __restrict__ had,
+                                     half* __restrict__ y, const int M,
+                                     const int K) {
   const int groups = K / kGroup;
   const int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (g >= static_cast<int64_t>(M) * groups) return;
@@ -187,15 +188,15 @@ __device__ __forceinline__ void row_dot(
 
 template <int MT>
 __global__ void __launch_bounds__(kThreads)
-    hi2_gemv_kernel(const half* __restrict__ x, const int M, const int K,
-                    const int32_t* __restrict__ codes,
-                    const int32_t* __restrict__ code_off,
-                    const uint8_t* __restrict__ blk_params,
-                    const int32_t* __restrict__ param_off,
-                    const half* __restrict__ row_consts,
-                    const uint8_t* __restrict__ row_nbits,
-                    const uint8_t* __restrict__ row_block,
-                    half* __restrict__ out, const int64_t ldo, const int R) {
+    gemv_kernel(const half* __restrict__ x, const int M, const int K,
+                const int32_t* __restrict__ codes,
+                const int32_t* __restrict__ code_off,
+                const uint8_t* __restrict__ blk_params,
+                const int32_t* __restrict__ param_off,
+                const half* __restrict__ row_consts,
+                const uint8_t* __restrict__ row_nbits,
+                const uint8_t* __restrict__ row_block, half* __restrict__ out,
+                const int64_t ldo, const int R) {
   const int wave = threadIdx.x / kWave;
   const int lane = threadIdx.x % kWave;
   const int r = blockIdx.x * kRowsPerBlock + wave;
@@ -241,7 +242,7 @@ __global__ void __launch_bounds__(kThreads)
 // ---------------------------------------------------------------------------
 // Dequant: W_stored[r, :] in fp16. grid.x = rows, grid.y strides the words.
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(kThreads) hi2_dequant_kernel(
+__global__ void __launch_bounds__(kThreads) dequant_kernel(
     const int32_t* __restrict__ codes, const int32_t* __restrict__ code_off,
     const uint8_t* __restrict__ blk_params,
     const int32_t* __restrict__ param_off, const half* __restrict__ row_consts,
@@ -287,11 +288,12 @@ __global__ void __launch_bounds__(kThreads) hi2_dequant_kernel(
 // INT8 codes (0..255) do not fit a signed byte: they enter the dot as
 //   code - 128 and S_g gets 128 * sumq_g back, exactly, in int32.
 // ---------------------------------------------------------------------------
-__global__ void hi2_act_quant_kernel(
-    const half* __restrict__ x, const int64_t ldx,
-    const half* __restrict__ col_scale, const uint8_t* __restrict__ had,
-    int8_t* __restrict__ xq, half* __restrict__ sx, int32_t* __restrict__ sumq,
-    const int M, const int K) {
+__global__ void act_quant_kernel(const half* __restrict__ x, const int64_t ldx,
+                                 const half* __restrict__ col_scale,
+                                 const uint8_t* __restrict__ had,
+                                 int8_t* __restrict__ xq, half* __restrict__ sx,
+                                 int32_t* __restrict__ sumq, const int M,
+                                 const int K) {
   const int groups = K / kGroup;
   const int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (g >= static_cast<int64_t>(M) * groups) return;
@@ -417,17 +419,16 @@ __device__ __forceinline__ void row_dot_i8(
 
 template <int MT>
 __global__ void __launch_bounds__(kThreads)
-    hi2_gemv_i8_kernel(const int8_t* __restrict__ xq,
-                       const half* __restrict__ sx,
-                       const int32_t* __restrict__ sumq, const int M,
-                       const int K, const int32_t* __restrict__ codes,
-                       const int32_t* __restrict__ code_off,
-                       const uint8_t* __restrict__ blk_params,
-                       const int32_t* __restrict__ param_off,
-                       const half* __restrict__ row_consts,
-                       const uint8_t* __restrict__ row_nbits,
-                       const uint8_t* __restrict__ row_block,
-                       half* __restrict__ out, const int64_t ldo, const int R) {
+    gemv_i8_kernel(const int8_t* __restrict__ xq, const half* __restrict__ sx,
+                   const int32_t* __restrict__ sumq, const int M, const int K,
+                   const int32_t* __restrict__ codes,
+                   const int32_t* __restrict__ code_off,
+                   const uint8_t* __restrict__ blk_params,
+                   const int32_t* __restrict__ param_off,
+                   const half* __restrict__ row_consts,
+                   const uint8_t* __restrict__ row_nbits,
+                   const uint8_t* __restrict__ row_block,
+                   half* __restrict__ out, const int64_t ldo, const int R) {
   const int wave = threadIdx.x / kWave;
   const int lane = threadIdx.x % kWave;
   const int r = blockIdx.x * kRowsPerBlock + wave;
@@ -471,40 +472,39 @@ __global__ void __launch_bounds__(kThreads)
 
 #else  // non-RDNA2 device pass: empty kernels for symbol parity.
 
-__global__ void hi2_act_quant_kernel(const half*, const int64_t, const half*,
-                                     const uint8_t*, int8_t*, half*, int32_t*,
-                                     const int, const int) {}
+__global__ void act_quant_kernel(const half*, const int64_t, const half*,
+                                 const uint8_t*, int8_t*, half*, int32_t*,
+                                 const int, const int) {}
 template <int MT>
-__global__ void hi2_gemv_i8_kernel(const int8_t*, const half*, const int32_t*,
-                                   const int, const int, const int32_t*,
-                                   const int32_t*, const uint8_t*,
-                                   const int32_t*, const half*, const uint8_t*,
-                                   const uint8_t*, half*, const int64_t,
-                                   const int) {}
+__global__ void gemv_i8_kernel(const int8_t*, const half*, const int32_t*,
+                               const int, const int, const int32_t*,
+                               const int32_t*, const uint8_t*, const int32_t*,
+                               const half*, const uint8_t*, const uint8_t*,
+                               half*, const int64_t, const int) {}
 
-__global__ void hi2_act_transform_kernel(const half*, const int64_t,
-                                         const half*, const uint8_t*, half*,
-                                         const int, const int) {}
+__global__ void act_transform_kernel(const half*, const int64_t, const half*,
+                                     const uint8_t*, half*, const int,
+                                     const int) {}
 template <int MT>
-__global__ void hi2_gemv_kernel(const half*, const int, const int,
-                                const int32_t*, const int32_t*, const uint8_t*,
-                                const int32_t*, const half*, const uint8_t*,
-                                const uint8_t*, half*, const int64_t,
-                                const int) {}
-__global__ void hi2_dequant_kernel(const int32_t*, const int32_t*,
-                                   const uint8_t*, const int32_t*, const half*,
-                                   const uint8_t*, const uint8_t*, half*,
-                                   const int) {}
+__global__ void gemv_kernel(const half*, const int, const int, const int32_t*,
+                            const int32_t*, const uint8_t*, const int32_t*,
+                            const half*, const uint8_t*, const uint8_t*, half*,
+                            const int64_t, const int) {}
+__global__ void dequant_kernel(const int32_t*, const int32_t*, const uint8_t*,
+                               const int32_t*, const half*, const uint8_t*,
+                               const uint8_t*, half*, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
-}  // namespace hi2
+}  // namespace rdna_hint_flex
 }  // namespace vllm
 
 // ---------------------------------------------------------------------------
 // Host side.
 // ---------------------------------------------------------------------------
 namespace {
+
+namespace hf = vllm::rdna_hint_flex;
 
 struct Hi2Weight {
   const torch::Tensor& codes;
@@ -539,8 +539,7 @@ int64_t check_weight(const Hi2Weight& w) {
   TORCH_CHECK(w.code_off.numel() == R + 1 && w.param_off.numel() == R + 1,
               "hi2: code_off/param_off must have R+1 entries");
   TORCH_CHECK(w.row_consts.numel() == 3 * R, "hi2: row_consts must be [R, 3]");
-  TORCH_CHECK(R < (int64_t{1} << 31) / vllm::hi2::kRowsPerBlock,
-              "hi2: too many rows");
+  TORCH_CHECK(R < (int64_t{1} << 31) / hf::kRowsPerBlock, "hi2: too many rows");
   return R;
 }
 
@@ -564,13 +563,12 @@ void launch_transform(const torch::Tensor& x, const torch::Tensor& col_scale,
     s = reinterpret_cast<const half*>(col_scale.data_ptr());
   }
   check_dev(had, "had", torch::kUInt8);
-  TORCH_CHECK(had.numel() == K / vllm::hi2::kGroup,
-              "hi2: had must have K/16 entries");
-  const int64_t n = M * (K / vllm::hi2::kGroup);
+  TORCH_CHECK(had.numel() == K / hf::kGroup, "hi2: had must have K/16 entries");
+  const int64_t n = M * (K / hf::kGroup);
   if (n == 0) return;
   const int threads = 256;
   const int64_t blocks = (n + threads - 1) / threads;
-  vllm::hi2::hi2_act_transform_kernel<<<blocks, threads, 0, stream>>>(
+  hf::act_transform_kernel<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<const half*>(x.data_ptr()), x.stride(0), s,
       had.data_ptr<uint8_t>(), reinterpret_cast<half*>(y.data_ptr()),
       static_cast<int>(M), static_cast<int>(K));
@@ -581,9 +579,8 @@ template <int MT>
 void launch_gemv_mt(const torch::Tensor& x, const Hi2Weight& w,
                     torch::Tensor& out, int64_t R, cudaStream_t stream) {
   const int64_t M = x.size(0), K = x.size(1);
-  dim3 grid((R + vllm::hi2::kRowsPerBlock - 1) / vllm::hi2::kRowsPerBlock,
-            (M + MT - 1) / MT);
-  vllm::hi2::hi2_gemv_kernel<MT><<<grid, vllm::hi2::kThreads, 0, stream>>>(
+  dim3 grid((R + hf::kRowsPerBlock - 1) / hf::kRowsPerBlock, (M + MT - 1) / MT);
+  hf::gemv_kernel<MT><<<grid, hf::kThreads, 0, stream>>>(
       reinterpret_cast<const half*>(x.data_ptr()), static_cast<int>(M),
       static_cast<int>(K), w.codes.data_ptr<int32_t>(),
       w.code_off.data_ptr<int32_t>(), w.blk_params.data_ptr<uint8_t>(),
@@ -616,10 +613,10 @@ void launch_dequant(const Hi2Weight& w, torch::Tensor& out, int64_t R,
   if (R == 0) return;
   // Enough y-blocks that each thread decodes a handful of words.
   const int64_t max_words = K / 4;  // INT8 rows have the most words
-  const int64_t ny = std::max<int64_t>(
-      1, (max_words + vllm::hi2::kThreads - 1) / vllm::hi2::kThreads);
+  const int64_t ny =
+      std::max<int64_t>(1, (max_words + hf::kThreads - 1) / hf::kThreads);
   dim3 grid(static_cast<unsigned>(R), static_cast<unsigned>(ny));
-  vllm::hi2::hi2_dequant_kernel<<<grid, vllm::hi2::kThreads, 0, stream>>>(
+  hf::dequant_kernel<<<grid, hf::kThreads, 0, stream>>>(
       w.codes.data_ptr<int32_t>(), w.code_off.data_ptr<int32_t>(),
       w.blk_params.data_ptr<uint8_t>(), w.param_off.data_ptr<int32_t>(),
       reinterpret_cast<const half*>(w.row_consts.data_ptr()),
@@ -643,18 +640,17 @@ void launch_act_quant(const torch::Tensor& x, const torch::Tensor& col_scale,
       s = reinterpret_cast<const half*>(col_scale.data_ptr());
     }
     check_dev(had, "had", torch::kUInt8);
-    TORCH_CHECK(had.numel() == K / vllm::hi2::kGroup,
+    TORCH_CHECK(had.numel() == K / hf::kGroup,
                 "hi2: had must have K/16 entries");
     h = had.data_ptr<uint8_t>();
   }
-  const int64_t n = M * (K / vllm::hi2::kGroup);
+  const int64_t n = M * (K / hf::kGroup);
   if (n == 0) return;
   const int threads = 256;
-  vllm::hi2::
-      hi2_act_quant_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
-          reinterpret_cast<const half*>(x.data_ptr()), x.stride(0), s, h,
-          xq.data_ptr<int8_t>(), reinterpret_cast<half*>(sx.data_ptr()),
-          sumq.data_ptr<int32_t>(), static_cast<int>(M), static_cast<int>(K));
+  hf::act_quant_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+      reinterpret_cast<const half*>(x.data_ptr()), x.stride(0), s, h,
+      xq.data_ptr<int8_t>(), reinterpret_cast<half*>(sx.data_ptr()),
+      sumq.data_ptr<int32_t>(), static_cast<int>(M), static_cast<int>(K));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -663,9 +659,8 @@ void launch_gemv_i8_mt(const torch::Tensor& xq, const torch::Tensor& sx,
                        const torch::Tensor& sumq, const Hi2Weight& w,
                        torch::Tensor& out, int64_t R, cudaStream_t stream) {
   const int64_t M = xq.size(0), K = xq.size(1);
-  dim3 grid((R + vllm::hi2::kRowsPerBlock - 1) / vllm::hi2::kRowsPerBlock,
-            (M + MT - 1) / MT);
-  vllm::hi2::hi2_gemv_i8_kernel<MT><<<grid, vllm::hi2::kThreads, 0, stream>>>(
+  dim3 grid((R + hf::kRowsPerBlock - 1) / hf::kRowsPerBlock, (M + MT - 1) / MT);
+  hf::gemv_i8_kernel<MT><<<grid, hf::kThreads, 0, stream>>>(
       xq.data_ptr<int8_t>(), reinterpret_cast<const half*>(sx.data_ptr()),
       sumq.data_ptr<int32_t>(), static_cast<int>(M), static_cast<int>(K),
       w.codes.data_ptr<int32_t>(), w.code_off.data_ptr<int32_t>(),
@@ -696,8 +691,9 @@ void launch_gemv_i8(const torch::Tensor& xq, const torch::Tensor& sx,
 }  // namespace
 
 // x [M, K] fp16 -> out [M, K] fp16 = H16(x / s) on flagged groups.
-void hi2_act_transform_rdna2(torch::Tensor x, torch::Tensor col_scale,
-                             torch::Tensor had, torch::Tensor out) {
+void rdna_hint_flex_act_transform_rdna2(torch::Tensor x,
+                                        torch::Tensor col_scale,
+                                        torch::Tensor had, torch::Tensor out) {
   check_act(x, x.size(1));
   check_dev(out, "out", torch::kHalf);
   TORCH_CHECK(out.sizes() == x.sizes(), "hi2: out must match x");
@@ -708,11 +704,12 @@ void hi2_act_transform_rdna2(torch::Tensor x, torch::Tensor col_scale,
 
 // x [M, K] fp16 (already transformed) -> out [M, R] fp16 (written, not
 // accumulated; out may be a row-strided view with unit column stride).
-void hi2_gemv_rdna2(torch::Tensor x, torch::Tensor codes,
-                    torch::Tensor code_off, torch::Tensor blk_params,
-                    torch::Tensor param_off, torch::Tensor row_consts,
-                    torch::Tensor row_nbits, torch::Tensor row_block,
-                    torch::Tensor out) {
+void rdna_hint_flex_gemv_rdna2(torch::Tensor x, torch::Tensor codes,
+                               torch::Tensor code_off, torch::Tensor blk_params,
+                               torch::Tensor param_off,
+                               torch::Tensor row_consts,
+                               torch::Tensor row_nbits, torch::Tensor row_block,
+                               torch::Tensor out) {
   const Hi2Weight w{codes,      code_off,  blk_params, param_off,
                     row_consts, row_nbits, row_block};
   const int64_t R = check_weight(w);
@@ -727,10 +724,12 @@ void hi2_gemv_rdna2(torch::Tensor x, torch::Tensor codes,
 }
 
 // Stored-basis reconstruction W [R, K] fp16.
-void hi2_dequant_rdna2(torch::Tensor codes, torch::Tensor code_off,
-                       torch::Tensor blk_params, torch::Tensor param_off,
-                       torch::Tensor row_consts, torch::Tensor row_nbits,
-                       torch::Tensor row_block, torch::Tensor out) {
+void rdna_hint_flex_dequant_rdna2(torch::Tensor codes, torch::Tensor code_off,
+                                  torch::Tensor blk_params,
+                                  torch::Tensor param_off,
+                                  torch::Tensor row_consts,
+                                  torch::Tensor row_nbits,
+                                  torch::Tensor row_block, torch::Tensor out) {
   const Hi2Weight w{codes,      code_off,  blk_params, param_off,
                     row_consts, row_nbits, row_block};
   const int64_t R = check_weight(w);
@@ -743,9 +742,10 @@ void hi2_dequant_rdna2(torch::Tensor codes, torch::Tensor code_off,
 }
 
 // I8 activation quantization (transform included when `transform`).
-void hi2_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
-                         torch::Tensor had, bool transform, torch::Tensor xq,
-                         torch::Tensor sx, torch::Tensor sumq) {
+void rdna_hint_flex_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                                    torch::Tensor had, bool transform,
+                                    torch::Tensor xq, torch::Tensor sx,
+                                    torch::Tensor sumq) {
   check_act(x, x.size(1));
   const int64_t M = x.size(0), K = x.size(1);
   check_dev(xq, "xq", torch::kInt8);
@@ -760,11 +760,11 @@ void hi2_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
 }
 
 // I8 GEMV from a quantized activation -> out [M, R] fp16.
-void hi2_gemv_i8_rdna2(torch::Tensor xq, torch::Tensor sx, torch::Tensor sumq,
-                       torch::Tensor codes, torch::Tensor code_off,
-                       torch::Tensor blk_params, torch::Tensor param_off,
-                       torch::Tensor row_consts, torch::Tensor row_nbits,
-                       torch::Tensor row_block, torch::Tensor out) {
+void rdna_hint_flex_gemv_i8_rdna2(
+    torch::Tensor xq, torch::Tensor sx, torch::Tensor sumq, torch::Tensor codes,
+    torch::Tensor code_off, torch::Tensor blk_params, torch::Tensor param_off,
+    torch::Tensor row_consts, torch::Tensor row_nbits, torch::Tensor row_block,
+    torch::Tensor out) {
   const Hi2Weight w{codes,      code_off,  blk_params, param_off,
                     row_consts, row_nbits, row_block};
   const int64_t R = check_weight(w);
@@ -781,18 +781,16 @@ void hi2_gemv_i8_rdna2(torch::Tensor xq, torch::Tensor sx, torch::Tensor sumq,
   launch_gemv_i8(xq, sx, sumq, w, out, R, stream);
 }
 
-// y = x . W^T for an HI2 tensor (transform included when `transform`).
-// mode 0 (F16): M <= decode_max_m runs the F16 GEMV, otherwise dequant +
-// rocBLAS GEMM. mode 1 (I8 decode): M <= decode_max_m runs the I8 path,
-// larger M as mode 0. mode 2 (I8 everywhere): the I8 path for every M.
-torch::Tensor hi2_linear_rdna2(torch::Tensor x, torch::Tensor col_scale,
-                               torch::Tensor had, torch::Tensor codes,
-                               torch::Tensor code_off, torch::Tensor blk_params,
-                               torch::Tensor param_off,
-                               torch::Tensor row_consts,
-                               torch::Tensor row_nbits, torch::Tensor row_block,
-                               bool transform, int64_t decode_max_m,
-                               int64_t mode) {
+// y = x . W^T for an rdna_hint_flex tensor (transform included when
+// `transform`). mode 0 (F16): M <= decode_max_m runs the F16 GEMV, otherwise
+// dequant + rocBLAS GEMM. mode 1 (I8 decode): M <= decode_max_m runs the I8
+// path, larger M as mode 0. mode 2 (I8 everywhere): the I8 path for every M.
+torch::Tensor rdna_hint_flex_linear_rdna2(
+    torch::Tensor x, torch::Tensor col_scale, torch::Tensor had,
+    torch::Tensor codes, torch::Tensor code_off, torch::Tensor blk_params,
+    torch::Tensor param_off, torch::Tensor row_consts, torch::Tensor row_nbits,
+    torch::Tensor row_block, bool transform, int64_t decode_max_m,
+    int64_t mode) {
   const Hi2Weight w{codes,      code_off,  blk_params, param_off,
                     row_consts, row_nbits, row_block};
   const int64_t R = check_weight(w);

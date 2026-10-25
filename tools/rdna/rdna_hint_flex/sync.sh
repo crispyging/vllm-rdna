@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mirror this worktree to the build box (dedicated tree, no --delete).
-#   bash tools/rdna/hi2/sync.sh [build]
+#   bash tools/rdna/rdna_hint_flex/sync.sh [build]
 set -euo pipefail
 TREE=$(cd "$(dirname "$0")/../../.." && pwd)
 DEST=${DEST:-chenco_adm@par1-cs25:/home/chenco_adm/vllm-rdna-hi2/}

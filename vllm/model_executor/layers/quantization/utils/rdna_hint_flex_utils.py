@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host-side helpers for HadamardINT2-FP16 (HI2, spec v3.2) tensors.
+"""Host-side helpers for rdna_hint_flex (HadamardINT2-FP16 spec v3.2) tensors.
 
-An HI2 tensor ``W[R, K]`` is a dict of flat buffers (spec 2.4), keyed by the
+An rdna_hint_flex tensor ``W[R, K]`` is a dict of flat buffers (spec 2.4), keyed by the
 checkpoint field names without the ``hi2_`` prefix:
 
 ==============  =======  ===================================================
@@ -81,18 +81,21 @@ def validate(t: Hi2, k: int | None = None) -> None:
     r = num_rows(t)
     kk = num_cols(t)
     if k is not None and kk != k:
-        raise ValueError(f"HI2 tensor has K={kk}, layer expects K={k}")
+        raise ValueError(f"rdna_hint_flex tensor has K={kk}, layer expects K={k}")
     if kk % K_MULTIPLE:
-        raise ValueError(f"HI2: K={kk} is not a multiple of {K_MULTIPLE}")
+        raise ValueError(f"rdna_hint_flex: K={kk} is not a multiple of {K_MULTIPLE}")
     nb = t["row_nbits"].to(torch.int64)
     bl = t["row_block"].to(torch.int64)
     if t["row_block"].numel() != r or t["row_consts"].shape != (r, 3):
-        raise ValueError("HI2: row_block/row_consts do not have R rows")
+        raise ValueError("rdna_hint_flex: row_block/row_consts do not have R rows")
     if not bool(torch.isin(nb, torch.tensor(NBITS)).all()):
-        raise ValueError(f"HI2: row_nbits outside {NBITS}: {sorted(set(nb.tolist()))}")
+        raise ValueError(
+            f"rdna_hint_flex: row_nbits outside {NBITS}: {sorted(set(nb.tolist()))}"
+        )
     if not bool(torch.isin(bl, torch.tensor(BLOCK_SIZES)).all()):
         raise ValueError(
-            f"HI2: row_block outside {BLOCK_SIZES}: {sorted(set(bl.tolist()))}"
+            f"rdna_hint_flex: row_block outside {BLOCK_SIZES}: "
+            f"{sorted(set(bl.tolist()))}"
         )
     for name, per_row, buf, scale in (
         ("code_off", kk * nb // 32, t["codes"], 1),
@@ -100,13 +103,19 @@ def validate(t: Hi2, k: int | None = None) -> None:
     ):
         off = t[name].to(torch.int64)
         if off.numel() != r + 1 or int(off[0]) != 0:
-            raise ValueError(f"HI2: {name} must have R+1 entries starting at 0")
+            raise ValueError(
+                f"rdna_hint_flex: {name} must have R+1 entries starting at 0"
+            )
         if not torch.equal(off[1:] - off[:-1], per_row):
-            raise ValueError(f"HI2: {name} does not match row_nbits/row_block")
+            raise ValueError(
+                f"rdna_hint_flex: {name} does not match row_nbits/row_block"
+            )
         if int(off[-1]) * scale != buf.numel():
-            raise ValueError(f"HI2: {name}[-1] does not match the buffer length")
+            raise ValueError(
+                f"rdna_hint_flex: {name}[-1] does not match the buffer length"
+            )
     if t.get("col_scale") is not None and t["col_scale"].numel() != kk:
-        raise ValueError("HI2: col_scale must have K entries")
+        raise ValueError("rdna_hint_flex: col_scale must have K entries")
 
 
 def select_rows(t: Hi2, r0: int, r1: int) -> Hi2:
@@ -139,7 +148,7 @@ def concat_rows(parts: list[Hi2]) -> Hi2:
     first = parts[0]
     for p in parts[1:]:
         if num_cols(p) != num_cols(first) or not _same_transform(first, p):
-            raise ValueError("HI2: concat_rows needs equal K and transform")
+            raise ValueError("rdna_hint_flex: concat_rows needs equal K and transform")
     out = dict(first)
     for f, off in (("codes", "code_off"), ("blk_params", "param_off")):
         bases, total = [], 0
@@ -158,7 +167,7 @@ def select_cols(t: Hi2, k0: int, k1: int) -> Hi2:
     Both bounds must be multiples of 64, so no word, block or Hadamard group
     is cut."""
     if k0 % K_MULTIPLE or k1 % K_MULTIPLE or not 0 <= k0 < k1 <= num_cols(t):
-        raise ValueError(f"HI2: column slice [{k0}, {k1}) is not 64-aligned")
+        raise ValueError(f"rdna_hint_flex: column slice [{k0}, {k1}) is not 64-aligned")
     r = num_rows(t)
     nb = t["row_nbits"].to(torch.int64)
     bl = t["row_block"].to(torch.int64)

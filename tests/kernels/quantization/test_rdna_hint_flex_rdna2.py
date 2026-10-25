@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HadamardINT2-FP16 (HI2, spec v3.2) weight support.
+"""rdna_hint_flex (HadamardINT2-FP16 spec v3.2) weight support.
 
 The reference below is a port of ``tools/hi2/hi2/format.py`` (the quantizer's
 ground truth for the bit layout): LSB-first word-aligned code packing, the
@@ -9,16 +9,16 @@ order-16 Walsh-Hadamard on flagged groups, the smoothing vector, and
 ``reference_linear`` in float64.
 
 CPU tests (run anywhere): the host helpers in
-``vllm/model_executor/layers/quantization/utils/hi2_utils.py`` (dequantize,
+``vllm/model_executor/layers/quantization/utils/rdna_hint_flex_utils.py`` (dequantize,
 row/column slicing for tensor parallelism, concatenation for fused layers,
 validation, the dequantized fallback) against the reference.
 
-GPU tests (gfx1030 with the ``_rocm_C`` HI2 ops): the dequant kernel is
+GPU tests (gfx1030 with the ``_rocm_C`` rdna_hint_flex ops): the dequant kernel is
 bit-exact against the reference decode; the activation transform and the
-GEMV (decode) and dequant+GEMM (prefill) paths of ``hi2_linear_rdna2`` match
+GEMV (decode) and dequant+GEMM (prefill) paths of ``rdna_hint_flex_linear_rdna2`` match
 ``reference_linear`` to fp16 accuracy.
 
-Run ``pytest tests/kernels/quantization/test_hi2_rdna2.py``.
+Run ``pytest tests/kernels/quantization/test_rdna_hint_flex_rdna2.py``.
 """
 
 import math
@@ -26,7 +26,7 @@ import math
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization.utils import hi2_utils as hu
+from vllm.model_executor.layers.quantization.utils import rdna_hint_flex_utils as hu
 
 GROUP = 16
 
@@ -98,7 +98,7 @@ def ref_linear(x: torch.Tensor, t: dict) -> torch.Tensor:
     return ref_fwht_groups(xd, t["had"]) @ ref_dequantize_stored(t).T
 
 
-# ---- random HI2 tensors ---------------------------------------------------
+# ---- random rdna_hint_flex tensors ---------------------------------------------------
 def make_hi2(
     r: int,
     k: int,
@@ -221,19 +221,21 @@ def test_config_module_selection():
         QUANTIZATION_METHODS,
         get_quantization_config,
     )
-    from vllm.model_executor.layers.quantization.hi2 import HadamardInt2Config
-    from vllm.model_executor.layers.quantization.hi2_names import (
-        HI2_QUANT_METHOD,
-        HI2_QUANT_METHOD_NAMES,
+    from vllm.model_executor.layers.quantization.rdna_hint_flex import (
+        RdnaHintFlexConfig,
+    )
+    from vllm.model_executor.layers.quantization.rdna_hint_flex_names import (
+        RDNA_HINT_FLEX_QUANT_METHOD,
+        RDNA_HINT_FLEX_QUANT_METHOD_NAMES,
     )
 
-    for name in HI2_QUANT_METHOD_NAMES:
+    for name in RDNA_HINT_FLEX_QUANT_METHOD_NAMES:
         assert name in QUANTIZATION_METHODS
-        assert get_quantization_config(name) is HadamardInt2Config
-    cfg = HadamardInt2Config.from_config(
-        {"quant_method": HI2_QUANT_METHOD, "version": "3.2", "mode": "flex"}
+        assert get_quantization_config(name) is RdnaHintFlexConfig
+    cfg = RdnaHintFlexConfig.from_config(
+        {"quant_method": RDNA_HINT_FLEX_QUANT_METHOD, "version": "3.2", "mode": "flex"}
     )
-    assert cfg.get_name() == HI2_QUANT_METHOD
+    assert cfg.get_name() == RDNA_HINT_FLEX_QUANT_METHOD
     names = []
     for m in ("q_proj", "k_proj", "v_proj"):
         base = f"model.language_model.layers.0.self_attn.{m}"
@@ -245,7 +247,7 @@ def test_config_module_selection():
     assert all(f is not None and "col_scale" in f for f in fields)
     assert cfg._module_fields("visual.blocks.0.attn.qkv") == [None]
     with pytest.raises(ValueError):
-        HadamardInt2Config(version="3.1")
+        RdnaHintFlexConfig(version="3.1")
 
 
 # ---- CPU: I8 compute mode reference (spec 6.2) ----------------------------
@@ -277,12 +279,12 @@ def _kernels_available() -> bool:
     return (
         on_gfx10x()
         and hasattr(torch.ops, "_rocm_C")
-        and hasattr(torch.ops._rocm_C, "hi2_linear_rdna2")
+        and hasattr(torch.ops._rocm_C, "rdna_hint_flex_linear_rdna2")
     )
 
 
 gfx1030_only = pytest.mark.skipif(
-    not _kernels_available(), reason="needs gfx1030 and the _rocm_C HI2 ops"
+    not _kernels_available(), reason="needs gfx1030 and the _rocm_C rdna_hint_flex ops"
 )
 
 
@@ -298,7 +300,7 @@ def _dev(t: dict) -> dict:
 def _linear(x: torch.Tensor, d: dict, transform: bool, max_m: int = 8, mode: int = 0):
     from vllm import _custom_ops as ops
 
-    return ops.hi2_linear_rdna2(
+    return ops.rdna_hint_flex_linear_rdna2(
         x,
         d["col_scale"],
         d["had"],
@@ -323,7 +325,7 @@ def test_dequant_kernel_bit_exact(seed):
     t = make_hi2(72, 512, seed=seed)
     d = _dev(t)
     out = torch.empty(72, 512, dtype=torch.float16, device="cuda")
-    ops.hi2_dequant_rdna2(
+    ops.rdna_hint_flex_dequant_rdna2(
         d["codes"],
         d["code_off"],
         d["blk_params"],
@@ -347,7 +349,7 @@ def test_act_transform_kernel(smooth, had):
     d = _dev(t)
     x = torch.randn(6, 1024, dtype=torch.float16)
     out = torch.empty(6, 1024, dtype=torch.float16, device="cuda")
-    ops.hi2_act_transform_rdna2(x.cuda(), d["col_scale"], d["had"], out)
+    ops.rdna_hint_flex_act_transform_rdna2(x.cuda(), d["col_scale"], d["had"], out)
     xd = x.double()
     if smooth:
         xd = xd / t["col_scale"].double()
@@ -401,7 +403,7 @@ def test_gemv_strided_output():
     x = torch.randn(3, 512, dtype=torch.float16)
     big = torch.zeros(3, 100, dtype=torch.float16, device="cuda")
     out = big[:, 20:84]
-    ops.hi2_gemv_rdna2(
+    ops.rdna_hint_flex_gemv_rdna2(
         x.cuda(),
         d["codes"],
         d["code_off"],
@@ -432,7 +434,9 @@ def test_act_quant_kernel_bit_exact(had, smooth):
     sx = torch.empty(7, 128, dtype=torch.float16, device="cuda")
     sumq = torch.empty(7, 128, dtype=torch.int32, device="cuda")
     tr = hu.needs_transform(t)
-    ops.hi2_act_quant_rdna2(x.cuda(), d["col_scale"], d["had"], tr, xq, sx, sumq)
+    ops.rdna_hint_flex_act_quant_rdna2(
+        x.cuda(), d["col_scale"], d["had"], tr, xq, sx, sumq
+    )
     torch.accelerator.synchronize()
     rq, rs, rsum = hu.act_quant_i8(x, t, tr)
     assert torch.equal(sx.cpu(), rs)

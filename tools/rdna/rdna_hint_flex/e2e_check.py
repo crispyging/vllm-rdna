@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end check of an HI2 checkpoint in vLLM against its dense export.
+"""End-to-end check of an rdna_hint_flex checkpoint in vLLM against its dense export.
 
-Run once on the HI2 checkpoint and once on ``hi2 export-dense`` of it (same
+Run once on the rdna_hint_flex checkpoint and once on ``hi2 export-dense`` of it (same
 weights, dequantized to fp16), then ``--compare`` the two JSON files:
 
 * teacher-forced prompt log-probabilities on a fixed text (mean NLL and the
-  per-token gap): the HI2 kernels should reproduce the dense model almost
+  per-token gap): the rdna_hint_flex kernels should reproduce the dense model almost
   exactly, since only the fp16 rounding of the transformed activation differs;
 * greedy continuations of a few prompts (coherence, first divergence).
 
-  python tools/rdna/hi2/e2e_check.py --model <dir> --out a.json [--eager]
-  python tools/rdna/hi2/e2e_check.py --compare a.json b.json
+  python tools/rdna/rdna_hint_flex/e2e_check.py --model <dir> --out a.json [--eager]
+  python tools/rdna/rdna_hint_flex/e2e_check.py --compare a.json b.json
 """
 
 import argparse

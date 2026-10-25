@@ -1,9 +1,16 @@
-# HI2 (HadamardINT2-FP16 v3.2) weights on RDNA2
+# rdna_hint_flex weights on RDNA2 (HadamardINT2-FP16 spec v3.2)
 
-`quant_method: hadamard_int2` loads checkpoints written by the separate
+`quant_method: rdna_hint_flex` (alias `hadamard_int2`) loads checkpoints written by the separate
 `tools/hi2` quantizer (spec: `docs/rdna2/hadamard-int2-v3.2-spec.md` on the
 `feat/hadamard-int2-weights` branch). This page covers the vLLM side: the
 loader, the gfx1030 kernels, and how they were checked.
+
+## Name
+
+The canonical `quant_method` is `rdna_hint_flex`; `hadamard_int2` (the name
+the first quantizer releases write) is an accepted alias. Both live in
+`vllm/model_executor/layers/quantization/rdna_hint_flex_names.py`, the only
+place to change them. The checkpoint tensor prefix stays `hi2_`.
 
 ## Format, as read
 
@@ -26,19 +33,19 @@ Decode (spec 2.2): `lo = fp16(fma_f32(lo_u8, lo_scale, lo_min))`,
 `step = fp16(step_u8 * step_scale)`, `w = fp16(lo + code * step)`. The stored
 basis is `H (W * s)`, so `y = H(x / s) . W_stored^T` (spec 2.3).
 
-Which modules are HI2 is read from the checkpoint index: a module stored as
-`.hi2_*` is HI2, one stored as `.weight` stays dense (vision tower, embeddings,
+Which modules are rdna_hint_flex is read from the checkpoint index: a module stored as
+`.hi2_*` is rdna_hint_flex, one stored as `.weight` stays dense (vision tower, embeddings,
 head, GDN `conv1d`, ...). No module list is needed in `quantization_config`.
 
 ## Files
 
 | file | content |
 | --- | --- |
-| `csrc/rocm/hi2_rdna2.cu` | kernels and host wrappers (gfx1030 build only) |
-| `vllm/model_executor/layers/quantization/hi2.py` | `HadamardInt2Config`, `HadamardInt2LinearMethod` |
-| `vllm/model_executor/layers/quantization/utils/hi2_utils.py` | host helpers: validate, slice rows/columns, concatenate, pure-PyTorch dequantize and activation transform |
-| `tests/kernels/quantization/test_hi2_rdna2.py` | reference port of `tools/hi2/hi2/format.py`, CPU and gfx1030 tests |
-| `tools/rdna/hi2/` | in-tree env, test runner, end-to-end check, kernel timing |
+| `csrc/rocm/rdna_hint_flex_rdna2.cu` | kernels and host wrappers (gfx1030 build only) |
+| `vllm/model_executor/layers/quantization/hi2.py` | `RdnaHintFlexConfig`, `RdnaHintFlexLinearMethod` |
+| `vllm/model_executor/layers/quantization/utils/rdna_hint_flex_utils.py` | host helpers: validate, slice rows/columns, concatenate, pure-PyTorch dequantize and activation transform |
+| `tests/kernels/quantization/test_rdna_hint_flex_rdna2.py` | reference port of `tools/hi2/hi2/format.py`, CPU and gfx1030 tests |
+| `tools/rdna/rdna_hint_flex/` | in-tree env, test runner, end-to-end check, kernel timing |
 
 Outside the new files: the op declarations (`csrc/rocm/ops.h`), their
 registration inside the `VLLM_ROCM_GFX1030` block of
@@ -49,17 +56,17 @@ Nothing in `fa_rdna2` or the attention backends changed.
 
 ## Kernels (F16 mode, spec 6.1)
 
-* `hi2_act_transform_rdna2`: `x' = H16(x / s)` on the flagged groups, fp32
+* `rdna_hint_flex_act_transform_rdna2`: `x' = H16(x / s)` on the flagged groups, fp32
   math, one rounding to fp16. One thread per (token, group).
-* `hi2_gemv_rdna2` (decode): one wave32 per output row, lanes stride over
+* `rdna_hint_flex_gemv_rdna2` (decode): one wave32 per output row, lanes stride over
   the row's words, so the weight stream is coalesced. A word never crosses a
   block, so each word decodes one `lo`/`step` pair; codes become fp16 through
   `half(0x6400 | c) - 1024` (exact up to 1023, so INT8 rows work too), then one
   `v_pk_fma_f16` and `v_dot2_f32_f16` against `x'`, fp32 accumulation and a
   wave reduction. The row's width is wave-uniform, so mixed INT2/INT4/INT8
   rows do not diverge. Up to 8 tokens per launch row tile.
-* `hi2_dequant_rdna2`: stored-basis fp16 `W [R, K]`.
-* `hi2_linear_rdna2`: transform, then GEMV for `M <= 8`, otherwise dequant
+* `rdna_hint_flex_dequant_rdna2`: stored-basis fp16 `W [R, K]`.
+* `rdna_hint_flex_linear_rdna2`: transform, then GEMV for `M <= 8`, otherwise dequant
   into a scratch buffer and a rocBLAS GEMM (the simple prefill path). The
   choice happens inside the op at execution time, so torch.compile cannot fix
   it to the warmup shape.
@@ -87,16 +94,16 @@ Activations must be fp16 (`--dtype float16`): RDNA2 has no bf16 dot.
 
 ## Checks
 
-Unit tests (`bash tools/rdna/hi2/run_tests.sh <hip_device>`): 133 pass on a
+Unit tests (`bash tools/rdna/rdna_hint_flex/run_tests.sh <hip_device>`): 133 pass on a
 V620. The dequant kernel is bit-identical to the reference decode for mixed
-INT2/INT4/INT8 rows and blocks 16/32/64; `hi2_linear_rdna2` matches
+INT2/INT4/INT8 rows and blocks 16/32/64; `rdna_hint_flex_linear_rdna2` matches
 `reference_linear` (float64) within 2e-3 relative error for M = 1..37 with
 and without smoothing and rotation; the GEMV and GEMM paths agree.
 
-End to end (`tools/rdna/hi2/e2e_check.py`, HI2 checkpoint against its
+End to end (`tools/rdna/rdna_hint_flex/e2e_check.py`, rdna_hint_flex checkpoint against its
 `hi2 export-dense`, greedy, fp16, one V620):
 
-| model (3.0 bpw, sens) | mode | teacher-forced ppl HI2 / dense | greedy tokens identical | weights in GPU memory HI2 / dense |
+| model (3.0 bpw, sens) | mode | teacher-forced ppl rdna_hint_flex / dense | greedy tokens identical | weights in GPU memory rdna_hint_flex / dense |
 | --- | --- | --- | --- | --- |
 | Qwen2.5-0.5B-Instruct | eager | 24.454 / 24.471 | 4 of 4 prompts, 48/48 | 0.39 / 0.93 GiB |
 | Qwen2.5-0.5B-Instruct | compile + FULL_AND_PIECEWISE | 24.457 / 24.471 | 4 of 4, 48/48 | 0.39 GiB |
@@ -108,13 +115,13 @@ Per-token log-probability gap to the dense export: mean 0.003 to 0.005, max
 activation and of the dense export's original-basis weights.
 
 Serving throughput has not been measured. A kernel-only timing is in
-`tools/rdna/hi2/bench_kernel.py` (decode GEMV at M=1 streams HI2 bytes at
+`tools/rdna/rdna_hint_flex/bench_kernel.py` (decode GEMV at M=1 streams rdna_hint_flex bytes at
 300 to 470 GB/s on a V620; the prefill path is untuned).
 
 ## Not done
 
 * I8 compute mode (spec 6.2, `v_dot4_i32_i8` with int8 activations).
-* HI2 MoE experts (only `LinearBase` layers are handled).
+* rdna_hint_flex MoE experts (only `LinearBase` layers are handled).
 * Tensor parallelism is implemented and unit-tested on the host (row and
   column slicing), but not run on GPUs.
 * Kernel tuning: the GEMV time grows about linearly with M (each wave handles

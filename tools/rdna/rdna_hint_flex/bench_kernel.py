@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kernel-level timing of hi2_linear_rdna2 against a dense fp16 F.linear of
-the same shape (random HI2 tensors, ~30% INT4 rows, mixed blocks). This is a
+"""Kernel-level timing of rdna_hint_flex_linear_rdna2 against a dense fp16 F.linear of
+the same shape (random rdna_hint_flex tensors, ~30% INT4 rows, mixed blocks). This is a
 kernel microbenchmark, not a serving benchmark.
 
-  python tools/rdna/hi2/bench_kernel.py
+  python tools/rdna/rdna_hint_flex/bench_kernel.py
 """
 
 import functools
@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.utils import hi2_utils as hu
+from vllm.model_executor.layers.quantization.utils import rdna_hint_flex_utils as hu
 
 SHAPES = {  # Qwen3.5-4B projections (R, K)
     "gate_up": (2 * 9216, 2560),
@@ -73,11 +73,11 @@ def main() -> None:
                 d["blk_params"], d["param_off"], d["row_consts"],
                 d["row_nbits"], d["row_block"], True, 8,
             )  # fmt: skip
-            t_q = timeit(functools.partial(ops.hi2_linear_rdna2, *args))
+            t_q = timeit(functools.partial(ops.rdna_hint_flex_linear_rdna2, *args))
             t_d = timeit(functools.partial(F.linear, x, w))
             print(
                 f"{name:13s} R={r:6d} K={k:5d} M={m:3d}  hi2 {t_q:8.1f} us "
-                f"({qbytes / t_q / 1e3:6.1f} GB/s of HI2 bytes)  dense fp16 "
+                f"({qbytes / t_q / 1e3:6.1f} GB/s of rdna_hint_flex bytes)  dense fp16 "
                 f"{t_d:8.1f} us ({r * k * 2 / t_d / 1e3:6.1f} GB/s)"
             )
 

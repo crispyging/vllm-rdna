@@ -655,7 +655,7 @@ class RocmPlatform(Platform):
         "online",
         "gpt_oss_mxfp4",
         "exl3",
-        # HI2 names are appended by the quantization registry (hi2_names.py).
+        # rdna_hint_flex names: appended by the quantization registry.
     ]
 
     @classmethod

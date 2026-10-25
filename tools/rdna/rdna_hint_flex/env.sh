@@ -2,7 +2,7 @@
 # Environment for running this tree (built in place with
 # tools/rdna/mono/build_tree.sh) against the shared venv without touching its
 # editable install: PYTHONPATH points at this tree.
-#   source tools/rdna/hi2/env.sh <hip_device>
+#   source tools/rdna/rdna_hint_flex/env.sh <hip_device>
 TREE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 VENV=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.31.0-final}
 SP=$VENV/lib/python3.12/site-packages
