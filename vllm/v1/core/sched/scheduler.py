@@ -439,6 +439,30 @@ class Scheduler(SchedulerInterface):
                 self.block_size,
                 self.hash_block_size,
             )
+            # A prefill chunk ends on a mamba state block boundary, so a
+            # scheduler step carries whole blocks. With a per-step budget of
+            # one block only one request is prefilled per step, and every
+            # block additionally costs a near-empty re-alignment step, so a
+            # long prompt at concurrency drains at half the rate (gfx1030,
+            # 27B AWQ, 16k x c=8: 42.2 tok/s and 50.7 s TTFT at block 1024
+            # vs 37.4 tok/s and 103.3 s at block 2048, with the per-token
+            # prefill cost unchanged). Two blocks per step restores parity.
+            # Say so loudly: the symptom reads like a kernel regression.
+            budget = self.scheduler_config.max_num_batched_tokens
+            if (
+                self.need_mamba_block_aligned_split
+                and self.mamba_state_block_size
+                and budget < 2 * self.mamba_state_block_size
+            ):
+                logger.warning(
+                    "max_num_batched_tokens=%d cannot cover two mamba state "
+                    "blocks of %d tokens: the block-aligned prefill split "
+                    "will prefill one request per step. Raise "
+                    "--max-num-batched-tokens to at least %d.",
+                    budget,
+                    self.mamba_state_block_size,
+                    2 * self.mamba_state_block_size,
+                )
         # TODO: Support models with multiple Mamba specs that require different
         # prefill checkpoint alignments instead of selecting the first one.
         self.mamba_prefill_checkpoint_alignment = next(

@@ -359,6 +359,19 @@ def main():
         "pick the attention block size.",
     )
     parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="max_num_batched_tokens for the server. The default follows the "
+        "attention block size the hybrid page alignment will pick: 2048 for "
+        "an FP16 KV cache (block 1024), 4096 for a packed KV cache with an "
+        "FP16 SSM state (block 2048), 6144 for a packed KV cache with the "
+        "model's own FP32 SSM state (block 3072). A prefill chunk ends on a "
+        "mamba state block boundary, so the budget must cover two blocks for "
+        "two requests to be prefilled per scheduler step; at one block per "
+        "step the long-prompt prefill drains at half the rate.",
+    )
+    parser.add_argument(
         "--gpus", default=GPUS, help="Comma-separated HIP device indices for this arm."
     )
     parser.add_argument(
@@ -367,6 +380,18 @@ def main():
         help="Execute only after source/build/layout gates pass",
     )
     args = parser.parse_args()
+    if args.max_num_batched_tokens is None:
+        # Two mamba state blocks per scheduler step, so two requests are
+        # prefilled per step. The block size the hybrid page alignment picks
+        # follows the KV cache page: a packed KV cache has a smaller
+        # attention page, so the block grows until the page covers the mamba
+        # state page (2048 with an FP16 SSM state, 3072 with FP32).
+        if args.cache_dtype == "auto":
+            args.max_num_batched_tokens = 2048
+        elif args.mamba_ssm_cache_dtype == "float16":
+            args.max_num_batched_tokens = 4096
+        else:
+            args.max_num_batched_tokens = 6144
     gpus = args.gpus
     assert os.environ.get("HIP_VISIBLE_DEVICES") == gpus, (
         f"HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES')!r} "
@@ -418,7 +443,7 @@ def main():
         "MTP=2",
         "SEQS=8",
         f"MAXLEN={args.max_model_len}",
-        "MAXBAT=2048",
+        f"MAXBAT={args.max_num_batched_tokens}",
         f"KV={args.kv_bytes}",
         f"BLOCK_SIZE={args.block_size}",
         f"GPU_MAX_HW_QUEUES={args.hw_queues}",
@@ -578,6 +603,25 @@ def main():
         assert re.search(r"[Cc]aptur", text), "graph capture not evidenced"
         if args.cache_dtype != "auto":
             assert args.cache_dtype in text, "packed dtype not evidenced"
+        # The mamba block-aligned prefill split ends every prefill chunk on a
+        # mamba state block boundary, so a scheduler step carries whole blocks.
+        # With a per-step budget of one block only one request is prefilled
+        # per step and the long-prompt prefill drains at half the rate
+        # (gfx1030, 27B AWQ, 16k x c=8: 42.2 -> 37.4 tok/s, TTFT 50.7 ->
+        # 103.3 s at block 2048, per-token prefill cost unchanged). Refuse
+        # an arm that cannot cover two blocks: it would look like a kernel
+        # regression rather than a scheduling cliff.
+        state_block = re.search(r"state_block=(\d+)", text)
+        scheduled = re.search(r"max_num_scheduled_tokens is set to (\d+)", text)
+        assert state_block and scheduled, "mamba state block size not evidenced"
+        state_block = int(state_block.group(1))
+        scheduled = int(scheduled.group(1))
+        assert scheduled >= 2 * state_block, (
+            f"max_num_scheduled_tokens={scheduled} cannot cover two mamba "
+            f"state blocks of {state_block} tokens; the block-aligned prefill "
+            f"split would prefill one request per step. Raise "
+            f"--max-num-batched-tokens to at least {2 * state_block}."
+        )
         for name, script, extra in (
             ("greedy", "tools/probe_greedy_correctness.py", ["--max-tokens", "48"]),
             ("ppl", "tools/rdna/port_v031/ppl_probe.py", ["--max-ppl", "6"]),
