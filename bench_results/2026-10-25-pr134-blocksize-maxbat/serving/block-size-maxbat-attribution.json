@@ -1,0 +1,190 @@
+{
+  "question": "Why did the INT4 KV cache lose ~12% of its 16k x c=8 throughput against the FP16 KV cache, and what fixes it?",
+  "answer": "Not the INT4 format and not the KV cache capacity: the attention block size. The hybrid mamba/attention page unification sets the attention block size equal to the mamba state block size, and a packed KV cache has a smaller attention page, so the block grows until its page covers the mamba state page (1024 tokens for FP16 KV, 2048 with an FP16 SSM state, 3072 with the model's own FP32). The mamba block-aligned prefill split ends every prefill chunk on a mamba state block boundary, so a scheduler step carries whole blocks, and the per-step token budget then decides how many requests are prefilled per step. With a budget of one block, one request is prefilled per step and each block additionally costs a near-empty re-alignment step, so a long prompt at concurrency drains at half the rate. The budget must cover two blocks.",
+  "environment": {
+    "host": "par1-cs25 (192.168.1.84)",
+    "boot_id": "89e15654-71a8-4986-8dba-ea413393b0a2",
+    "gpus": "4x gfx1030 Radeon PRO V620, HIP_VISIBLE_DEVICES=6,7,8,9",
+    "torch": "2.12.0+rocm7.14.0",
+    "hip": "7.14.60850",
+    "source": "/home/chenco_adm/vllm-pr-int4fp16",
+    "venv": "/home/chenco_adm/Apps/vllm/venv-pr134-int4fp16",
+    "private_core_sha256": "4292ace2dd42b1d6",
+    "model": "cyankiwi/Qwen3.8-27B-AWQ-INT4 @ 63768c10df38c0395e12ef49edac1bd539eaeeea",
+    "parallelism": "TP=4, PP=1, DP=1, MTP2 (2 speculative tokens)",
+    "recipe": "27b-awq: --max-num-seqs 8, --block-size 1024 (requested), --enable-prefix-caching, --mamba-cache-mode align, --kv-cache-memory-bytes 8000000000, cudagraph_mode=FULL_AND_PIECEWISE"
+  },
+  "method": {
+    "design": "One variable per arm. The block size is the only thing that changed in the sweep arms, and max_num_batched_tokens is the only thing that changed in the budget arms. The KV format was varied across arms with the block size and the budget held fixed, so the format effect and the block effect are separable.",
+    "arms": "8 serving arms on one boot, one source tree and one private core build, plus a probe of the real Scheduler._mamba_block_aligned_split with production numbers.",
+    "probe": "The real Scheduler._mamba_block_aligned_split was called with a stub self (same shape as tests/v1/core/test_mamba_align_chunk_split.py) on the remote venv, with the production budget arithmetic of scheduler.py:848-890: num_new_tokens = min(remaining, token_budget, max_num_batched_tokens - draft_slots)."
+  },
+  "arms": {
+    "fp16_ref_block1024_maxbat2048": {
+      "dir": "serve-27b-fp16-ssm32-core4292ace2-hip6789",
+      "kv_dtype": "fp16",
+      "ssm_state": "fp32",
+      "attention_block": 1024,
+      "max_num_batched_tokens": 2048,
+      "kv_tokens": 438210,
+      "bench_1024x512_c1": {"out_tok_s": 81.81, "ttft_s": 0.96},
+      "bench_1024x512_c8": {"out_tok_s": 203.75, "ttft_s": 2.50},
+      "bench_16384x1024_c1": {"out_tok_s": 31.20, "ttft_s": 19.30},
+      "bench_16384x1024_c8": {"out_tok_s": 42.18, "ttft_s": 50.73},
+      "status": "PASS"
+    },
+    "fp16_ssm16_block1024_maxbat2048": {
+      "dir": "serve-27b-fp16-ssm16-block1024-core4292ace2-hip6789",
+      "kv_dtype": "fp16",
+      "ssm_state": "fp16",
+      "attention_block": 1024,
+      "max_num_batched_tokens": 2048,
+      "kv_tokens": 438210,
+      "bench_1024x512_c1": {"out_tok_s": 83.68, "ttft_s": 0.93},
+      "bench_1024x512_c8": {"out_tok_s": 208.19, "ttft_s": 2.69},
+      "bench_16384x1024_c1": {"out_tok_s": 31.60, "ttft_s": 18.72},
+      "bench_16384x1024_c8": {"out_tok_s": 42.93, "ttft_s": 47.98},
+      "status": "PASS",
+      "note": "The fp16 SSM state is performance neutral at block 1024; its value shows up in the packed arms, where it moves the block from 3072 to 2048."
+    },
+    "fp16_block2048_maxbat2048": {
+      "dir": "serve-27b-fp16-block2048-core4292ace2-hip6789",
+      "kv_dtype": "fp16",
+      "ssm_state": "fp32",
+      "attention_block": 2048,
+      "max_num_batched_tokens": 2048,
+      "kv_tokens": 419430,
+      "bench_1024x512_c1": {"out_tok_s": 82.39, "ttft_s": 0.95},
+      "bench_1024x512_c8": {"out_tok_s": 207.21, "ttft_s": 2.38},
+      "bench_16384x1024_c1": {"out_tok_s": 31.00, "ttft_s": 18.94},
+      "bench_16384x1024_c8": {"out_tok_s": 37.42, "ttft_s": 103.33},
+      "status": "PASS",
+      "note": "FP16 KV at block 2048 scores the same as INT4 KV at block 2048. The cliff is the block, not the format."
+    },
+    "fp16_block3072_maxbat2048": {
+      "dir": "serve-27b-fp16-block3072-core4292ace2-hip6789",
+      "kv_dtype": "fp16",
+      "ssm_state": "fp32",
+      "attention_block": 3072,
+      "max_num_batched_tokens": 2048,
+      "kv_tokens": 398565,
+      "bench_1024x512_c1": {"out_tok_s": 82.46, "ttft_s": 0.95},
+      "bench_1024x512_c8": {"out_tok_s": 206.35, "ttft_s": 2.35},
+      "bench_16384x1024_c1": {"out_tok_s": 30.97, "ttft_s": 19.07},
+      "bench_16384x1024_c8": {"out_tok_s": 37.57, "ttft_s": 104.26},
+      "status": "PASS",
+      "note": "3072 is no worse than 2048: both are capped by the same token budget, so the budget and not the block sets the regime."
+    },
+    "fp16_block2048_maxbat4096": {
+      "dir": "serve-27b-fp16-block2048-maxbat4096-core4292ace2-hip6789",
+      "kv_dtype": "fp16",
+      "ssm_state": "fp32",
+      "attention_block": 2048,
+      "max_num_batched_tokens": 4096,
+      "kv_tokens": 419430,
+      "bench_1024x512_c1": {"out_tok_s": 82.72, "ttft_s": 0.94},
+      "bench_1024x512_c8": {"out_tok_s": 202.20, "ttft_s": 2.65},
+      "bench_16384x1024_c1": {"out_tok_s": 31.37, "ttft_s": 18.61},
+      "bench_16384x1024_c8": {"out_tok_s": 42.15, "ttft_s": 49.30},
+      "status": "PASS",
+      "note": "Identical to fp16_block2048_maxbat2048 except for the budget: +12.6% throughput and TTFT halved. One variable."
+    },
+    "int4_ssm32_block3072_maxbat2048": {
+      "dir": "serve-27b-int4-ssm32-core4292ace2-hip6789",
+      "kv_dtype": "int4_fp16_block",
+      "ssm_state": "fp32",
+      "attention_block": 3072,
+      "max_num_batched_tokens": 2048,
+      "kv_tokens": 1420392,
+      "bench_1024x512_c1": {"out_tok_s": 84.51, "ttft_s": 0.94},
+      "bench_1024x512_c8": {"out_tok_s": 204.97, "ttft_s": 2.33},
+      "bench_16384x1024_c1": {"out_tok_s": 33.02, "ttft_s": 18.59},
+      "bench_16384x1024_c8": {"out_tok_s": 36.88, "ttft_s": 107.50},
+      "status": "PASS"
+    },
+    "int4_ssm16_block2048_maxbat2048": {
+      "dir": "serve-27b-int4-ssm16-core4292ace2-hip6789",
+      "kv_dtype": "int4_fp16_block",
+      "ssm_state": "fp16",
+      "attention_block": 2048,
+      "max_num_batched_tokens": 2048,
+      "kv_tokens": 1492348,
+      "bench_1024x512_c1": {"out_tok_s": 84.46, "ttft_s": 0.96},
+      "bench_1024x512_c8": {"out_tok_s": 206.46, "ttft_s": 2.80},
+      "bench_16384x1024_c1": {"out_tok_s": 32.84, "ttft_s": 18.82},
+      "bench_16384x1024_c8": {"out_tok_s": 37.14, "ttft_s": 105.93},
+      "status": "PASS",
+      "ppl_ratio_vs_reference": 1.0027
+    },
+    "int4_ssm16_block2048_maxbat4096": {
+      "dir": "serve-27b-int4-ssm16-block2048-maxbat4096-core4292ace2-hip6789",
+      "kv_dtype": "int4_fp16_block",
+      "ssm_state": "fp16",
+      "attention_block": 2048,
+      "max_num_batched_tokens": 4096,
+      "kv_tokens": 1492348,
+      "bench_1024x512_c1": {"out_tok_s": 84.49, "ttft_s": 0.96},
+      "bench_1024x512_c8": {"out_tok_s": 209.90, "ttft_s": 2.73},
+      "bench_16384x1024_c1": {"out_tok_s": 32.77, "ttft_s": 18.72},
+      "bench_16384x1024_c8": {"out_tok_s": 41.20, "ttft_s": 48.06},
+      "status": "PASS",
+      "ppl_ratio_vs_reference": 1.0020242914979756,
+      "ppl_candidate": 4.95,
+      "ppl_reference": 4.94,
+      "greedy": "PASS 3/3",
+      "note": "The candidate: FP16-level throughput at 16k x c=8 with 3.4x the KV cache of the FP16 arm."
+    }
+  },
+  "attribution": {
+    "format_is_not_the_cause": {
+      "claim": "The packed KV format costs about 2%, not 12%.",
+      "evidence": "FP16 KV at block 2048 scores 37.42 tok/s and INT4 KV at block 2048 scores 37.14 tok/s (difference 0.7%). INT4 wins the other three cells outright: 84.49 vs 81.61 at 1024x512 c1, 209.90 vs 202.20 at 1024x512 c8, 32.77 vs 31.37 at 16k c1."
+    },
+    "block_size_is_the_cause": {
+      "claim": "The attention block size sets the regime, and the token budget sets the regime inside it.",
+      "evidence": "With the KV format and the budget fixed at FP16/2048, the block sweep gives 42.18 (1024), 37.42 (2048), 37.57 (3072). With the block and the format fixed at 2048/FP16, the budget sweep gives 37.42 (MAXBAT 2048) and 42.15 (MAXBAT 4096)."
+    },
+    "prefill_kernel_is_innocent": {
+      "claim": "The prefill kernel is not slower at the larger block.",
+      "evidence": "The scheduler's own decode-stall fit reports the per-token prefill cost b = 1.03-1.10 ms/tok in every arm, including the 37.42 tok/s arms."
+    },
+    "prefix_caching_is_innocent": {
+      "claim": "Prefix caching is not the differentiator.",
+      "evidence": "The prefix cache hit rate was 0.0% in both the FP16 and the INT4 arms during the 16k cell, and GPU KV cache usage stayed at 12% (INT4) vs 46% (FP16), so neither arm was capacity starved."
+    },
+    "concurrency_visibility": {
+      "claim": "The cliff is invisible at c=1 and at short prompts.",
+      "evidence": "At 16k x c=1 the three block sizes score 31.20 / 31.00 / 30.97 tok/s; at 1024 x c=8 they score 203.75 / 207.21 / 206.35. Only 16k x c=8 separates them. This is the signature of a per-step budget that limits how many requests can be prefilled in parallel: with one request there is nothing to share the budget with, and a 1024-token prompt fits in one chunk."
+    }
+  },
+  "mechanism": {
+    "code_path": [
+      "vllm/v1/core/sched/scheduler.py:848-890 - the scheduler gives each running request min(remaining, token_budget, max_num_batched_tokens - draft_slots) tokens.",
+      "vllm/v1/core/sched/scheduler.py:558-569 - _mamba_block_aligned_split floors the chunk end onto a mamba state block boundary.",
+      "vllm/v1/core/sched/scheduler.py:916-934 - a request that cannot be given a block-aligned chunk is skipped; the comment lists 'insufficient budget for a block-aligned chunk in hybrid models with mamba cache mode align' as reason 4.",
+      "vllm/v1/core/sched/scheduler.py:597-624 - the stops tuple re-aligns a chunk that starts mid-block at the next boundary.",
+      "vllm/platforms/interface.py:987-996 - the hybrid page unification sets the attention block size to the mamba state block size, and mamba_cache_mode=align ties the two together."
+    ],
+    "probe_of_the_real_split": {
+      "note": "Real Scheduler._mamba_block_aligned_split, production budget arithmetic, first chunk at start=0.",
+      "results": [
+        {"attention_block": 1024, "max_num_batched_tokens": 2048, "draft_slots": 3, "num_new_tokens": 2045, "chunk": 1024},
+        {"attention_block": 2048, "max_num_batched_tokens": 2048, "draft_slots": 3, "num_new_tokens": 2045, "chunk": 0},
+        {"attention_block": 2048, "max_num_batched_tokens": 4096, "draft_slots": 3, "num_new_tokens": 4093, "chunk": 2048},
+        {"attention_block": 3072, "max_num_batched_tokens": 2048, "draft_slots": 3, "num_new_tokens": 2045, "chunk": 2045},
+        {"attention_block": 3072, "max_num_batched_tokens": 6144, "draft_slots": 3, "num_new_tokens": 6141, "chunk": 3072}
+      ],
+      "reading": "At a budget of one block the chunk degenerates (0 tokens, or a sub-block chunk that needs an extra near-empty re-alignment step), so one request is prefilled per step. At two blocks the chunk is a clean whole block and two requests are prefilled per step."
+    }
+  },
+  "fix": {
+    "rule": "max_num_batched_tokens >= 2 x the mamba state block size",
+    "implementation": [
+      "tools/rdna/serve_rdna.sh - derives MAXBAT from the KV and SSM dtypes (2048 for FP16 KV, 4096 for a packed KV cache with an FP16 SSM state, 6144 for a packed KV cache with the model's own FP32). An explicit MAXBAT still wins.",
+      "vllm/v1/core/sched/scheduler.py - warns loudly, naming the flag and the number, when the budget cannot cover two mamba state blocks.",
+      "benchmarks/kernels/pr134/qualify_serving.py - refuses a serving arm whose budget cannot cover two blocks instead of recording it as a slow run."
+    ],
+    "commit": "9522c57097 on feat/gdn-fp16-ssm-state",
+    "result": "INT4 KV + fp16 SSM state reaches 41.20 tok/s with a 48.06 s TTFT at 16k x c=8 (was 37.14 tok/s and 105.93 s), against 42.15 tok/s and 49.30 s for the FP16 KV arm at the same block and budget, while carrying 1,492,348 KV tokens instead of 419,430."
+  }
+}

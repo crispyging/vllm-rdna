@@ -1,0 +1,15 @@
+{
+  "verdict": "clean",
+  "event_groups": [],
+  "corrected_event_groups": 0,
+  "corrected_error_count": 0,
+  "fatal_event_groups": 0,
+  "fatal_events": [],
+  "endpoints": [],
+  "endpoints_with_nonfatal_err": 0,
+  "endpoints_with_bad_tlp": 0,
+  "aer_recovery_buffer_overflows": [],
+  "corrected_marker_count": 0,
+  "raw_gate_matched_lines": [],
+  "interpretation": "No PCIe/AER activity observed in this delta."
+}

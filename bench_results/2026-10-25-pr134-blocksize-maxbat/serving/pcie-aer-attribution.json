@@ -1,0 +1,74 @@
+{
+  "question": "Is the raw FAIL of the FP16 reference arm (arm F) caused by the MAXBAT fix, or by something else on the box?",
+  "answer": "Something else. The raw gate fired on a corrected PCIe AER error that arrived 98 seconds after an unrelated workload started on the shared PLX 88096 PCIe fabric. The MAXBAT fix touches the scheduler's startup warning, the recipe's token-budget derivation and the harness assertion; none of them touch PCIe.",
+  "environment": {
+    "host": "par1-cs25 (192.168.1.84)",
+    "boot_id": "89e15654-71a8-4986-8dba-ea413393b0a2",
+    "boot_time": "2026-10-25 08:35:41 +0100",
+    "gpus_under_test": "HIP 6,7,8,9 (gfx1030 Radeon PRO V620)",
+    "gpus_foreign": "HIP 2,3,4,5 (the vllm-rdna-hi2-bench workload)"
+  },
+  "timeline": [
+    {
+      "at": "2026-10-25 19:26:34",
+      "event": "arm F starts (serve-27b-fp16-ssm32-core4292ace2-maxbatfix-hip6789)",
+      "source": "serve.log first INFO line"
+    },
+    {
+      "at": "2026-10-25 19:49:12",
+      "event": "the unrelated workload starts: bash /home/chenco_adm/vllm-rdna-hi2-bench/tools/rdna/port_v031/serve_validate.sh TP=4 MAXLEN=32768",
+      "source": "ps -eo lstart",
+      "note": "This job brings up a 4-GPU vLLM server on HIP 2,3,4,5 while arm F is serving on HIP 6,7,8,9, on the same PLX 88096 PCIe fabric."
+    },
+    {
+      "at": "2026-10-25 19:50:50",
+      "event": "PCIe AER event on pcieport 0000:40:03.1",
+      "source": "kernel delta window, kernel timestamp 40508.709119 s since boot",
+      "detail": "aer_cor_status 0x00000040, aer_uncor_status 0x00000000, aer_uncor_mask 0x04000000, aer_uncor_severity 0x026f6030, TLP Header all zero, aer_layer=Data Link Layer, aer_agent=Receiver ID. The kernel classified it as corrected ('It has been corrected by h/w')."
+    },
+    {
+      "at": "2026-10-25 19:52:33",
+      "event": "arm F's last log line",
+      "source": "serve.log last INFO line"
+    },
+    {
+      "at": "2026-10-25 19:52:36",
+      "event": "arm F ends, raw status FAIL",
+      "source": "/tmp/final-cohort.log"
+    }
+  ],
+  "harness_classification": {
+    "verdict": "corrected-only",
+    "corrected_event_groups": 1,
+    "corrected_error_count": 1,
+    "fatal_event_groups": 0,
+    "fatal_events": [],
+    "endpoints_with_nonfatal_err": 0,
+    "endpoints_with_bad_tlp": 1,
+    "aer_recovery_buffer_overflows": [],
+    "interpretation": "All PCIe/AER activity was classified by the kernel as corrected; no device fault, timeout or reset was reported.",
+    "raw_status": "FAIL",
+    "qualification_mode": "diagnostic-only",
+    "hardware_attribution": "contaminated-corrected-link-noise"
+  },
+  "functional_results_of_arm_F": {
+    "note": "The raw gate is deliberately strict and is not relaxed. The functional gates of the same arm are all green.",
+    "cleanup": "PASS",
+    "ppl": "PASS (4.94, mean NLL 1.597 over 261 tokens)",
+    "greedy": "PASS 3/3",
+    "bench_16384x1024_c8": {"out_tok_s": 42.69, "ttft_s": 48.26},
+    "bench_1024x512_c8": {"out_tok_s": 208.10, "ttft_s": 2.57}
+  },
+  "why_it_is_not_the_fix": [
+    "The changed files are vllm/v1/core/sched/scheduler.py (a startup warning), tools/rdna/serve_rdna.sh (a token-budget derivation) and benchmarks/kernels/pr134/qualify_serving.py (a harness assertion). None of them issue PCIe traffic or touch the drivers.",
+    "The event is a Data Link Layer corrected error on a root port, i.e. a link-level retry, not a device or driver fault.",
+    "The event lands 98 s after the foreign 4-GPU server starts and 26 min into arm F, with no correlation to any phase of the arm.",
+    "Six earlier arms on the same boot, same tree and same core build recorded kernel_events verdict 'clean'. The noise appeared only once the second 4-GPU workload came up."
+  ],
+  "handling": {
+    "protocol": "The harness's documented --diagnostic-reference path: the candidate is recorded as diagnostic-only with contaminated hardware attribution, and the reference's raw FAIL is preserved rather than rewritten.",
+    "arm_G": "serve-27b-int4-ssm16-core4292ace2-maxbatfix-hip6789 was run with --reference <arm F> --diagnostic-reference.",
+    "not_done": "The raw status of arm F is left FAIL. Nothing in the harness was relaxed to make it pass."
+  },
+  "residual_risk": "The box is shared: the vllm-rdna-hi2-bench workload holds HIP 2,3,4,5 and keeps writing to disk. A cohort that needs a strict (non-diagnostic) reference should be run while that workload is idle, so that a corrected link error cannot contaminate it."
+}
