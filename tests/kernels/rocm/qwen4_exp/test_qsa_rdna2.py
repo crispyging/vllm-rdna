@@ -34,12 +34,12 @@ from vllm.platforms.rocm import on_gfx10x  # noqa: E402
 if not on_gfx10x():
     pytest.skip("RDNA2 QSA kernels are gfx1030-only", allow_module_level=True)
 
-from vllm.triton_utils import triton  # noqa: E402
 from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops  # noqa: E402
 from vllm.models.qwen4_exp.amd.ops import qsa_rdna2  # noqa: E402
 from vllm.models.qwen4_exp.amd.ops.qsa import (  # noqa: E402
     _store_qsa_rows_kernel,
 )
+from vllm.triton_utils import triton  # noqa: E402
 
 device = "cuda"
 ATOL = 1e-3
@@ -89,17 +89,21 @@ def test_qsa_dispatcher_env_gate(monkeypatch):
 
 def test_mqa_paged_routes_to_hip_only_for_fp16(monkeypatch):
     """The dispatcher sends fp16 to the HIP op and bf16 to Triton."""
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+
     seen: list[torch.dtype] = []
 
     def spy(q, k_cache, page_table, token_to_req, query_positions,
-            sequence_lengths, compress_ratio, num_columns, score_scale):
+            sequence_lengths, compress_ratio, score_divisor, logits,
+            visible_blocks):
         seen.append(q.dtype)
-        return (
-            torch.empty(q.shape[0], num_columns, dtype=torch.float32, device=device),
-            torch.empty(q.shape[0], dtype=torch.int32, device=device),
-        )
+        return True
 
-    monkeypatch.setattr(qsa_rdna2, "qsa_mqa_paged", spy)
+    # The dispatcher scores through the MonoKernel's HIP scoring module, not
+    # through the wrapper in `qsa_rdna2`: `mqa_paged` returns True when the
+    # layout is one the HIP kernel covers and the caller then skips Triton.
+    monkeypatch.setattr(mono_qsa, "mqa_paged", spy)
+    monkeypatch.setattr(qsa_ops, "MONO_QSA", None)
     monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", True)
     monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
 
@@ -165,7 +169,7 @@ def test_store_cache_rows_parity(num_rows, width, page_size, num_blocks):
     hip = torch.zeros_like(ref)
     _store_rows_reference(rows, slots, ref, page_size, width)
     qsa_rdna2.qsa_store_cache_rows(rows, slots, hip, page_size, width)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     maxdiff = (ref - hip).abs().max().item()
     print(f"store_cache_rows atol=0 maxdiff={maxdiff} rows={num_rows}")
@@ -192,7 +196,7 @@ def test_store_cache_rows_matches_scatter_semantics():
             expected[slot // page_size, slot % page_size, 0] = rows[row]
     hip = torch.full_like(expected, -1.0)
     qsa_rdna2.qsa_store_cache_rows(rows, slots, hip, page_size, width)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(expected, hip)
 
 
@@ -207,14 +211,13 @@ def test_store_cache_rows_all_element_sizes_and_strides(dtype, strided):
     """
     num_rows, width, page_size, num_blocks = 24, 16, 4, 6
     torch.manual_seed(11)
+    fill = -7.0
     if dtype == torch.int64:
         rows = torch.randint(0, 4096, (num_rows, width), device=device)
         rows = rows.reshape(width, num_rows).t() if strided else rows
-        fill = -7
     else:
         base = torch.randn(width, num_rows, dtype=dtype, device=device)
         rows = base.t() if strided else base.t().contiguous()
-        fill = -7.0
 
     capacity = num_blocks * page_size
     slots = torch.full((num_rows,), -1, dtype=torch.int64, device=device)
@@ -237,7 +240,7 @@ def test_store_cache_rows_all_element_sizes_and_strides(dtype, strided):
             expected[slot // page_size, slot % page_size, 0] = rows[row]
 
     qsa_rdna2.qsa_store_cache_rows(rows, slots, cache, page_size, width)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(expected, cache), f"rows stride {rows.stride()}"
     if interleave > 1:
         assert bool((backing[..., 1::2] == fill).all()), "clobbered interleaved columns"
@@ -352,7 +355,7 @@ def test_compress_groups_parity(
         ratio,
         rope_cache,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert hip_pooled.shape == ref_pooled.shape
     maxdiff = (ref_pooled - hip_pooled).abs().max().item()
@@ -390,7 +393,7 @@ def test_compress_groups_all_null_state_table(triton_gate):
         raw_keys, raw_positions, state_cache, state_table, token_to_req,
         query_start_loc, logical_positions, compressed_slots, ratio, rope_cache,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     torch.testing.assert_close(hip_pooled, ref_pooled, atol=ATOL, rtol=RTOL)
     assert torch.equal(hip_first, ref_first)
 
@@ -449,7 +452,7 @@ def test_mqa_paged_parity(triton_gate, rows, heads, head_dim, num_pages, page_si
     hip_logits, hip_visible = qsa_rdna2.qsa_mqa_paged(
         q, k_cache, table, token_to_req, positions, seq_lens, ratio, columns, scale
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert hip_logits.shape == ref_logits.shape == (rows, columns)
     assert hip_visible.shape == ref_visible.shape == (rows,)
@@ -491,7 +494,7 @@ def test_mqa_paged_smaller_num_columns_matches_capacity(triton_gate):
         q, k_cache, table, token_to_req, positions, seq_lens, 4, narrow,
         128**0.5,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     ref = wide_logits[:, :narrow]
     finite = ~torch.isneginf(ref)
     assert torch.equal(torch.isneginf(ref), torch.isneginf(hip_logits))
@@ -558,7 +561,7 @@ def test_dispatched_mqa_paged_matches_gate_off(monkeypatch):
     hip_logits, hip_visible = qsa_ops.qsa_mqa_paged(
         q, k_cache, table, token_to_req, positions, seq_lens, 4, columns
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.equal(hip_visible, ref_visible)
     finite = ~torch.isneginf(ref_logits)
@@ -598,7 +601,7 @@ def test_dispatched_compress_and_store_match_gate_off(monkeypatch):
     monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", True)
     monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
     hip = run()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     torch.testing.assert_close(hip[0], ref[0], atol=ATOL, rtol=RTOL)
     assert torch.equal(hip[1], ref[1])
@@ -614,7 +617,7 @@ def test_dispatched_compress_and_store_match_gate_off(monkeypatch):
 def test_dispatched_indexer_selection_matches_gate_off(monkeypatch):
     """S3: end-to-end indexer selection (score -> top-k -> expand) must agree."""
     rows, heads, head_dim, ratio, token_topk = 6, 4, 128, 4, 64
-    num_pages, page_size, table_width, num_requests = 32, 64, 16, 2
+    num_pages, page_size, num_requests = 32, 64, 2
     torch.manual_seed(5)
     q = torch.randn(rows, heads, head_dim, dtype=torch.float16, device=device)
     k_cache = torch.randn(
@@ -642,7 +645,7 @@ def test_dispatched_indexer_selection_matches_gate_off(monkeypatch):
     hip = qsa_ops.qsa_select_paged_tokens(
         q, k_cache, table, token_to_req, positions, seq_lens, token_topk, ratio
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for row in range(rows):
         ref_set = set(int(v) for v in ref[row] if v >= 0)
@@ -690,14 +693,14 @@ def test_qsa_hip_ops_are_cudagraph_safe(triton_gate):
     with torch.cuda.stream(side):
         run()
     torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
     store_cache.zero_()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert bool((store_cache != 0).any()), "store_cache_rows did not replay"
 
@@ -808,11 +811,12 @@ def test_expand_indices_routes_to_hip_behind_the_gate(monkeypatch):
     restriction does not apply -- but the env/platform gate still must.
     """
     seen: list[torch.dtype] = []
-    monkeypatch.setattr(
-        qsa_rdna2,
-        "qsa_expand_indices",
-        lambda *a, **kw: seen.append(a[0].dtype) or torch.empty(0),
-    )
+
+    def spy(*a, **kw):
+        seen.append(a[0].dtype)
+        return torch.empty(0)
+
+    monkeypatch.setattr(qsa_rdna2, "qsa_expand_indices", spy)
     monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", True)
     monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
     blocks, positions, seq_lens, token_to_req = _expand_inputs(4, 2, 4, 2, seed=3)
@@ -929,11 +933,12 @@ def test_sparse_paged_attention_out_param_is_in_place():
 def test_sparse_paged_attention_routes_to_hip_only_for_fp16(monkeypatch):
     """fp16 goes to the HIP op; bf16 must keep Triton (the kernels are fp16)."""
     seen: list[torch.dtype] = []
-    monkeypatch.setattr(
-        qsa_rdna2,
-        "qsa_sparse_paged_attention",
-        lambda *a, **kw: seen.append(a[0].dtype) or torch.empty(0),
-    )
+
+    def spy(*a, **kw):
+        seen.append(a[0].dtype)
+        return torch.empty(0)
+
+    monkeypatch.setattr(qsa_rdna2, "qsa_sparse_paged_attention", spy)
     monkeypatch.setattr(qsa_rdna2, "VLLM_RDNA_QSA_HIP", True)
     monkeypatch.setattr(qsa_rdna2, "on_gfx10x", lambda: True)
     q, k_cache, v_cache, logical, block_table, token_to_req = _sparse_inputs(
