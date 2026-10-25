@@ -1080,8 +1080,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hi2_linear_rdna2(Tensor x, Tensor col_scale, Tensor had, "
       "Tensor codes, Tensor code_off, Tensor blk_params, Tensor param_off, "
       "Tensor row_consts, Tensor row_nbits, Tensor row_block, "
-      "bool transform, int decode_max_m) -> Tensor");
+      "bool transform, int decode_max_m, int mode) -> Tensor");
   rocm_ops.impl("hi2_linear_rdna2", torch::kCUDA, &hi2_linear_rdna2);
+  rocm_ops.def(
+      "hi2_act_quant_rdna2(Tensor x, Tensor col_scale, Tensor had, "
+      "bool transform, Tensor! xq, Tensor! sx, Tensor! sumq) -> ()");
+  rocm_ops.impl("hi2_act_quant_rdna2", torch::kCUDA, &hi2_act_quant_rdna2);
+  rocm_ops.def(
+      "hi2_gemv_i8_rdna2(Tensor xq, Tensor sx, Tensor sumq, Tensor codes, "
+      "Tensor code_off, Tensor blk_params, Tensor param_off, "
+      "Tensor row_consts, Tensor row_nbits, Tensor row_block, "
+      "Tensor! out) -> ()");
+  rocm_ops.impl("hi2_gemv_i8_rdna2", torch::kCUDA, &hi2_gemv_i8_rdna2);
 #endif
 
   // EXL3 (QTIP-style bitshift trellis) kernels are RDNA-generic

@@ -1368,6 +1368,7 @@ def hi2_linear_rdna2(
     row_block: torch.Tensor,
     transform: bool,
     decode_max_m: int,
+    mode: int = 0,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.hi2_linear_rdna2(
         x,
@@ -1382,7 +1383,39 @@ def hi2_linear_rdna2(
         row_block,
         transform,
         decode_max_m,
+        mode,
     )
+
+
+def hi2_act_quant_rdna2(
+    x: torch.Tensor,
+    col_scale: torch.Tensor,
+    had: torch.Tensor,
+    transform: bool,
+    xq: torch.Tensor,
+    sx: torch.Tensor,
+    sumq: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.hi2_act_quant_rdna2(x, col_scale, had, transform, xq, sx, sumq)
+
+
+def hi2_gemv_i8_rdna2(
+    xq: torch.Tensor,
+    sx: torch.Tensor,
+    sumq: torch.Tensor,
+    codes: torch.Tensor,
+    code_off: torch.Tensor,
+    blk_params: torch.Tensor,
+    param_off: torch.Tensor,
+    row_consts: torch.Tensor,
+    row_nbits: torch.Tensor,
+    row_block: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.hi2_gemv_i8_rdna2(
+        xq, sx, sumq, codes, code_off, blk_params, param_off, row_consts,
+        row_nbits, row_block, out,
+    )  # fmt: skip
 
 
 def hi2_gemv_rdna2(
@@ -1440,8 +1473,37 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "hi2_linear_rdna
         row_block: torch.Tensor,
         transform: bool,
         decode_max_m: int,
+        mode: int,
     ) -> torch.Tensor:
         return x.new_empty((x.size(0), row_nbits.size(0)))
+
+    @register_fake("_rocm_C::hi2_act_quant_rdna2")
+    def _hi2_act_quant_rdna2_fake(
+        x: torch.Tensor,
+        col_scale: torch.Tensor,
+        had: torch.Tensor,
+        transform: bool,
+        xq: torch.Tensor,
+        sx: torch.Tensor,
+        sumq: torch.Tensor,
+    ) -> None:
+        return
+
+    @register_fake("_rocm_C::hi2_gemv_i8_rdna2")
+    def _hi2_gemv_i8_rdna2_fake(
+        xq: torch.Tensor,
+        sx: torch.Tensor,
+        sumq: torch.Tensor,
+        codes: torch.Tensor,
+        code_off: torch.Tensor,
+        blk_params: torch.Tensor,
+        param_off: torch.Tensor,
+        row_consts: torch.Tensor,
+        row_nbits: torch.Tensor,
+        row_block: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        return
 
     @register_fake("_rocm_C::hi2_gemv_rdna2")
     def _hi2_gemv_rdna2_fake(

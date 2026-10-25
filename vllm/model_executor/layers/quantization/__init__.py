@@ -8,6 +8,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     resolve_quant_method,
 )
+from vllm.model_executor.layers.quantization.hi2_names import (
+    HI2_QUANT_METHOD_NAMES,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -37,7 +40,6 @@ QuantizationMethods = Literal[
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
     "exl3",
-    "hadamard_int2",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
@@ -50,6 +52,14 @@ QuantizationMethods = Literal[
     "mxfp8",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
+# HI2 names (and aliases) live in one module; see hi2_names.py.
+QUANTIZATION_METHODS += list(HI2_QUANT_METHOD_NAMES)
+if current_platform.is_rocm() and current_platform.supported_quantization:
+    current_platform.supported_quantization.extend(
+        n
+        for n in HI2_QUANT_METHOD_NAMES
+        if n not in current_platform.supported_quantization
+    )
 
 DEPRECATED_QUANTIZATION_METHODS = [
     "fbgemm_fp8",
@@ -180,7 +190,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "exl3": Exl3Config,
-        "hadamard_int2": HadamardInt2Config,
+        **{name: HadamardInt2Config for name in HI2_QUANT_METHOD_NAMES},
         "deepseek_v4_fp8": deepseek_config,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,

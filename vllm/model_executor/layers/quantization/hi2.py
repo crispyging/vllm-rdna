@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HadamardINT2-FP16 (HI2, spec v3.2) weight quantization: ``hadamard_int2``.
+"""HadamardINT2-FP16 (HI2, spec v3.2) weight quantization.
 
 Checkpoints come from the separate ``tools/hi2`` quantizer. Each quantized
 linear ``<name>.weight`` is replaced by the flat buffers ``<name>.hi2_<field>``
 of spec 2.4 (see ``utils/hi2_utils.py``), and ``config.json`` carries
-``quantization_config = {"quant_method": "hadamard_int2", "version": "3.2"}``.
+``quantization_config = {"quant_method": <HI2_QUANT_METHOD>, "version": "3.2"}``
+(the name and its aliases live in ``hi2_names.py``).
 Every per-tensor choice (row widths, block sizes, Hadamard flags, smoothing
 vector) lives in the tensors, so the reader needs no other metadata.
 
@@ -21,7 +22,7 @@ not compact), so the format never breaks another platform.
 
 import json
 import os
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +43,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.hi2_names import HI2_QUANT_METHOD
 from vllm.model_executor.layers.quantization.utils import hi2_utils as hu
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -49,6 +51,12 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 SPEC_VERSIONS = ("3.2",)
+# Compute modes (spec 6): "f16" (default, v_dot2_f32_f16 on fp16 activations),
+# "i8" (v_dot4_i32_i8 on per-16-column int8 activations for M <= DECODE_MAX_M,
+# the f16 prefill path above it), "i8_all" (the I8 kernel for every M; slow
+# prefill, meant for accuracy evaluation). quantization_config["compute_mode"]
+# sets it; the VLLM_HI2_COMPUTE_MODE environment variable overrides it.
+COMPUTE_MODES = {"f16": 0, "i8": 1, "i8_all": 2}
 # M at or below this runs the GEMV kernel; above it, dequant + rocBLAS GEMM.
 DECODE_MAX_M = 8
 _FIELD_PREFIX = "hi2_"
@@ -103,14 +111,22 @@ def _checkpoint_tensor_names(model: str, revision: str | None) -> list[str] | No
 
 
 class HadamardInt2Config(QuantizationConfig):
-    """Config for HI2 (``quant_method: hadamard_int2``) checkpoints."""
+    """Config for HI2 checkpoints (``quant_method`` in ``hi2_names.py``)."""
 
-    def __init__(self, version: str = "3.2", mode: str = "flex") -> None:
+    def __init__(
+        self, version: str = "3.2", mode: str = "flex", compute_mode: str = "f16"
+    ) -> None:
         super().__init__()
+        compute_mode = os.environ.get("VLLM_HI2_COMPUTE_MODE", compute_mode)
+        if compute_mode not in COMPUTE_MODES:
+            raise ValueError(
+                f"HI2 compute_mode {compute_mode!r} is not one of "
+                f"{sorted(COMPUTE_MODES)}"
+            )
+        self.compute_mode = compute_mode
         if version not in SPEC_VERSIONS:
             raise ValueError(
-                f"hadamard_int2 version {version!r} is not supported "
-                f"(supported: {SPEC_VERSIONS})"
+                f"HI2 version {version!r} is not supported (supported: {SPEC_VERSIONS})"
             )
         self.version = version
         self.mode = mode
@@ -119,11 +135,14 @@ class HadamardInt2Config(QuantizationConfig):
         self._hi2_modules: dict[str, set[str]] | None = None
 
     def __repr__(self) -> str:
-        return f"HadamardInt2Config(version={self.version}, mode={self.mode})"
+        return (
+            f"HadamardInt2Config(version={self.version}, mode={self.mode}, "
+            f"compute_mode={self.compute_mode})"
+        )
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
-        return "hadamard_int2"
+        return cast(QuantizationMethods, HI2_QUANT_METHOD)
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -145,6 +164,7 @@ class HadamardInt2Config(QuantizationConfig):
         return cls(
             version=str(config.get("version", "3.2")),
             mode=str(config.get("mode", "flex")),
+            compute_mode=str(config.get("compute_mode", "f16")),
         )
 
     def maybe_update_config(self, model_name: str, hf_config=None, revision=None):
@@ -180,7 +200,7 @@ class HadamardInt2Config(QuantizationConfig):
             return None
         if self._hi2_modules is None:
             raise ValueError(
-                "hadamard_int2: the checkpoint index could not be read, so the "
+                "HI2: the checkpoint index could not be read, so the "
                 "quantized modules are unknown (expected a local directory or a "
                 "Hugging Face repo with safetensors)."
             )
@@ -190,17 +210,15 @@ class HadamardInt2Config(QuantizationConfig):
             return UnquantizedLinearMethod()
         if len(present) != len(fields):
             raise ValueError(
-                f"hadamard_int2: {prefix} fuses HI2 and dense sub-modules; "
+                f"HI2: {prefix} fuses HI2 and dense sub-modules; "
                 "quantize all of them or none"
             )
         for f in present:
             missing = set(hu.FIELDS) - f
             if missing:
-                raise ValueError(
-                    f"hadamard_int2: {prefix} is missing {sorted(missing)}"
-                )
+                raise ValueError(f"HI2: {prefix} is missing {sorted(missing)}")
         has_col_scale = any("col_scale" in f for f in present)
-        return HadamardInt2LinearMethod(has_col_scale)
+        return HadamardInt2LinearMethod(has_col_scale, COMPUTE_MODES[self.compute_mode])
 
 
 class HadamardInt2LinearMethod(LinearMethodBase):
@@ -215,8 +233,9 @@ class HadamardInt2LinearMethod(LinearMethodBase):
     gate/up layer is usually a single kernel call.
     """
 
-    def __init__(self, has_col_scale: bool):
+    def __init__(self, has_col_scale: bool, compute_mode: int = 0):
         self.has_col_scale = has_col_scale
+        self.compute_mode = compute_mode
         self.use_kernels = _rdna2_kernels_available()
 
     def create_weights(
@@ -231,7 +250,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
     ):
         if input_size_per_partition % hu.K_MULTIPLE:
             raise ValueError(
-                f"hadamard_int2: input size per partition {input_size_per_partition} "
+                f"HI2: input size per partition {input_size_per_partition} "
                 f"is not a multiple of {hu.K_MULTIPLE}"
             )
         layer.hi2_k = input_size_per_partition
@@ -299,7 +318,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
             missing = set(hu.FIELDS) - set(buffers)
             if missing:
                 raise ValueError(
-                    f"hadamard_int2: shard {shard_id} of {getattr(layer, 'prefix', '')}"
+                    f"HI2: shard {shard_id} of {getattr(layer, 'prefix', '')}"
                     f" is missing {sorted(missing)}"
                 )
             t = hu.canonicalize(buffers)
@@ -308,7 +327,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
             rows = [parts_spec[i][0] for i in idx]
             if hu.num_rows(t) != sum(rows):
                 raise ValueError(
-                    f"hadamard_int2: shard {shard_id} has {hu.num_rows(t)} rows, "
+                    f"HI2: shard {shard_id} has {hu.num_rows(t)} rows, "
                     f"expected {sum(rows)}"
                 )
             off = 0
@@ -317,7 +336,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
                 off += r
         parts = [p for p in found if p is not None]
         if len(parts) != len(found):
-            raise ValueError("hadamard_int2: not every output partition was loaded")
+            raise ValueError("HI2: not every output partition was loaded")
 
         k_full = hu.num_cols(parts[0])
         k_part = layer.hi2_k
@@ -328,7 +347,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
             if k_part != k_full:
                 if not isinstance(layer, RowParallelLinear):
                     raise ValueError(
-                        f"hadamard_int2: K={k_full} in the checkpoint, {k_part} "
+                        f"HI2: K={k_full} in the checkpoint, {k_part} "
                         "in a layer that does not shard its input"
                     )
                 k0 = layer.tp_rank * k_part
@@ -370,7 +389,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
         del layer._hi2_loaded
         if not self.use_kernels:
             logger.warning_once(
-                "hadamard_int2: RDNA2 HI2 kernels unavailable; using dequantized "
+                "HI2: RDNA2 HI2 kernels unavailable; using dequantized "
                 "fp16 weights (correct, not memory-saving)."
             )
 
@@ -398,6 +417,7 @@ class HadamardInt2LinearMethod(LinearMethodBase):
                     seg["row_block"],
                     seg["transform"],
                     DECODE_MAX_M,
+                    self.compute_mode,
                 )
             else:
                 xt = x2

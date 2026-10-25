@@ -275,7 +275,212 @@ __global__ void __launch_bounds__(kThreads) hi2_dequant_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// I8 compute mode (spec 6.2).
+//
+// Activation: per token and 16-column group g of the transformed activation
+//   sx_g = fp16(absmax / 127), xq = clamp(rint(x / sx_g), -127, 127),
+//   sumq_g = sum xq. The transform and the quantization group are the same
+//   16 columns, so one thread does both.
+// Weights: per 16-column chunk of a row, S_g = sum code * xq through four
+//   v_dot4_i32_i8; y += sx_g * (step * S_g + lo * sumq_g) in fp32.
+// INT8 codes (0..255) do not fit a signed byte: they enter the dot as
+//   code - 128 and S_g gets 128 * sumq_g back, exactly, in int32.
+// ---------------------------------------------------------------------------
+__global__ void hi2_act_quant_kernel(
+    const half* __restrict__ x, const int64_t ldx,
+    const half* __restrict__ col_scale, const uint8_t* __restrict__ had,
+    int8_t* __restrict__ xq, half* __restrict__ sx, int32_t* __restrict__ sumq,
+    const int M, const int K) {
+  const int groups = K / kGroup;
+  const int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= static_cast<int64_t>(M) * groups) return;
+  const int m = static_cast<int>(g / groups);
+  const int gi = static_cast<int>(g % groups);
+  const half* xp = x + m * ldx + gi * kGroup;
+  float v[kGroup];
+  #pragma unroll
+  for (int i = 0; i < kGroup; ++i) v[i] = __half2float(xp[i]);
+  if (col_scale != nullptr) {
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i)
+      v[i] = v[i] / __half2float(col_scale[gi * kGroup + i]);
+  }
+  if (had != nullptr && had[gi]) {
+  #pragma unroll
+    for (int len = 1; len < kGroup; len <<= 1) {
+  #pragma unroll
+      for (int i = 0; i < kGroup; ++i) {
+        if ((i & len) == 0) {
+          const float a = v[i], b = v[i + len];
+          v[i] = a + b;
+          v[i + len] = a - b;
+        }
+      }
+    }
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i) v[i] *= 0.25f;
+  }
+  float amax = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < kGroup; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  const half sh = __float2half_rn(amax / 127.0f);
+  const float sf = __half2float(sh);
+  union {
+    int8_t b[kGroup];
+    uint4 u;
+  } q;
+  int sum = 0;
+  #pragma unroll
+  for (int i = 0; i < kGroup; ++i) {
+    float r = sf > 0.0f ? rintf(v[i] / sf) : 0.0f;
+    r = fminf(fmaxf(r, -127.0f), 127.0f);
+    q.b[i] = static_cast<int8_t>(r);
+    sum += q.b[i];
+  }
+  *reinterpret_cast<uint4*>(xq + static_cast<int64_t>(m) * K + gi * kGroup) =
+      q.u;
+  sx[static_cast<int64_t>(m) * groups + gi] = sh;
+  sumq[static_cast<int64_t>(m) * groups + gi] = sum;
+}
+
+// Four consecutive codes as the bytes of one dword (code j in byte j).
+__device__ __forceinline__ int spread2(uint32_t x) {
+  return static_cast<int>((x & 0x03u) | ((x & 0x0Cu) << 6) |
+                          ((x & 0x30u) << 12) | ((x & 0xC0u) << 18));
+}
+__device__ __forceinline__ int spread4(uint32_t x) {
+  return static_cast<int>((x & 0x000Fu) | ((x & 0x00F0u) << 4) |
+                          ((x & 0x0F00u) << 8) | ((x & 0xF000u) << 12));
+}
+
+template <int NB>
+__device__ __forceinline__ void group_codes(const uint32_t* __restrict__ w,
+                                            int (&d)[4]) {
+  if constexpr (NB == 2) {
+    const uint32_t q = w[0];
+    d[0] = spread2(q);
+    d[1] = spread2(q >> 8);
+    d[2] = spread2(q >> 16);
+    d[3] = spread2(q >> 24);
+  } else if constexpr (NB == 4) {
+    const uint2 q = *reinterpret_cast<const uint2*>(w);
+    d[0] = spread4(q.x);
+    d[1] = spread4(q.x >> 16);
+    d[2] = spread4(q.y);
+    d[3] = spread4(q.y >> 16);
+  } else {
+    const uint4 q = *reinterpret_cast<const uint4*>(w);
+    d[0] = static_cast<int>(q.x ^ 0x80808080u);
+    d[1] = static_cast<int>(q.y ^ 0x80808080u);
+    d[2] = static_cast<int>(q.z ^ 0x80808080u);
+    d[3] = static_cast<int>(q.w ^ 0x80808080u);
+  }
+}
+
+template <int MT, int NB>
+__device__ __forceinline__ void row_dot_i8(
+    const int8_t* __restrict__ xq, const half* __restrict__ sx,
+    const int32_t* __restrict__ sumq, const int K, const int m0, const int M,
+    const uint32_t* __restrict__ words, const uint8_t* __restrict__ params,
+    const int lb, const float lo_min, const float lo_scale,
+    const float step_scale, const int lane, float (&acc)[MT]) {
+  constexpr int WPG = NB / 2;  // words per 16-column group
+  const int groups = K / kGroup;
+  for (int g = lane; g < groups; g += kWave) {
+    int d[4];
+    group_codes<NB>(words + g * WPG, d);
+    const int blk = (g * kGroup) >> lb;
+    half lo, step;
+    decode_params(params[2 * blk], params[2 * blk + 1], lo_min, lo_scale,
+                  step_scale, lo, step);
+    const float lof = __half2float(lo), stf = __half2float(step);
+  #pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      if (m0 + m < M) {
+        const int64_t row = static_cast<int64_t>(m0 + m);
+        const int4 xv =
+            *reinterpret_cast<const int4*>(xq + row * K + g * kGroup);
+        const int sq = sumq[row * groups + g];
+        int S = __builtin_amdgcn_sdot4(d[0], xv.x, 0, false);
+        S = __builtin_amdgcn_sdot4(d[1], xv.y, S, false);
+        S = __builtin_amdgcn_sdot4(d[2], xv.z, S, false);
+        S = __builtin_amdgcn_sdot4(d[3], xv.w, S, false);
+        if constexpr (NB == 8) S += 128 * sq;
+        const float sxf = __half2float(sx[row * groups + g]);
+        acc[m] +=
+            sxf * (stf * static_cast<float>(S) + lof * static_cast<float>(sq));
+      }
+    }
+  }
+}
+
+template <int MT>
+__global__ void __launch_bounds__(kThreads)
+    hi2_gemv_i8_kernel(const int8_t* __restrict__ xq,
+                       const half* __restrict__ sx,
+                       const int32_t* __restrict__ sumq, const int M,
+                       const int K, const int32_t* __restrict__ codes,
+                       const int32_t* __restrict__ code_off,
+                       const uint8_t* __restrict__ blk_params,
+                       const int32_t* __restrict__ param_off,
+                       const half* __restrict__ row_consts,
+                       const uint8_t* __restrict__ row_nbits,
+                       const uint8_t* __restrict__ row_block,
+                       half* __restrict__ out, const int64_t ldo, const int R) {
+  const int wave = threadIdx.x / kWave;
+  const int lane = threadIdx.x % kWave;
+  const int r = blockIdx.x * kRowsPerBlock + wave;
+  if (r >= R) return;
+  const int m0 = blockIdx.y * MT;
+  const int nb = row_nbits[r];
+  const int lb = log2_block(row_block[r]);
+  const float lo_min = __half2float(row_consts[3 * r + 0]);
+  const float lo_scale = __half2float(row_consts[3 * r + 1]);
+  const float step_scale = __half2float(row_consts[3 * r + 2]);
+  const uint32_t* words =
+      reinterpret_cast<const uint32_t*>(codes) + code_off[r];
+  const uint8_t* params = blk_params + 2 * static_cast<int64_t>(param_off[r]);
+  float acc[MT];
+  #pragma unroll
+  for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+  switch (nb) {
+    case 2:
+      row_dot_i8<MT, 2>(xq, sx, sumq, K, m0, M, words, params, lb, lo_min,
+                        lo_scale, step_scale, lane, acc);
+      break;
+    case 4:
+      row_dot_i8<MT, 4>(xq, sx, sumq, K, m0, M, words, params, lb, lo_min,
+                        lo_scale, step_scale, lane, acc);
+      break;
+    default:
+      row_dot_i8<MT, 8>(xq, sx, sumq, K, m0, M, words, params, lb, lo_min,
+                        lo_scale, step_scale, lane, acc);
+      break;
+  }
+  #pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    float v = acc[m];
+  #pragma unroll
+    for (int off = kWave / 2; off > 0; off >>= 1)
+      v += __shfl_xor(v, off, kWave);
+    if (lane == 0 && m0 + m < M)
+      out[static_cast<int64_t>(m0 + m) * ldo + r] = __float2half_rn(v);
+  }
+}
+
 #else  // non-RDNA2 device pass: empty kernels for symbol parity.
+
+__global__ void hi2_act_quant_kernel(const half*, const int64_t, const half*,
+                                     const uint8_t*, int8_t*, half*, int32_t*,
+                                     const int, const int) {}
+template <int MT>
+__global__ void hi2_gemv_i8_kernel(const int8_t*, const half*, const int32_t*,
+                                   const int, const int, const int32_t*,
+                                   const int32_t*, const uint8_t*,
+                                   const int32_t*, const half*, const uint8_t*,
+                                   const uint8_t*, half*, const int64_t,
+                                   const int) {}
 
 __global__ void hi2_act_transform_kernel(const half*, const int64_t,
                                          const half*, const uint8_t*, half*,
@@ -423,6 +628,71 @@ void launch_dequant(const Hi2Weight& w, torch::Tensor& out, int64_t R,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// I8 activation: xq [M, K] int8, sx [M, K/16] fp16, sumq [M, K/16] int32.
+void launch_act_quant(const torch::Tensor& x, const torch::Tensor& col_scale,
+                      const torch::Tensor& had, bool transform,
+                      torch::Tensor& xq, torch::Tensor& sx, torch::Tensor& sumq,
+                      cudaStream_t stream) {
+  const int64_t M = x.size(0), K = x.size(1);
+  const half* s = nullptr;
+  const uint8_t* h = nullptr;
+  if (transform) {
+    if (col_scale.numel() > 0) {
+      check_dev(col_scale, "col_scale", torch::kHalf);
+      TORCH_CHECK(col_scale.numel() == K, "hi2: col_scale must have K entries");
+      s = reinterpret_cast<const half*>(col_scale.data_ptr());
+    }
+    check_dev(had, "had", torch::kUInt8);
+    TORCH_CHECK(had.numel() == K / vllm::hi2::kGroup,
+                "hi2: had must have K/16 entries");
+    h = had.data_ptr<uint8_t>();
+  }
+  const int64_t n = M * (K / vllm::hi2::kGroup);
+  if (n == 0) return;
+  const int threads = 256;
+  vllm::hi2::
+      hi2_act_quant_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+          reinterpret_cast<const half*>(x.data_ptr()), x.stride(0), s, h,
+          xq.data_ptr<int8_t>(), reinterpret_cast<half*>(sx.data_ptr()),
+          sumq.data_ptr<int32_t>(), static_cast<int>(M), static_cast<int>(K));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int MT>
+void launch_gemv_i8_mt(const torch::Tensor& xq, const torch::Tensor& sx,
+                       const torch::Tensor& sumq, const Hi2Weight& w,
+                       torch::Tensor& out, int64_t R, cudaStream_t stream) {
+  const int64_t M = xq.size(0), K = xq.size(1);
+  dim3 grid((R + vllm::hi2::kRowsPerBlock - 1) / vllm::hi2::kRowsPerBlock,
+            (M + MT - 1) / MT);
+  vllm::hi2::hi2_gemv_i8_kernel<MT><<<grid, vllm::hi2::kThreads, 0, stream>>>(
+      xq.data_ptr<int8_t>(), reinterpret_cast<const half*>(sx.data_ptr()),
+      sumq.data_ptr<int32_t>(), static_cast<int>(M), static_cast<int>(K),
+      w.codes.data_ptr<int32_t>(), w.code_off.data_ptr<int32_t>(),
+      w.blk_params.data_ptr<uint8_t>(), w.param_off.data_ptr<int32_t>(),
+      reinterpret_cast<const half*>(w.row_consts.data_ptr()),
+      w.row_nbits.data_ptr<uint8_t>(), w.row_block.data_ptr<uint8_t>(),
+      reinterpret_cast<half*>(out.data_ptr()), out.stride(0),
+      static_cast<int>(R));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_gemv_i8(const torch::Tensor& xq, const torch::Tensor& sx,
+                    const torch::Tensor& sumq, const Hi2Weight& w,
+                    torch::Tensor& out, int64_t R, cudaStream_t stream) {
+  const int64_t M = xq.size(0);
+  if (M == 0 || R == 0) return;
+  if (M == 1) {
+    launch_gemv_i8_mt<1>(xq, sx, sumq, w, out, R, stream);
+  } else if (M == 2) {
+    launch_gemv_i8_mt<2>(xq, sx, sumq, w, out, R, stream);
+  } else if (M <= 4) {
+    launch_gemv_i8_mt<4>(xq, sx, sumq, w, out, R, stream);
+  } else {
+    launch_gemv_i8_mt<8>(xq, sx, sumq, w, out, R, stream);
+  }
+}
+
 }  // namespace
 
 // x [M, K] fp16 -> out [M, K] fp16 = H16(x / s) on flagged groups.
@@ -472,25 +742,78 @@ void hi2_dequant_rdna2(torch::Tensor codes, torch::Tensor code_off,
   launch_dequant(w, out, R, out.size(1), stream);
 }
 
+// I8 activation quantization (transform included when `transform`).
+void hi2_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                         torch::Tensor had, bool transform, torch::Tensor xq,
+                         torch::Tensor sx, torch::Tensor sumq) {
+  check_act(x, x.size(1));
+  const int64_t M = x.size(0), K = x.size(1);
+  check_dev(xq, "xq", torch::kInt8);
+  check_dev(sx, "sx", torch::kHalf);
+  check_dev(sumq, "sumq", torch::kInt32);
+  TORCH_CHECK(xq.numel() == M * K && sx.numel() == M * K / 16 &&
+                  sumq.numel() == M * K / 16,
+              "hi2: xq/sx/sumq must be [M, K], [M, K/16], [M, K/16]");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_act_quant(x, col_scale, had, transform, xq, sx, sumq, stream);
+}
+
+// I8 GEMV from a quantized activation -> out [M, R] fp16.
+void hi2_gemv_i8_rdna2(torch::Tensor xq, torch::Tensor sx, torch::Tensor sumq,
+                       torch::Tensor codes, torch::Tensor code_off,
+                       torch::Tensor blk_params, torch::Tensor param_off,
+                       torch::Tensor row_consts, torch::Tensor row_nbits,
+                       torch::Tensor row_block, torch::Tensor out) {
+  const Hi2Weight w{codes,      code_off,  blk_params, param_off,
+                    row_consts, row_nbits, row_block};
+  const int64_t R = check_weight(w);
+  check_dev(xq, "xq", torch::kInt8);
+  check_dev(sx, "sx", torch::kHalf);
+  check_dev(sumq, "sumq", torch::kInt32);
+  TORCH_CHECK(xq.dim() == 2 && xq.size(1) % 64 == 0, "hi2: xq must be [M, K]");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kHalf &&
+                  out.dim() == 2 && out.size(0) == xq.size(0) &&
+                  out.size(1) == R && out.stride(1) == 1,
+              "hi2: out must be fp16 [M, R] with unit column stride");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(xq));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_gemv_i8(xq, sx, sumq, w, out, R, stream);
+}
+
 // y = x . W^T for an HI2 tensor (transform included when `transform`).
-// M <= decode_max_m: GEMV kernel; otherwise dequant + rocBLAS GEMM.
+// mode 0 (F16): M <= decode_max_m runs the F16 GEMV, otherwise dequant +
+// rocBLAS GEMM. mode 1 (I8 decode): M <= decode_max_m runs the I8 path,
+// larger M as mode 0. mode 2 (I8 everywhere): the I8 path for every M.
 torch::Tensor hi2_linear_rdna2(torch::Tensor x, torch::Tensor col_scale,
                                torch::Tensor had, torch::Tensor codes,
                                torch::Tensor code_off, torch::Tensor blk_params,
                                torch::Tensor param_off,
                                torch::Tensor row_consts,
                                torch::Tensor row_nbits, torch::Tensor row_block,
-                               bool transform, int64_t decode_max_m) {
+                               bool transform, int64_t decode_max_m,
+                               int64_t mode) {
   const Hi2Weight w{codes,      code_off,  blk_params, param_off,
                     row_consts, row_nbits, row_block};
   const int64_t R = check_weight(w);
   const int64_t K = x.size(1);
   check_act(x, K);
+  TORCH_CHECK(mode >= 0 && mode <= 2, "hi2: mode must be 0, 1 or 2");
   const int64_t M = x.size(0);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();
   auto out = torch::empty({M, R}, x.options());
   if (M == 0 || R == 0) return out;
+
+  if (mode == 2 || (mode == 1 && M <= decode_max_m)) {
+    const auto opts = x.options();
+    auto xq = torch::empty({M, K}, opts.dtype(torch::kInt8));
+    auto sx = torch::empty({M, K / 16}, opts);
+    auto sumq = torch::empty({M, K / 16}, opts.dtype(torch::kInt32));
+    launch_act_quant(x, col_scale, had, transform, xq, sx, sumq, stream);
+    launch_gemv_i8(xq, sx, sumq, w, out, R, stream);
+    return out;
+  }
 
   torch::Tensor xt;
   if (transform) {

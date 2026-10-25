@@ -217,11 +217,23 @@ def test_utils_fallback_linear(smooth, had):
 
 
 def test_config_module_selection():
-    from vllm.model_executor.layers.quantization.hi2 import HadamardInt2Config
-
-    cfg = HadamardInt2Config.from_config(
-        {"quant_method": "hadamard_int2", "version": "3.2", "mode": "flex"}
+    from vllm.model_executor.layers.quantization import (
+        QUANTIZATION_METHODS,
+        get_quantization_config,
     )
+    from vllm.model_executor.layers.quantization.hi2 import HadamardInt2Config
+    from vllm.model_executor.layers.quantization.hi2_names import (
+        HI2_QUANT_METHOD,
+        HI2_QUANT_METHOD_NAMES,
+    )
+
+    for name in HI2_QUANT_METHOD_NAMES:
+        assert name in QUANTIZATION_METHODS
+        assert get_quantization_config(name) is HadamardInt2Config
+    cfg = HadamardInt2Config.from_config(
+        {"quant_method": HI2_QUANT_METHOD, "version": "3.2", "mode": "flex"}
+    )
+    assert cfg.get_name() == HI2_QUANT_METHOD
     names = []
     for m in ("q_proj", "k_proj", "v_proj"):
         base = f"model.language_model.layers.0.self_attn.{m}"
@@ -234,6 +246,24 @@ def test_config_module_selection():
     assert cfg._module_fields("visual.blocks.0.attn.qkv") == [None]
     with pytest.raises(ValueError):
         HadamardInt2Config(version="3.1")
+
+
+# ---- CPU: I8 compute mode reference (spec 6.2) ----------------------------
+@pytest.mark.parametrize("smooth", [False, True])
+def test_i8_reference(smooth):
+    t = make_hi2(32, 512, had="mixed", smooth=smooth, seed=21)
+    x = torch.randn(4, 512, dtype=torch.float16)
+    xt = hu.act_transform_f32(x, t)
+    ref = ref_fwht_groups(
+        x.double() / (t["col_scale"].double() if smooth else 1.0), t["had"]
+    )
+    assert rel_err(xt, ref) < 1e-6
+    xq, sx, sumq = hu.act_quant_i8(x, t)
+    assert xq.dtype == torch.int8 and int(xq.abs().max()) <= 127
+    assert torch.equal(sumq, xq.reshape(4, 32, 16).to(torch.int32).sum(-1))
+    # Group-wise int8 adds well under 1% output error (spec 5).
+    y = hu.i8_linear_reference(xq, sx, sumq, t)
+    assert rel_err(y, ref_linear(x, t)) < 1e-2
 
 
 # ---- GPU: RDNA2 kernels ---------------------------------------------------
@@ -265,7 +295,7 @@ def _dev(t: dict) -> dict:
     return d
 
 
-def _linear(x: torch.Tensor, d: dict, transform: bool, max_m: int = 8):
+def _linear(x: torch.Tensor, d: dict, transform: bool, max_m: int = 8, mode: int = 0):
     from vllm import _custom_ops as ops
 
     return ops.hi2_linear_rdna2(
@@ -281,6 +311,7 @@ def _linear(x: torch.Tensor, d: dict, transform: bool, max_m: int = 8):
         d["row_block"],
         transform,
         max_m,
+        mode,
     )
 
 
@@ -384,3 +415,49 @@ def test_gemv_strided_output():
     torch.accelerator.synchronize()
     assert rel_err(out, ref_linear(x, t)) < 2e-3
     assert not big[:, :20].any() and not big[:, 84:].any()
+
+
+@gfx1030_only
+@pytest.mark.parametrize(
+    "had,smooth", [("all", True), ("none", False), ("mixed", True)]
+)
+def test_act_quant_kernel_bit_exact(had, smooth):
+    from vllm import _custom_ops as ops
+
+    t = make_hi2(1, 2048, had=had, smooth=smooth, seed=31)
+    d = _dev(t)
+    x = torch.randn(7, 2048, dtype=torch.float16)
+    x[0, :16] = 0  # an all-zero group (sx = 0)
+    xq = torch.empty(7, 2048, dtype=torch.int8, device="cuda")
+    sx = torch.empty(7, 128, dtype=torch.float16, device="cuda")
+    sumq = torch.empty(7, 128, dtype=torch.int32, device="cuda")
+    tr = hu.needs_transform(t)
+    ops.hi2_act_quant_rdna2(x.cuda(), d["col_scale"], d["had"], tr, xq, sx, sumq)
+    torch.accelerator.synchronize()
+    rq, rs, rsum = hu.act_quant_i8(x, t, tr)
+    assert torch.equal(sx.cpu(), rs)
+    assert torch.equal(xq.cpu(), rq)
+    assert torch.equal(sumq.cpu(), rsum)
+
+
+@gfx1030_only
+@pytest.mark.parametrize("m", [1, 3, 8, 13])
+@pytest.mark.parametrize(
+    "nbits,blocks",
+    [((2,), (16,)), ((4,), (32,)), ((8,), (64,)), ((2, 4, 8), (16, 32, 64))],
+)
+def test_i8_linear_vs_reference(m, nbits, blocks):
+    r, k = 160, 1024
+    t = make_hi2(r, k, nbits=nbits, blocks=blocks, seed=40 + m)
+    d = _dev(t)
+    x = torch.randn(m, k, dtype=torch.float16)
+    xq, sx, sumq = hu.act_quant_i8(x, t)
+    ref = hu.i8_linear_reference(xq, sx, sumq, t)
+    y_all = _linear(x.cuda(), d, True, mode=2)
+    y_dec = _linear(x.cuda(), d, True, max_m=16, mode=1)
+    torch.accelerator.synchronize()
+    # Integer dots are exact; fp32 accumulation and the fp16 output remain.
+    assert rel_err(y_all, ref) < 1e-3
+    assert rel_err(y_dec, ref) < 1e-3
+    # The accuracy cost of I8 against the exact product stays small.
+    assert rel_err(y_all, ref_linear(x, t)) < 1e-2

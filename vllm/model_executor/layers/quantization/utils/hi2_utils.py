@@ -263,3 +263,84 @@ def dequantize_stored(t: Hi2) -> torch.Tensor:
             w = lo.double().unsqueeze(-1) + codes.double() * step.double().unsqueeze(-1)
             out[rows] = w.to(torch.float16).reshape(-1, k)
     return out
+
+
+# ---- I8 compute mode (spec 6.2) -------------------------------------------
+def act_transform_f32(x: torch.Tensor, t: Hi2) -> torch.Tensor:
+    """``H16 (x / s)`` in fp32 with the kernel's butterfly order, so the
+    result is bit-identical to the device transform before any rounding."""
+    k = x.shape[-1]
+    v = x.float()
+    s = t.get("col_scale")
+    if s is not None and s.numel() > 0:
+        v = v / s.to(x.device).float()
+    v = v.reshape(*x.shape[:-1], k // GROUP, GROUP)
+    rot = v
+    length = 1
+    while length < GROUP:
+        r = rot.reshape(*rot.shape[:-1], GROUP // (2 * length), 2, length)
+        a, b = r[..., 0, :], r[..., 1, :]
+        rot = torch.stack([a + b, a - b], dim=-2).reshape(v.shape)
+        length *= 2
+    rot = rot * 0.25
+    flags = t["had"].to(x.device).bool().reshape(-1, 1)
+    return torch.where(flags, rot, v).reshape(x.shape)
+
+
+def act_quant_i8(
+    x: torch.Tensor, t: Hi2, transform: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Spec 6.2 activation: per token and 16-column group,
+    ``sx = fp16(absmax / 127)``, ``xq = clamp(rint(x / sx), -127, 127)``,
+    ``sumq = sum(xq)``. Returns ``(xq int8 [M, K], sx fp16 [M, K/16],
+    sumq int32 [M, K/16])``."""
+    v = act_transform_f32(x, t) if transform else x.float()
+    m, k = v.shape
+    vg = v.reshape(m, k // GROUP, GROUP)
+    sx = (vg.abs().amax(-1) / 127.0).to(torch.float16)
+    sf = sx.float().unsqueeze(-1)
+    q = torch.where(sf > 0, torch.round(vg / torch.where(sf > 0, sf, 1.0)), 0.0)
+    q = q.clamp(-127, 127).to(torch.int8)
+    return q.reshape(m, k), sx, q.to(torch.int32).sum(-1)
+
+
+def i8_linear_reference(
+    xq: torch.Tensor, sx: torch.Tensor, sumq: torch.Tensor, t: Hi2
+) -> torch.Tensor:
+    """float64 ``[M, R]``: ``sum_g sx_g * (step * S_g + lo * sumq_g)`` with the
+    integer ``S_g = sum code * xq`` computed exactly."""
+    r, k = num_rows(t), num_cols(t)
+    g = k // GROUP
+    codes = torch.zeros(r, k, dtype=torch.float64)
+    lo = torch.zeros(r, g, dtype=torch.float64)
+    step = torch.zeros(r, g, dtype=torch.float64)
+    nb = t["row_nbits"].to(torch.int64)
+    bl = t["row_block"].to(torch.int64)
+    co = t["code_off"].to(torch.int64)
+    po = t["param_off"].to(torch.int64)
+    pv = t["blk_params"].view(-1, 2)
+    for nbits in sorted(set(nb.tolist())):
+        for bs in sorted(set(bl.tolist())):
+            rows = ((nb == nbits) & (bl == bs)).nonzero().flatten()
+            if rows.numel() == 0:
+                continue
+            wr, nblk = k * nbits // 32, k // bs
+            words = t["codes"][co[rows].unsqueeze(1) + torch.arange(wr)]
+            codes[rows] = unpack_codes(words, nbits).double()
+            p = pv[po[rows].unsqueeze(1) + torch.arange(nblk)]
+            rc = t["row_consts"][rows].unsqueeze(1)
+            lo_b = (
+                (p[..., 0].double() * rc[..., 1].double() + rc[..., 0].double())
+                .float()
+                .to(torch.float16)
+            )
+            st_b = (p[..., 1].float() * rc[..., 2].float()).to(torch.float16)
+            rep = bs // GROUP
+            lo[rows] = lo_b.double().repeat_interleave(rep, dim=1)
+            step[rows] = st_b.double().repeat_interleave(rep, dim=1)
+    m = xq.shape[0]
+    xg = xq.double().reshape(m, g, GROUP)
+    s_int = torch.einsum("rgj,mgj->mrg", codes.reshape(r, g, GROUP), xg)
+    sxd = sx.double().unsqueeze(1)  # [m, 1, g]
+    sq = sumq.double().unsqueeze(1)
+    return (sxd * (step.unsqueeze(0) * s_int + lo.unsqueeze(0) * sq)).sum(-1)

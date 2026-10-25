@@ -1294,4 +1294,13 @@ torch::Tensor hi2_linear_rdna2(torch::Tensor x, torch::Tensor col_scale,
                                torch::Tensor param_off,
                                torch::Tensor row_consts,
                                torch::Tensor row_nbits, torch::Tensor row_block,
-                               bool transform, int64_t decode_max_m);
+                               bool transform, int64_t decode_max_m,
+                               int64_t mode);
+void hi2_act_quant_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                         torch::Tensor had, bool transform, torch::Tensor xq,
+                         torch::Tensor sx, torch::Tensor sumq);
+void hi2_gemv_i8_rdna2(torch::Tensor xq, torch::Tensor sx, torch::Tensor sumq,
+                       torch::Tensor codes, torch::Tensor code_off,
+                       torch::Tensor blk_params, torch::Tensor param_off,
+                       torch::Tensor row_consts, torch::Tensor row_nbits,
+                       torch::Tensor row_block, torch::Tensor out);
