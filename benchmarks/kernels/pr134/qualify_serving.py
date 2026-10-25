@@ -359,6 +359,22 @@ def main():
         "pick the attention block size.",
     )
     parser.add_argument(
+        "--w4a8",
+        choices=("0", "1"),
+        default=None,
+        help="Enable the int8-activation prefill GEMM path "
+        "(VLLM_RDNA2_W4A8_SDOT4=1). Prefill only: decode stays W4A16. The "
+        "default leaves the recipe's own W4A8 setting alone.",
+    )
+    parser.add_argument(
+        "--decode-stall-ms",
+        type=int,
+        default=None,
+        help="Override the decode-stall cap (VLLM_RDNA_DECODE_STALL_MS) that "
+        "bounds prefill work in steps that carry decodes. 0 disables the cap. "
+        "The default leaves the recipe's value alone.",
+    )
+    parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
         default=None,
@@ -419,6 +435,27 @@ def main():
         PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED="0",
         TUNEOP_REQUIRE_HASH_ROWS="1",
     )
+    # The two serving levers the recipe exposes. Both are environment knobs
+    # read before the server starts, so they are pinned here to keep an arm
+    # self-contained: the caller's environment cannot leak into it.
+    knobs = {
+        "w4a8": "recipe" if args.w4a8 is None else args.w4a8,
+        "decode_stall_ms": (
+            "recipe" if args.decode_stall_ms is None else args.decode_stall_ms
+        ),
+    }
+    if args.w4a8 is None:
+        # No override: drop any inherited value so the recipe's own W4A8
+        # setting governs the arm.
+        env.pop("VLLM_RDNA2_W4A8_SDOT4", None)
+    else:
+        env["VLLM_RDNA2_W4A8_SDOT4"] = args.w4a8
+    if args.decode_stall_ms is None:
+        # No override: drop any inherited value so the recipe's own setting
+        # (VLLM_RDNA_DECODE_STALL_MS) governs the arm.
+        env.pop("VLLM_RDNA_DECODE_STALL_MS", None)
+    else:
+        env["VLLM_RDNA_DECODE_STALL_MS"] = str(args.decode_stall_ms)
     features = "prefix-caching mamba-align language-model-only skip-mm-profiling"
     if args.recipe == "flashnext-mtp2":
         features += " expert-parallel"
@@ -538,6 +575,11 @@ def main():
         # per arm: the budget must cover two mamba state blocks, which the
         # server log assertion above enforces on both arms.
         assert reference_run["kv_cache_layout"] == args.layout
+        assert reference_run.get("knobs") == knobs, (
+            "reference levers differ: "
+            f"{reference_run.get('knobs')} != {knobs}; the paired PPL check "
+            "would compare two different server configurations"
+        )
         assert reference_run["boot_id"] == boot_id()
         assert (
             json.loads((args.reference / "manifest.before.json").read_text())
@@ -567,6 +609,7 @@ def main():
             "cache_dtype": args.cache_dtype,
             "kv_cache_layout": args.layout,
             "recipe": args.recipe,
+            "knobs": knobs,
             "model": str(args.model),
             "reference": str(args.reference) if args.reference else None,
             "reference_mode": reference_mode,
