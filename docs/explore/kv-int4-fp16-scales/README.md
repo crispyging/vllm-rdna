@@ -3,7 +3,8 @@
 **Status**: implemented and measured on gfx1030. The format below is now a
 serving dtype. `int4_fp16_block` is a real `CacheDType`; the RDNA2 attention
 backend reads and writes it natively, with the FP16 block scale and the
-zero-point riding inside the packed record; and the Triton backend writes it.
+zero-point riding inside the packed record. Every other backend refuses the
+dtype up front rather than reading it as the wrong format.
 The format contract, the reference codec and the measurement plan stay here
 because they are the reason the format is what it is. Nothing changes by
 default - the dtype is opt-in through `--kv-cache-dtype int4_fp16_block`.
@@ -493,20 +494,21 @@ accumulate, not the scalar-FMA fallback the shipped format lands on.
 | native read/write | `csrc/rocm/int4_fp16_kv_cache.cu`, `csrc/rocm/fa_rdna2.cu` | the packed writer, the packed reader and the dequantising FA-RDNA2 kernels |
 | op registration | `csrc/rocm/torch_bindings.cpp`, `vllm/v1/attention/ops/fa_rdna2_backend.py` | `reshape_and_cache_int4_fp16_rdna2` and `fa_rdna2_paged_int4_fp16_block` |
 | backend opt-in | `vllm/v1/attention/backends/rdna_attn.py` | `supported_kv_cache_dtypes`, the read views, the native dispatch and the configuration checks |
-| write-only fallback | `vllm/v1/attention/backends/triton_attn.py` | the Triton backend writes the packed record and reads it back through the same codec |
+| backend refusal | `vllm/v1/attention/backends/triton_attn.py` | the Triton backend refuses the dtype: no Triton kernel packs the record |
 
 The Triton backend already listed `int4_per_token_head`
-(`vllm/v1/attention/backends/triton_attn.py:320`); it now also lists
-`int4_fp16_block`, and it writes the same packed record the RDNA2 backend
-reads. The RDNA2 backend is the one that reads it back natively, in the FA
-kernel itself.
+(`vllm/v1/attention/backends/triton_attn.py:320`), and it refuses
+`int4_fp16_block` in `supports_combination` (`:373-388`) and again in its
+constructor (`:565-566`): the dtype is absent from `supported_kv_cache_dtypes`
+(`:313-323`), because no Triton kernel packs the packed record. The RDNA2
+backend is the one that writes and reads it natively, in the FA kernel itself.
 
 ### Coverage
 
 | Deployment | `int4_fp16_block` | Why |
 | --- | --- | --- |
 | `RDNA_ATTN` (gfx1030, Qwen3.x-style text models) | yes, native read and write | the FA-RDNA2 kernels dequantise in registers and keep the FP16 dot |
-| `TRITON_ATTN` | write only | it writes the packed record; the read path is not on this PR |
+| `TRITON_ATTN` | no | no Triton kernel packs the record, so the backend refuses the dtype up front (`vllm/v1/attention/backends/triton_attn.py`) |
 | `QWEN4_EXP_QSA_TRITON` (Qwen4Exp, Flash-Next) | no | the QSA owner reads the main KV cache as FP16/BF16 words and refuses any other cache dtype (`vllm/models/qwen4_exp/amd/qsa.py`) |
 | `--monokernel` (Qwen4Exp MonoKernel on gfx1030) | no | the mono QSA kernels read K and V as FP16 words; the switch refuses a quantized KV cache up front (`vllm/models/qwen4_exp/amd/mono_decode_rdna2.py`) |
 
@@ -633,7 +635,7 @@ tree (`benchmarks/kernels/pr134/refresh_evidence.sh`).
 ## What this PR does not contain
 
 - No change for any other platform. The dtype is opt-in; the RDNA2 backend
-  only takes it on gfx10x, and the Triton backend only lists it.
+  only takes it on gfx10x, and every other backend refuses it.
 - No INT4 KV support for the Qwen4Exp / Flash-Next attention path or for the
   MonoKernel. Those read the main KV cache as FP16/BF16 words and refuse a
   quantized cache explicitly (see *Coverage*).
