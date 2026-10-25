@@ -1352,6 +1352,131 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "mxfp4_gemm_rdna
         return
 
 
+# HadamardINT2-FP16 (HI2, spec v3.2) weight kernels for RDNA2 (gfx1030).
+# `w` is the flat per-row buffer dict of one HI2 tensor (see
+# vllm/model_executor/layers/quantization/utils/hi2_utils.py).
+def hi2_linear_rdna2(
+    x: torch.Tensor,
+    col_scale: torch.Tensor,
+    had: torch.Tensor,
+    codes: torch.Tensor,
+    code_off: torch.Tensor,
+    blk_params: torch.Tensor,
+    param_off: torch.Tensor,
+    row_consts: torch.Tensor,
+    row_nbits: torch.Tensor,
+    row_block: torch.Tensor,
+    transform: bool,
+    decode_max_m: int,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.hi2_linear_rdna2(
+        x,
+        col_scale,
+        had,
+        codes,
+        code_off,
+        blk_params,
+        param_off,
+        row_consts,
+        row_nbits,
+        row_block,
+        transform,
+        decode_max_m,
+    )
+
+
+def hi2_gemv_rdna2(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    code_off: torch.Tensor,
+    blk_params: torch.Tensor,
+    param_off: torch.Tensor,
+    row_consts: torch.Tensor,
+    row_nbits: torch.Tensor,
+    row_block: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.hi2_gemv_rdna2(
+        x, codes, code_off, blk_params, param_off, row_consts, row_nbits,
+        row_block, out,
+    )  # fmt: skip
+
+
+def hi2_dequant_rdna2(
+    codes: torch.Tensor,
+    code_off: torch.Tensor,
+    blk_params: torch.Tensor,
+    param_off: torch.Tensor,
+    row_consts: torch.Tensor,
+    row_nbits: torch.Tensor,
+    row_block: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.hi2_dequant_rdna2(
+        codes, code_off, blk_params, param_off, row_consts, row_nbits,
+        row_block, out,
+    )  # fmt: skip
+
+
+def hi2_act_transform_rdna2(
+    x: torch.Tensor, col_scale: torch.Tensor, had: torch.Tensor, out: torch.Tensor
+) -> None:
+    torch.ops._rocm_C.hi2_act_transform_rdna2(x, col_scale, had, out)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "hi2_linear_rdna2"):
+
+    @register_fake("_rocm_C::hi2_linear_rdna2")
+    def _hi2_linear_rdna2_fake(
+        x: torch.Tensor,
+        col_scale: torch.Tensor,
+        had: torch.Tensor,
+        codes: torch.Tensor,
+        code_off: torch.Tensor,
+        blk_params: torch.Tensor,
+        param_off: torch.Tensor,
+        row_consts: torch.Tensor,
+        row_nbits: torch.Tensor,
+        row_block: torch.Tensor,
+        transform: bool,
+        decode_max_m: int,
+    ) -> torch.Tensor:
+        return x.new_empty((x.size(0), row_nbits.size(0)))
+
+    @register_fake("_rocm_C::hi2_gemv_rdna2")
+    def _hi2_gemv_rdna2_fake(
+        x: torch.Tensor,
+        codes: torch.Tensor,
+        code_off: torch.Tensor,
+        blk_params: torch.Tensor,
+        param_off: torch.Tensor,
+        row_consts: torch.Tensor,
+        row_nbits: torch.Tensor,
+        row_block: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        return
+
+    @register_fake("_rocm_C::hi2_dequant_rdna2")
+    def _hi2_dequant_rdna2_fake(
+        codes: torch.Tensor,
+        code_off: torch.Tensor,
+        blk_params: torch.Tensor,
+        param_off: torch.Tensor,
+        row_consts: torch.Tensor,
+        row_nbits: torch.Tensor,
+        row_block: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        return
+
+    @register_fake("_rocm_C::hi2_act_transform_rdna2")
+    def _hi2_act_transform_rdna2_fake(
+        x: torch.Tensor, col_scale: torch.Tensor, had: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        return
+
+
 def moe_mxfp4_gemm_rdna2(
     a: torch.Tensor,
     c: torch.Tensor,

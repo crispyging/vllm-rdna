@@ -655,6 +655,7 @@ class RocmPlatform(Platform):
         "online",
         "gpt_oss_mxfp4",
         "exl3",
+        "hadamard_int2",
     ]
 
     @classmethod
