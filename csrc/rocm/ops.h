@@ -1308,3 +1308,15 @@ void rdna_hint_flex_gemv_i8_rdna2(
     torch::Tensor code_off, torch::Tensor blk_params, torch::Tensor param_off,
     torch::Tensor row_consts, torch::Tensor row_nbits, torch::Tensor row_block,
     torch::Tensor out);
+torch::Tensor rdna_hint_flex_moe_rdna2(
+    torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor w13_codes, torch::Tensor w13_code_off,
+    torch::Tensor w13_blk_params, torch::Tensor w13_param_off,
+    torch::Tensor w13_row_consts, torch::Tensor w13_row_nbits,
+    torch::Tensor w13_row_block, torch::Tensor w13_col_scale,
+    torch::Tensor w13_had, bool w13_transform, torch::Tensor w2_codes,
+    torch::Tensor w2_code_off, torch::Tensor w2_blk_params,
+    torch::Tensor w2_param_off, torch::Tensor w2_row_consts,
+    torch::Tensor w2_row_nbits, torch::Tensor w2_row_block,
+    torch::Tensor w2_col_scale, torch::Tensor w2_had, bool w2_transform,
+    int64_t num_experts, int64_t intermediate);

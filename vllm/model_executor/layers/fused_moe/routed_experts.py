@@ -673,9 +673,9 @@ class RoutedExperts(PluggableLayer):
         if expert_id == -1 and not use_global_sf:
             # Failed to load this param since it's not local to this rank
             return False if return_success else None
-        if quant_method_name == "Exl3MoEMethod":
+        if quant_method_name in ("Exl3MoEMethod", "RdnaHintFlexMoEMethod"):
             # EXL3 trellis/suh/svh have their own layout and TP slicing.
-            self.quant_method.absorb(
+            cast(Any, self.quant_method).absorb(
                 self, loaded_weight, weight_name, shard_id, expert_id
             )
             return True if return_success else None
@@ -959,6 +959,13 @@ class RoutedExperts(PluggableLayer):
                         param_name = param_name[: -len(exl3_kind)] + "weight"
                         weight_name = f"{param_name}.{exl3_kind}"
                         break
+                # rdna_hint_flex checkpoints use ragged .hi2_<field> buffers:
+                # experts.E.gate_proj.hi2_codes maps to w13_hi2_codes; the
+                # quant method collects them through w13_weight's loader.
+                head, sep, field = param_name.partition("_hi2_")
+                if sep and head in ("w13", "w2"):
+                    param_name = f"{head}_weight"
+                    weight_name = f"{param_name}.hi2_{field}"
                 param = getattr(self, param_name, None)
                 if param is None:
                     if param_name.endswith(("w13_bias", "w2_bias")):

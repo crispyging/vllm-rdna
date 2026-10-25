@@ -1387,6 +1387,34 @@ def rdna_hint_flex_linear_rdna2(
     )
 
 
+def rdna_hint_flex_moe_rdna2(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: dict[str, torch.Tensor],
+    w13_transform: bool,
+    w2: dict[str, torch.Tensor],
+    w2_transform: bool,
+    num_experts: int,
+    intermediate: int,
+) -> torch.Tensor:
+    """Routed experts on stacked rdna_hint_flex tensors (see the op comment in
+    csrc/rocm/rdna_hint_flex_rdna2.cu)."""
+    f = ("codes", "code_off", "blk_params", "param_off", "row_consts",
+         "row_nbits", "row_block", "col_scale", "had")  # fmt: skip
+    return torch.ops._rocm_C.rdna_hint_flex_moe_rdna2(
+        x,
+        topk_ids,
+        topk_weights,
+        *(w13[k] for k in f),
+        w13_transform,
+        *(w2[k] for k in f),
+        w2_transform,
+        num_experts,
+        intermediate,
+    )
+
+
 def rdna_hint_flex_act_quant_rdna2(
     x: torch.Tensor,
     col_scale: torch.Tensor,
@@ -1480,6 +1508,10 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         mode: int,
     ) -> torch.Tensor:
         return x.new_empty((x.size(0), row_nbits.size(0)))
+
+    @register_fake("_rocm_C::rdna_hint_flex_moe_rdna2")
+    def _rdna_hint_flex_moe_rdna2_fake(x: torch.Tensor, *args) -> torch.Tensor:
+        return torch.empty_like(x)
 
     @register_fake("_rocm_C::rdna_hint_flex_act_quant_rdna2")
     def _rdna_hint_flex_act_quant_rdna2_fake(

@@ -199,6 +199,25 @@ class RdnaHintFlexConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts,
+        )
+
+        if isinstance(layer, RoutedExperts):
+            if self._rdna_hint_flex_modules is None:
+                return None
+            head = _norm_name(prefix) + "."
+            if not any(k.startswith(head) for k in self._rdna_hint_flex_modules):
+                return None
+            if not _rdna2_kernels_available():
+                raise NotImplementedError(
+                    "rdna_hint_flex routed experts need the RDNA2 kernels"
+                )
+            from vllm.model_executor.layers.quantization.rdna_hint_flex_moe import (
+                RdnaHintFlexMoEMethod,
+            )
+
+            return RdnaHintFlexMoEMethod(layer.moe_config)
         if not isinstance(layer, LinearBase):
             return None
         if self._rdna_hint_flex_modules is None:

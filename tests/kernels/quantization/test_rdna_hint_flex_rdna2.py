@@ -465,3 +465,62 @@ def test_i8_linear_vs_reference(m, nbits, blocks):
     assert rel_err(y_dec, ref) < 1e-3
     # The accuracy cost of I8 against the exact product stays small.
     assert rel_err(y_all, ref_linear(x, t)) < 1e-2
+
+
+# ---- GPU: routed experts on a tiny synthetic checkpoint --------------------
+def _synthetic_experts(e: int, hidden: int, inter: int, seed: int):
+    """Per expert: gate/up sharing one transform, down with its own, mixed
+    row widths and blocks (the layout tools/hi2 would write per expert)."""
+    gate, up, down = [], [], []
+    for i in range(e):
+        g = make_hi2(inter, hidden, seed=seed + 10 * i, smooth=True)
+        u = make_hi2(inter, hidden, seed=seed + 10 * i + 1, smooth=True)
+        u["had"], u["col_scale"] = g["had"], g["col_scale"]
+        d = make_hi2(hidden, inter, seed=seed + 10 * i + 2, smooth=i % 2 == 0)
+        gate.append(g)
+        up.append(u)
+        down.append(d)
+    return gate, up, down
+
+
+class _Experts(torch.nn.Module):
+    pass
+
+
+@gfx1030_only
+@pytest.mark.parametrize("tokens", [1, 3, 9])
+def test_moe_vs_dense_reference(tokens):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.rdna_hint_flex_moe import (
+        RdnaHintFlexMoEMethod,
+        moe_reference,
+    )
+
+    e, hidden, inter, top_k = 4, 256, 128, 2
+    gate, up, down = _synthetic_experts(e, hidden, inter, seed=100)
+    with torch.device("cuda"):
+        layer = _Experts()
+        method = RdnaHintFlexMoEMethod(None)
+        method.create_weights(layer, e, hidden, inter, torch.float16)
+    layer.moe_config = SimpleNamespace(tp_size=1, tp_rank=0)
+    layer.activation = "silu"
+    for shard, tensors in (("w1", gate), ("w3", up), ("w2", down)):
+        param = "w2_weight" if shard == "w2" else "w13_weight"
+        for i, t in enumerate(tensors):
+            for f, v in t.items():
+                method.absorb(layer, v, f"{param}.hi2_{f}", shard, i)
+    method.process_weights_after_loading(layer)
+
+    g = torch.Generator().manual_seed(tokens)
+    x = (torch.randn(tokens, hidden, generator=g) * 0.5).to(torch.float16)
+    ids = torch.stack([torch.randperm(e, generator=g)[:top_k] for _ in range(tokens)])
+    if tokens > 1:
+        ids[1, 1] = -1  # a pair whose expert is not on this rank
+    w = torch.softmax(torch.randn(tokens, top_k, generator=g), -1)
+    out = method.apply(layer, x.cuda(), w.cuda(), ids.cuda())
+    torch.accelerator.synchronize()
+    ref = moe_reference(x, ids, w, gate, up, down)
+    assert out.shape == (tokens, hidden)
+    # fp16 activations between the stages (transform, gate/up, SiLU product).
+    assert rel_err(out, ref) < 1e-2

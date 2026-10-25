@@ -141,14 +141,18 @@ def _same_transform(a: Hi2, b: Hi2) -> bool:
     return torch.equal(a["had"], b["had"])
 
 
-def concat_rows(parts: list[Hi2]) -> Hi2:
-    """Stack tensors with the same K and the same transform along R."""
+def concat_rows(parts: list[Hi2], check_transform: bool = True) -> Hi2:
+    """Stack tensors with the same K along R. With ``check_transform`` they
+    must also share the transform (the result keeps the first one's); routed
+    experts pass False and keep their transforms separately."""
     if len(parts) == 1:
         return dict(parts[0])
     first = parts[0]
     for p in parts[1:]:
-        if num_cols(p) != num_cols(first) or not _same_transform(first, p):
-            raise ValueError("rdna_hint_flex: concat_rows needs equal K and transform")
+        if num_cols(p) != num_cols(first):
+            raise ValueError("rdna_hint_flex: concat_rows needs equal K")
+        if check_transform and not _same_transform(first, p):
+            raise ValueError("rdna_hint_flex: concat_rows needs equal transforms")
     out = dict(first)
     for f, off in (("codes", "code_off"), ("blk_params", "param_off")):
         bases, total = [], 0
