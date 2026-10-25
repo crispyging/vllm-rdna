@@ -1,0 +1,240 @@
+{
+  "campaign": "PR134 serving levers on the INT4 + fp16-SSM configuration",
+  "model": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+  "arms": [
+    {
+      "dir": "serve-27b-fp16-core4292ace2-w4a8-ssm16-hip6789",
+      "kv_cache": "fp16",
+      "knobs": {
+        "w4a8": "1",
+        "decode_stall_ms": "recipe"
+      },
+      "boot_id": "9d2621ae-2838-4db6-951d-43ccd261f397",
+      "status": "PASS",
+      "cleanup": "PASS",
+      "qualification_mode": "strict-pass",
+      "raw_status": "PASS",
+      "kernel_events": {
+        "verdict": "clean",
+        "corrected_event_groups": 0,
+        "corrected_error_count": 0,
+        "fatal_event_groups": 0,
+        "fatal_events": [],
+        "endpoints_with_nonfatal_err": 0,
+        "endpoints_with_bad_tlp": 0,
+        "aer_recovery_buffer_overflows": []
+      },
+      "ppl_paired": null,
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_tokens_per_s": 87.27,
+          "whole_run_input_tokens_per_s": 174.5,
+          "mean_ttft_s": 0.73,
+          "mean_request_prefill_tokens_per_s": 1408.1,
+          "mean_request_decode_tokens_per_s": 99.68,
+          "acceptance_length": 2.8275862068965516,
+          "acceptance_rate": 91.37931034482759
+        },
+        "1k x c=8": {
+          "aggregate_output_tokens_per_s": 234.18,
+          "whole_run_input_tokens_per_s": 468.4,
+          "mean_ttft_s": 1.96,
+          "mean_request_prefill_tokens_per_s": 753.1,
+          "mean_request_decode_tokens_per_s": 35.01,
+          "acceptance_length": 2.752057785990257,
+          "acceptance_rate": 87.60288929951285
+        },
+        "16k x c=1": {
+          "aggregate_output_tokens_per_s": 36.11,
+          "whole_run_input_tokens_per_s": 577.7,
+          "mean_ttft_s": 15.23,
+          "mean_request_prefill_tokens_per_s": 1075.9,
+          "mean_request_decode_tokens_per_s": 77.94,
+          "acceptance_length": 2.9464028776978415,
+          "acceptance_rate": 97.32014388489209
+        },
+        "16k x c=8": {
+          "aggregate_output_tokens_per_s": 52.35,
+          "whole_run_input_tokens_per_s": 837.6,
+          "mean_ttft_s": 35.56,
+          "mean_request_prefill_tokens_per_s": 687.5,
+          "mean_request_decode_tokens_per_s": 9.85,
+          "acceptance_length": 2.888134696755994,
+          "acceptance_rate": 94.40673483779972
+        }
+      }
+    },
+    {
+      "dir": "serve-27b-fp16-core4292ace2-w4a8-ssm16-real-hip6789",
+      "kv_cache": "fp16",
+      "knobs": {
+        "w4a8": "1",
+        "decode_stall_ms": "recipe"
+      },
+      "boot_id": "9d2621ae-2838-4db6-951d-43ccd261f397",
+      "status": "PASS",
+      "cleanup": "PASS",
+      "qualification_mode": "strict-pass",
+      "raw_status": "PASS",
+      "kernel_events": {
+        "verdict": "clean",
+        "corrected_event_groups": 0,
+        "corrected_error_count": 0,
+        "fatal_event_groups": 0,
+        "fatal_events": [],
+        "endpoints_with_nonfatal_err": 0,
+        "endpoints_with_bad_tlp": 0,
+        "aer_recovery_buffer_overflows": []
+      },
+      "ppl_paired": null,
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_tokens_per_s": 87.57,
+          "whole_run_input_tokens_per_s": 175.1,
+          "mean_ttft_s": 0.73,
+          "mean_request_prefill_tokens_per_s": 1409.6,
+          "mean_request_decode_tokens_per_s": 100.04,
+          "acceptance_length": 2.8320663441603315,
+          "acceptance_rate": 91.60331720801659
+        },
+        "1k x c=8": {
+          "aggregate_output_tokens_per_s": 233.3,
+          "whole_run_input_tokens_per_s": 466.6,
+          "mean_ttft_s": 1.96,
+          "mean_request_prefill_tokens_per_s": 746.8,
+          "mean_request_decode_tokens_per_s": 34.85,
+          "acceptance_length": 2.7455185123136205,
+          "acceptance_rate": 87.27592561568102
+        },
+        "16k x c=1": {
+          "aggregate_output_tokens_per_s": 36.09,
+          "whole_run_input_tokens_per_s": 577.5,
+          "mean_ttft_s": 15.24,
+          "mean_request_prefill_tokens_per_s": 1074.9,
+          "mean_request_decode_tokens_per_s": 77.95,
+          "acceptance_length": 2.9474631162288594,
+          "acceptance_rate": 97.37315581144297
+        },
+        "16k x c=8": {
+          "aggregate_output_tokens_per_s": 52.3,
+          "whole_run_input_tokens_per_s": 836.7,
+          "mean_ttft_s": 34.41,
+          "mean_request_prefill_tokens_per_s": 719.2,
+          "mean_request_decode_tokens_per_s": 9.76,
+          "acceptance_length": 2.871603856266433,
+          "acceptance_rate": 93.58019281332164
+        }
+      }
+    },
+    {
+      "dir": "serve-27b-int4-core4292ace2-w4a8-ssm16-real-hip6789",
+      "kv_cache": "int4_fp16_block",
+      "knobs": {
+        "w4a8": "1",
+        "decode_stall_ms": "recipe"
+      },
+      "boot_id": "9d2621ae-2838-4db6-951d-43ccd261f397",
+      "status": "PASS",
+      "cleanup": "PASS",
+      "qualification_mode": "strict-pass",
+      "raw_status": "PASS",
+      "kernel_events": {
+        "verdict": "clean",
+        "corrected_event_groups": 0,
+        "corrected_error_count": 0,
+        "fatal_event_groups": 0,
+        "fatal_events": [],
+        "endpoints_with_nonfatal_err": 0,
+        "endpoints_with_bad_tlp": 0,
+        "aer_recovery_buffer_overflows": []
+      },
+      "ppl_paired": {
+        "candidate": 4.92,
+        "reference": 4.91,
+        "ratio": 1.0020366598778003,
+        "max_ratio": 1.05
+      },
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_tokens_per_s": 81.63,
+          "whole_run_input_tokens_per_s": 163.3,
+          "mean_ttft_s": 0.73,
+          "mean_request_prefill_tokens_per_s": 1405.8,
+          "mean_request_decode_tokens_per_s": 94.06,
+          "acceptance_length": 2.603941513032422,
+          "acceptance_rate": 80.1970756516211
+        },
+        "1k x c=8": {
+          "aggregate_output_tokens_per_s": 230.01,
+          "whole_run_input_tokens_per_s": 460.0,
+          "mean_ttft_s": 2.08,
+          "mean_request_prefill_tokens_per_s": 690.8,
+          "mean_request_decode_tokens_per_s": 34.35,
+          "acceptance_length": 2.7364729458917836,
+          "acceptance_rate": 86.82364729458918
+        },
+        "16k x c=1": {
+          "aggregate_output_tokens_per_s": 37.51,
+          "whole_run_input_tokens_per_s": 600.2,
+          "mean_ttft_s": 14.97,
+          "mean_request_prefill_tokens_per_s": 1094.7,
+          "mean_request_decode_tokens_per_s": 82.97,
+          "acceptance_length": 2.9692028985507246,
+          "acceptance_rate": 98.46014492753623
+        },
+        "16k x c=8": {
+          "aggregate_output_tokens_per_s": 50.48,
+          "whole_run_input_tokens_per_s": 807.6,
+          "mean_ttft_s": 39.53,
+          "mean_request_prefill_tokens_per_s": 576.3,
+          "mean_request_decode_tokens_per_s": 9.34,
+          "acceptance_length": 2.9263261296660117,
+          "acceptance_rate": 96.31630648330058
+        }
+      }
+    }
+  ],
+  "environment": {
+    "host": "par1-cs25 (192.168.1.84), 8x Radeon PRO V620 (gfx1030)",
+    "serving_gpus": "HIP 6,7,8,9 (cards 0-3, the clean PLX 88096 root port)",
+    "compile_gpus": "HIP 2,3,4,5 (cards 4-7)",
+    "boot_id": "9d2621ae-2838-4db6-951d-43ccd261f397",
+    "harness": "benchmarks/kernels/pr134/qualify_serving.py",
+    "incident": {
+      "summary": "The Hugging Face snapshot directory of the served model became unopenable mid-campaign (the parent directory still listed it, but the inode could not be resolved: a stale XFS directory entry after the host reboot). The blobs it pointed at stayed intact.",
+      "repair": "The model was rebuilt from the intact blobs into /home/chenco_adm/pr134-model-real/qwen3.8-27b-awq (a plain copy, same content) and served from there for the rest of the campaign, with the pair driver taking the model directory as an override so both arms of a pair always served the same copy. A bind mount over the original snapshot path was also installed and verified to resolve for pre-existing sessions, so the path string kept working while the copy was being made.",
+      "impact": "None on the measurements: every arm after the repair loaded the same model weights from the same blobs, and the arm command lines are identical apart from the model directory. The two arms measured before the repair (the first FP16 reference) bracket the repaired ones: they differ by 0.4 % or less in every cell, which is the run-to-run noise of the box."
+    }
+  },
+  "comparisons": [
+    {
+      "comparison": "fp16: {'w4a8': '1', 'decode_stall_ms': 'recipe'} -> {'w4a8': '1', 'decode_stall_ms': 'recipe'}",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": 0.34,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": 0.11,
+          "decode_delta_pct": 0.36
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": -0.38,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": -0.84,
+          "decode_delta_pct": -0.46
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": -0.06,
+          "ttft_delta_pct": 0.07,
+          "prefill_delta_pct": -0.09,
+          "decode_delta_pct": 0.01
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": -0.1,
+          "ttft_delta_pct": -3.23,
+          "prefill_delta_pct": 4.61,
+          "decode_delta_pct": -0.91
+        }
+      }
+    }
+  ]
+}
