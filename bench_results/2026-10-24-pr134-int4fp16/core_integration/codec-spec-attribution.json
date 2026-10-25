@@ -1,0 +1,51 @@
+{
+  "question": "Does the reference codec merged in PR #134 describe the encoder the shipped HIP writer implements?",
+  "method": "The reference codec is the oracle that benchmarks/kernels/pr134/validate_registered.py compares the writer against, byte for byte (torch.testing.assert_close with rtol=0, atol=0). The merged codec was copied over the branch codec in the remote tree at /home/chenco_adm/vllm-pr-int4fp16, the validator was run unchanged against the same built core, and the branch codec was restored afterwards.",
+  "environment": {
+    "host": "par1-cs25 (192.168.1.84)",
+    "boot_id": "a1c4e5e4-1dea-4875-8daa-1c2d6bbafca9",
+    "gpus": "gfx1030, HIP_VISIBLE_DEVICES=2,3,4,5",
+    "torch": "2.12.0+rocm7.14.0",
+    "hip": "7.14.60850",
+    "source": "/home/chenco_adm/vllm-pr-int4fp16",
+    "venv": "/home/chenco_adm/Apps/vllm/venv-pr134-int4fp16"
+  },
+  "codecs": {
+    "merged_pr134": {
+      "md5": "a0b338cd97c5772991e5f1b727573045",
+      "ref": "origin/rdna_extras:docs/explore/kv-int4-fp16-scales/reference_codec.py"
+    },
+    "branch_corrected": {
+      "md5": "22afd7c6d388da1e6e42bc27e1920243",
+      "ref": "feat/kv-int4-fp16-scales:docs/explore/kv-int4-fp16-scales/reference_codec.py"
+    }
+  },
+  "results": {
+    "merged_pr134": {
+      "validator_exit_code": 1,
+      "verdict": "FAIL",
+      "failure": "AssertionError: Tensor-likes are not equal!",
+      "mismatched_elements": 96,
+      "compared_elements": 4128,
+      "mismatch_fraction": 0.0233,
+      "greatest_absolute_difference": 16,
+      "failing_gate": "benchmarks/kernels/benchmark_int4_fp16_block_writer.py:173, reached through benchmarks/kernels/pr134/benchmark_native.py:51 (check_writer -> reference.check_correctness)"
+    },
+    "branch_corrected": {
+      "validator_exit_code": 0,
+      "verdict": "PASS"
+    }
+  },
+  "differential": {
+    "method": "Pure-Python differential over the two codecs' encode() path (the same path validate_registered.py uses) on random FP16 rows. No GPU.",
+    "rows_compared": 640,
+    "rows_with_scale_word_difference": 34,
+    "rows_with_payload_difference": 25
+  },
+  "defects_in_the_merged_codec": [
+    "the quantisation range excluded zero (lo = min(block)), so a constant or one-sided block had no representable zero-point at all",
+    "the scale was snapped onto the FP16 grid from a nearest-half-rounded value, which could land on a grid point below the value it had to cover"
+  ],
+  "reading": "The merged PR #134 codec describes an encoder the shipped writer does not implement. The writer includes zero in the range and takes the smallest grid value that still covers it; the corrected codec matches the writer, and the validator passes with it.",
+  "consequence": "PR #138 carries the correction, so the merged spec and the shipped writer agree when it lands."
+}
