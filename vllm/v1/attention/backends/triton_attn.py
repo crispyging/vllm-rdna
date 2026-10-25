@@ -156,7 +156,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # num_seqs x num_heads_kv x num_par_softmax_segments. With few KV
         # heads split across TP (e.g. Qwen3.8-27B: 4 KV heads, 2 per rank
         # at TP=2) a single-sequence decode is 1 x 2 x 16 = 32 workgroups
-        # on a 36-CU card. Scale segments so one sequence still reaches
+        # on a 72-CU card. Scale segments so one sequence still reaches
         # MIN_LAUNCH_GRID_SIZE_2D. Measured gfx1030 / 43k / int8 KV:
         #   16 segs (grid 32)  -> 1.37 ms, 32.2 GB/s
         #   32 segs (grid 64)  -> 0.82 ms, 53.6 GB/s
