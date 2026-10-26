@@ -19,7 +19,7 @@ Nothing in the launcher or the recipes bakes in a home directory, a host, or an 
 
 ROCm variables, `VLLM_*`, `HSA_*`, `NCCL_*` / `RCCL_*`, and vLLM serve flags belong to the process that runs `serve_rdna.sh`. An API client or a gateway (OpenAI SDK, OpenCode, LiteLLM, and others) receives the base URL and the served model name. It does not receive those variables or flags.
 
-`GPU_MAX_HW_QUEUES` is one of those launch-environment variables. The recipes that set it — `flashnext`, `flashnext-exl3`, `flashnext-mtp0`, `flashnext-mtp2`, `flashnext-dflash2` — set it to **4**. Leave that value. A setting of 2 is only an unverified workaround reported in [ROCm/TheRock#9306](https://github.com/ROCm/TheRock/issues/9306).
+`GPU_MAX_HW_QUEUES` is one of those launch-environment variables. [`rdna_launcher_common.sh`](../../tools/rdna/rdna_launcher_common.sh) defaults it to **2**. Recipes that omit the key keep that default (`27b-awq`, `27b-exl3`, `dsv4-flash`, `full`, and both `flashnext-pp3*` recipes). The five Flash-Next TP=4 recipes — `flashnext`, `flashnext-exl3`, `flashnext-mtp0`, `flashnext-mtp2`, `flashnext-dflash2` — override it to **4**; leave that recipe value. Do not change those recipes to 2. A value of 2 as a host-specific fix is only an unverified workaround reported in [ROCm/TheRock#9306](https://github.com/ROCm/TheRock/issues/9306).
 
 ## Pick a recipe
 
@@ -166,7 +166,7 @@ Where a recipe sets these, the value is the one below. A later section names the
 | `VLLM_FORCE_CUSTOM_ALL_REDUCE` | `0` | Set by `27b-awq`, `27b-exl3`, `dsv4-flash`, `full`. The tuning guide says to keep the stock custom all-reduce off. |
 | `HSA_FORCE_FINE_GRAIN_PCIE` | `1` | Fine-grain PCIe. Set by every recipe. |
 | `HSA_ENABLE_SDMA` | `0` | Set by every Flash-Next recipe (TP=4 and PP=3) and by `27b-awq`. |
-| `GPU_MAX_HW_QUEUES` | `4` | Set by `flashnext`, `flashnext-exl3`, `flashnext-mtp0`, `flashnext-mtp2`, and `flashnext-dflash2` only. See [above](#launch-environment-then-clients). |
+| `GPU_MAX_HW_QUEUES` | launcher default `2`; `4` in five recipes | `flashnext`, `flashnext-exl3`, `flashnext-mtp0`, `flashnext-mtp2`, and `flashnext-dflash2` set 4. Every other recipe omits it and keeps the launcher default. See [above](#launch-environment-then-clients). |
 | `OMP_NUM_THREADS` | `4` | Set by every recipe except `27b-exl3` and `full`. |
 | `TOKENIZERS_PARALLELISM` | `false` | Same recipes as `OMP_NUM_THREADS`. |
 | `PYTHONFAULTHANDLER` | `1` | Same recipes as `OMP_NUM_THREADS`. |

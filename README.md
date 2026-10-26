@@ -62,8 +62,16 @@ uv pip install \
 git clone -b rdna_extras https://github.com/opengfx1030/vllm-rdna.git
 cd vllm-rdna
 
-# Install this tree. Leave --torch-backend off: the PyTorch rocm7.14 index
-# has no matching torchaudio wheel for CPython 3.12 on x86_64.
+# --no-build-isolation means setup.py runs in this venv. It imports
+# setuptools_rust and setuptools_scm. Install those without touching torch,
+# so the ROCm 7.14 pins above stay.
+uv pip install \
+  "cmake>=3.26.1" ninja packaging \
+  "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8" "setuptools-rust>=1.9.0" \
+  wheel jinja2
+
+# Leave --torch-backend off: the PyTorch rocm7.14 index has no matching
+# torchaudio wheel for CPython 3.12 on x86_64.
 VLLM_USE_PRECOMPILED=0 ENABLE_CK=0 \
   ROCM_HOME="${ROCM_HOME:-/opt/rocm/core-7.14}" \
   PYTORCH_ROCM_ARCH=gfx1030 \

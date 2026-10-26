@@ -411,7 +411,7 @@ QSA ring alignment requirements remain independent of graph sizes.
 | `VLLM_RDNA_AR_BLOCKS`, `_PACE`, `_WAIT_MS` | auto, 0, — | Block cap, pacing, and peer-flag wait timeout. |
 | `VLLM_FORCE_CUSTOM_ALL_REDUCE` | 0 | Stock custom AR past the XGMI gates. **Keep 0**: it has crashed the host (PCI SERR). |
 | `NCCL_P2P_LEVEL=pxb`, `NCCL_PROTO=Simple`, `RCCL_P2P_NET_DISABLE=1`, `RCCL_P2P_BATCH_ENABLE=1`, `RCCL_MSCCL_ENABLE=0` | | RCCL settings for RDNA PCIe. LL/LL128 can deadlock. |
-| `GPU_MAX_HW_QUEUES` | 4 where a recipe sets it | Launch-environment HIP queue count. `flashnext`, `flashnext-exl3`, `flashnext-mtp0`, `flashnext-mtp2`, and `flashnext-dflash2` set 4. Leave that value. A setting of 2 is only an unverified workaround reported in [ROCm/TheRock#9306](https://github.com/ROCm/TheRock/issues/9306). It is not a client setting. |
+| `GPU_MAX_HW_QUEUES` | launcher 2; five Flash-Next recipes 4 | Launch-environment HIP queue count (`rdna_launcher_common.sh` defaults to 2). `flashnext`, `flashnext-exl3`, `flashnext-mtp0`, `flashnext-mtp2`, and `flashnext-dflash2` override to 4 — leave that. Recipes that omit the key keep 2. Do not drop the Flash-Next recipes to 2; a host-specific setting of 2 is only an unverified workaround reported in [ROCm/TheRock#9306](https://github.com/ROCm/TheRock/issues/9306). Not a client setting. |
 
 ### Scheduler
 
