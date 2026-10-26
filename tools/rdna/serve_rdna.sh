@@ -122,7 +122,29 @@ fi
 MODEL=${MODEL:-${MODEL_PATH:-}}
 SERVED_NAME=${SERVED_NAME:-}
 SEQS=${SEQS:-${MAX_NUM_SEQS:-8}}
-MAXBAT=${MAXBAT:-${MAX_BATCHED_TOKENS:-2048}}
+MAXBAT=${MAXBAT:-${MAX_BATCHED_TOKENS:-}}
+if [[ -z $MAXBAT ]]; then
+    # The hybrid mamba/attention page alignment raises the attention block
+    # size until the attention page covers the mamba state page: 1024 tokens
+    # for an FP16 KV cache, 2048 for a packed KV cache with an FP16 SSM
+    # state, 3072 for a packed KV cache with the model's own FP32 SSM state.
+    # A prefill chunk ends on a mamba state block boundary, so the per-step
+    # token budget must cover two blocks for two requests to be prefilled per
+    # step. At one block per step a long prompt at concurrency drains at half
+    # the rate (gfx1030, 27B AWQ, 16k x c=8: 42.2 -> 37.4 tok/s and 50.7 ->
+    # 103.3 s TTFT at block 2048, per-token prefill cost unchanged). Two
+    # blocks per step restores parity, so scale the budget with the block.
+    case ${EXTRA_ARGS:-} in
+        *int4_fp16_block*)
+            if [[ ${EXTRA_ARGS:-} == *"--mamba-ssm-cache-dtype float16"* ]]; then
+                MAXBAT=4096   # block 2048
+            else
+                MAXBAT=6144   # block 3072
+            fi
+            ;;
+        *) MAXBAT=2048 ;;  # block 1024
+    esac
+fi
 MAXLEN=${MAXLEN:-${MAX_MODEL_LEN:-}}
 MIN_MAXLEN=${MIN_MAXLEN:-}
 KV=${KV:-${KVCAP:-${KV_CACHE_MEMORY:-}}}
@@ -182,7 +204,8 @@ if [[ -n $MIN_MAXLEN && -n $MAXLEN ]] && ((MAXLEN < MIN_MAXLEN)); then
 fi
 
 if ((rdse_print)); then
-    RDNA_DRY_RUN=1
+    # Read by rdna_init() in rdna_launcher_common.sh (RDNA_DRY_RUN).
+    export RDNA_DRY_RUN=1
 fi
 rdna_init
 
@@ -307,6 +330,8 @@ else
     comp_config="{"
     [[ -n $COMPILE_MODE ]] && comp_config+="\"mode\":$COMPILE_MODE,"
     comp_config+="\"cudagraph_mode\":\"$CG_MODE\""
+    # capture_sizes is set by rdna_mtp_args() in rdna_launcher_common.sh.
+    # shellcheck disable=SC2154
     [[ $CG_CAPTURE_SIZES == 1 ]] && comp_config+=",\"cudagraph_capture_sizes\":$capture_sizes"
     comp_config+="$CG_EXTRA}"
 fi
