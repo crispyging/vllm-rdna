@@ -413,10 +413,103 @@ be `allenai/OLMoE-1B-7B-0924` (bf16, about 14 GB, 64 experts top-8, per-expert
 2-D gate/up/down, SiLU) or `Qwen/Qwen1.5-MoE-A2.7B` (about 29 GB, with a shared
 expert).
 
+## I8 prefill: parked
+
+Stopped at a clean point on request; nothing here is wired into a serving
+path (F16 stays the default, the `i8`/`i8_all` modes are unchanged).
+
+**What exists (opt-in ops, tested, not benchmarked):**
+
+* `rdna_hint_flex_act_quant64_rdna2`: one thread per (token, 64-column group):
+  `x / s` and the order-16 Hadamard in fp32, `sx = fp16(absmax / 127)` per 64
+  columns, `xq` int8, and `sq16 = sx * sum(xq)` per 16-column chunk.
+* `rdna_hint_flex_i8gemm_rdna2` (128 x 128 or 64 x 128 tiles, one 64-column
+  group per K step, register prefetch): per 16-column chunk four
+  `v_dot4_i32_i8`, `S1 += u_chunk * d` in int32, `acc += lo'_chunk * sq16`;
+  per group `acc += sx * step_scale * float(S1)`. The integer epilogue uses the
+  unrounded `step_b = step_scale * u_b` and `lo_b = lo_min + lo_scale * lou_b`
+  (linear in the stored bytes; the spec's fp16 rounding of lo/step is dropped);
+  INT2/INT4 codes are used as int8 directly, INT8 codes as `code - 128` with
+  `128 * step_b` folded into `lo_b`.
+* `act_quant64` / `unrounded_weight` / `i8g64_reference` in
+  `rdna_hint_flex_utils.py`; 34 tests pass (bit-exact pre-pass; the GEMM within
+  1e-3 of the integer-exact reference for INT2/INT4/INT8 and blocks 16/32/64).
+* Not measured: kernel time against tuned rocBLAS (the dense bench shapes at
+  M = 16..4096 were tuned into a scratch rows file,
+  `~/w4a8_runs/hi2-support/tunable-bench/rows_bench.csv`, but the benchmark was
+  not run), the A=32 kernel variant, and the row sort by block size that would
+  let a tile drop the per-chunk integer multiply and bias (generic path: about 27
+  instructions per 64 multiply-adds against 32 for the F16 GEMM; B=64-uniform
+  tiles would need about 21).
+
+**Activation-group measurements** (`tools/rdna/rdna_hint_flex/actq_study.py`,
+real linear inputs after smoothing and rotation, 8 x 2048 held-out tokens;
+output error is `|(x' - q(x')) W^T| / |x' W^T|`; perplexity through the math of
+the I8 path in fp32):
+
+| model | A | act error mean / pooled | output error mean / pooled | ppl | ppl / F16 |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3.5-0.8B | F16 | | | 13.1279 | 1 |
+| Qwen3.5-0.8B | 16 | 0.454% / 0.469% | 0.323% / 0.239% | 13.1292 | 1.00010 |
+| Qwen3.5-0.8B | 32 | 0.526% / 0.534% | 0.375% / 0.271% | 13.1283 | 1.00004 |
+| Qwen3.5-0.8B | 64 | 0.598% / 0.599% | 0.426% / 0.303% | 13.1298 | 1.00014 |
+| Qwen3.5-0.8B | per token | 1.088% / 0.934% | 0.781% / 0.453% | 13.1387 | 1.00082 |
+| Qwen3.5-4B | F16 | | | 7.7919 | 1 |
+| Qwen3.5-4B | 16 | 0.450% / 0.466% | 0.317% / 0.249% | 7.7923 | 1.00006 |
+| Qwen3.5-4B | 32 | 0.523% / 0.533% | 0.368% / 0.284% | 7.7903 | 0.99980 |
+| Qwen3.5-4B | 64 | 0.593% / 0.594% | 0.418% / 0.317% | 7.7918 | 0.99999 |
+| Qwen3.5-4B | per token | 1.298% / 1.113% | 0.893% / 0.541% | 7.8063 | 1.00186 |
+
+A = 64 passes the ppl gate (<= 1.003) on both models; so does per-token. The
+differences between 16, 32 and 64 are below the run-to-run noise of the
+perplexity.
+
+Per input at A = 64: 85 of 114 (0.8B) and 118 of 152 (4B) inputs exceed 0.3%
+output error from the activation quantization alone (mean 0.42%). The worst are
+the attention output projections (`self_attn.o_proj`), then GDN `out_proj` and
+some `down_proj`:
+
+| model | input | A=16 | A=32 | A=64 | per token |
+| --- | --- | --- | --- | --- | --- |
+| 0.8B | layers.11.self_attn.o_proj | 0.842% | 0.968% | 1.082% | 1.781% |
+| 0.8B | layers.7.self_attn.o_proj | 0.769% | 0.890% | 1.002% | 1.663% |
+| 0.8B | layers.15.self_attn.o_proj | 0.556% | 0.645% | 0.727% | 1.312% |
+| 0.8B | layers.8.linear_attn.out_proj | 0.479% | 0.565% | 0.646% | 1.329% |
+| 0.8B | layers.3.self_attn.o_proj | 0.471% | 0.557% | 0.644% | 1.243% |
+| 0.8B | layers.10.linear_attn.out_proj | 0.483% | 0.560% | 0.632% | 1.220% |
+| 0.8B | layers.9.linear_attn.out_proj | 0.453% | 0.535% | 0.612% | 1.290% |
+| 0.8B | layers.12.linear_attn.out_proj | 0.446% | 0.526% | 0.606% | 1.353% |
+| 0.8B | layers.8.mlp.down_proj | 0.426% | 0.519% | 0.606% | 1.196% |
+| 0.8B | layers.17.mlp.down_proj | 0.427% | 0.516% | 0.606% | 1.339% |
+| 4B | layers.11.self_attn.o_proj | 0.658% | 0.758% | 0.852% | 1.579% |
+| 4B | layers.15.self_attn.o_proj | 0.614% | 0.708% | 0.793% | 1.550% |
+| 4B | layers.7.self_attn.o_proj | 0.544% | 0.631% | 0.713% | 1.528% |
+| 4B | layers.19.self_attn.o_proj | 0.481% | 0.556% | 0.628% | 1.376% |
+| 4B | layers.0.mlp.gate_up_proj | 0.488% | 0.569% | 0.613% | 0.877% |
+| 4B | layers.12.linear_attn.out_proj | 0.438% | 0.517% | 0.595% | 1.328% |
+| 4B | layers.23.self_attn.o_proj | 0.447% | 0.520% | 0.589% | 1.346% |
+| 4B | layers.13.linear_attn.out_proj | 0.431% | 0.509% | 0.584% | 1.459% |
+| 4B | layers.28.mlp.down_proj | 0.399% | 0.478% | 0.563% | 1.568% |
+| 4B | layers.9.linear_attn.out_proj | 0.414% | 0.489% | 0.562% | 1.353% |
+
+No input is an outlier by an order of magnitude (worst about 2.5x the mean);
+with the end-to-end perplexity unchanged, a per-input group or an F16-only flag
+is not justified by these two models.
+
+**Format implications (as far as measured):** no checkpoint layout change is
+needed. The 8-bit block parameters are linear in the stored bytes with per-row
+fp16 constants, smoothing and rotation fold into the activation pre-pass, and
+INT2/INT4 codes are valid int8 operands. Only the spec's activation group A (16
+-> 64, with B dividing 64) and the decision to use unrounded `lo`/`step` in the
+integer epilogue change. A row sort by block size, to make tiles uniform, would
+be a load-time repack (a permutation applied to the rows plus an output index
+map), not a checkpoint change.
+
 ## Not done
 
 * A prefill kernel faster than dequant + rocBLAS (the fused kernel is opt-in;
-  see above). I8 prefill (only the GEMV path exists, for accuracy).
+  see above). I8 prefill is parked (see above): kernel built and tested, not
+  benchmarked or wired.
 * Routed experts were not run end to end (no suitable checkpoint); the forward is
   a per-pair GEMV (prefill re-reads each expert per token).
 * The tuned dense Qwen2.5-0.5B concurrency failure was not investigated.
