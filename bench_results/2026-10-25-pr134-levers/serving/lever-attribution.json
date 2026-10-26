@@ -450,6 +450,135 @@
           "acceptance_rate": 96.64369462096126
         }
       }
+    },
+    {
+      "dir": "serve-27b-fp16-core4292ace2-recipe-final-hip6789",
+      "kv_cache": "fp16",
+      "knobs": {
+        "w4a8": "recipe",
+        "decode_stall_ms": "recipe"
+      },
+      "boot_id": "9d2621ae-2838-4db6-951d-43ccd261f397",
+      "status": "PASS",
+      "cleanup": "PASS",
+      "qualification_mode": "strict-pass",
+      "raw_status": "PASS",
+      "kernel_events": {
+        "verdict": "clean",
+        "corrected_event_groups": 0,
+        "corrected_error_count": 0,
+        "fatal_event_groups": 0,
+        "fatal_events": [],
+        "endpoints_with_nonfatal_err": 0,
+        "endpoints_with_bad_tlp": 0,
+        "aer_recovery_buffer_overflows": []
+      },
+      "ppl_paired": null,
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_tokens_per_s": 85.09,
+          "whole_run_input_tokens_per_s": 170.2,
+          "mean_ttft_s": 0.73,
+          "mean_request_prefill_tokens_per_s": 1406.6,
+          "mean_request_decode_tokens_per_s": 96.84,
+          "acceptance_length": 2.829537612146308,
+          "acceptance_rate": 91.4768806073154
+        },
+        "1k x c=8": {
+          "aggregate_output_tokens_per_s": 236.65,
+          "whole_run_input_tokens_per_s": 473.3,
+          "mean_ttft_s": 1.6,
+          "mean_request_prefill_tokens_per_s": 935.6,
+          "mean_request_decode_tokens_per_s": 35.03,
+          "acceptance_length": 2.761206605999326,
+          "acceptance_rate": 88.0603302999663
+        },
+        "16k x c=1": {
+          "aggregate_output_tokens_per_s": 35.49,
+          "whole_run_input_tokens_per_s": 567.9,
+          "mean_ttft_s": 15.42,
+          "mean_request_prefill_tokens_per_s": 1062.7,
+          "mean_request_decode_tokens_per_s": 76.19,
+          "acceptance_length": 2.953840605842048,
+          "acceptance_rate": 97.69203029210242
+        },
+        "16k x c=8": {
+          "aggregate_output_tokens_per_s": 52.02,
+          "whole_run_input_tokens_per_s": 832.3,
+          "mean_ttft_s": 35.9,
+          "mean_request_prefill_tokens_per_s": 657.2,
+          "mean_request_decode_tokens_per_s": 9.72,
+          "acceptance_length": 2.8881445570736006,
+          "acceptance_rate": 94.40722785368003
+        }
+      }
+    },
+    {
+      "dir": "serve-27b-int4-core4292ace2-recipe-final-hip6789",
+      "kv_cache": "int4_fp16_block",
+      "knobs": {
+        "w4a8": "recipe",
+        "decode_stall_ms": "recipe"
+      },
+      "boot_id": "9d2621ae-2838-4db6-951d-43ccd261f397",
+      "status": "PASS",
+      "cleanup": "PASS",
+      "qualification_mode": "strict-pass",
+      "raw_status": "PASS",
+      "kernel_events": {
+        "verdict": "clean",
+        "corrected_event_groups": 0,
+        "corrected_error_count": 0,
+        "fatal_event_groups": 0,
+        "fatal_events": [],
+        "endpoints_with_nonfatal_err": 0,
+        "endpoints_with_bad_tlp": 0,
+        "aer_recovery_buffer_overflows": []
+      },
+      "ppl_paired": {
+        "candidate": 4.92,
+        "reference": 4.91,
+        "ratio": 1.0020366598778003,
+        "max_ratio": 1.05
+      },
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_tokens_per_s": 83.84,
+          "whole_run_input_tokens_per_s": 167.7,
+          "mean_ttft_s": 0.73,
+          "mean_request_prefill_tokens_per_s": 1399.3,
+          "mean_request_decode_tokens_per_s": 96.38,
+          "acceptance_length": 2.69651086240948,
+          "acceptance_rate": 84.825543120474
+        },
+        "1k x c=8": {
+          "aggregate_output_tokens_per_s": 233.9,
+          "whole_run_input_tokens_per_s": 467.8,
+          "mean_ttft_s": 1.77,
+          "mean_request_prefill_tokens_per_s": 878.9,
+          "mean_request_decode_tokens_per_s": 34.81,
+          "acceptance_length": 2.7093465674110835,
+          "acceptance_rate": 85.46732837055417
+        },
+        "16k x c=1": {
+          "aggregate_output_tokens_per_s": 37.73,
+          "whole_run_input_tokens_per_s": 603.7,
+          "mean_ttft_s": 14.81,
+          "mean_request_prefill_tokens_per_s": 1106.2,
+          "mean_request_decode_tokens_per_s": 82.98,
+          "acceptance_length": 2.9681274900398407,
+          "acceptance_rate": 98.40637450199203
+        },
+        "16k x c=8": {
+          "aggregate_output_tokens_per_s": 51.99,
+          "whole_run_input_tokens_per_s": 831.8,
+          "mean_ttft_s": 36.81,
+          "mean_request_prefill_tokens_per_s": 626.0,
+          "mean_request_decode_tokens_per_s": 9.38,
+          "acceptance_length": 2.939973082099596,
+          "acceptance_rate": 96.9986541049798
+        }
+      }
     }
   ],
   "environment": {
@@ -461,7 +590,7 @@
     "incident": {
       "summary": "The Hugging Face snapshot directory of the served model became unopenable mid-campaign (the parent directory still listed it, but the inode could not be resolved: a stale XFS directory entry after the host reboot). The blobs it pointed at stayed intact.",
       "repair": "The model was rebuilt from the intact blobs into /home/chenco_adm/pr134-model-real/qwen3.8-27b-awq (a plain copy, same content) and served from there for the rest of the campaign, with the pair driver taking the model directory as an override so both arms of a pair always served the same copy. A bind mount over the original snapshot path was also installed and verified to resolve for pre-existing sessions, so the path string kept working while the copy was being made.",
-      "impact": "None on the measurements: every arm after the repair loaded the same model weights from the same blobs, and the arm command lines are identical apart from the model directory. The two arms measured before the repair (the first FP16 reference) bracket the repaired ones: they differ by 0.4 % or less in every cell, which is the run-to-run noise of the box."
+      "impact": "None on the measurements: every arm after the repair loaded the same model weights from the same blobs, and the arm command lines are identical apart from the model directory. The two arms measured before the repair (the first FP16 reference) bracket the repaired ones: they differ by 0.4 % or less in every cell. The wider spread shows up across the campaign rather than within a pair: the shipped-recipe reference, re-measured about half an hour after the stall-0 FP16 arm on the same configuration, is 1.0-2.5 % lower in every cell. Treat single-digit percentages as the box's run-to-run noise and only the larger deltas as signal."
     }
   },
   "comparisons": [
@@ -553,6 +682,35 @@
       }
     },
     {
+      "comparison": "fp16 KV, fp16-core4292ace2-base-ssm16-real-hip6789 -> fp16-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": 2.88,
+          "ttft_delta_pct": -23.16,
+          "prefill_delta_pct": 30.58,
+          "decode_delta_pct": -1.32
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": 13.81,
+          "ttft_delta_pct": -38.22,
+          "prefill_delta_pct": 57.91,
+          "decode_delta_pct": 9.64
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": 14.12,
+          "ttft_delta_pct": -19.06,
+          "prefill_delta_pct": 23.53,
+          "decode_delta_pct": 2.63
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": 22.46,
+          "ttft_delta_pct": -26.42,
+          "prefill_delta_pct": 39.59,
+          "decode_delta_pct": 13.42
+        }
+      }
+    },
+    {
       "comparison": "fp16 KV, fp16-core4292ace2-w4a8-ssm16-hip6789 -> fp16-core4292ace2-w4a8-ssm16-real-hip6789",
       "cells": {
         "1k x c=1": {
@@ -611,6 +769,35 @@
       }
     },
     {
+      "comparison": "fp16 KV, fp16-core4292ace2-w4a8-ssm16-hip6789 -> fp16-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": -2.5,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": -0.11,
+          "decode_delta_pct": -2.85
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": 1.05,
+          "ttft_delta_pct": -18.37,
+          "prefill_delta_pct": 24.23,
+          "decode_delta_pct": 0.06
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": -1.72,
+          "ttft_delta_pct": 1.25,
+          "prefill_delta_pct": -1.23,
+          "decode_delta_pct": -2.25
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": -0.63,
+          "ttft_delta_pct": 0.96,
+          "prefill_delta_pct": -4.41,
+          "decode_delta_pct": -1.32
+        }
+      }
+    },
+    {
       "comparison": "fp16 KV, fp16-core4292ace2-w4a8-ssm16-real-hip6789 -> fp16-core4292ace2-stall0-w4a8-ssm16-real-hip6789",
       "cells": {
         "1k x c=1": {
@@ -636,6 +823,64 @@
           "ttft_delta_pct": 0.32,
           "prefill_delta_pct": -3.3,
           "decode_delta_pct": 0.2
+        }
+      }
+    },
+    {
+      "comparison": "fp16 KV, fp16-core4292ace2-w4a8-ssm16-real-hip6789 -> fp16-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": -2.83,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": -0.21,
+          "decode_delta_pct": -3.2
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": 1.44,
+          "ttft_delta_pct": -18.37,
+          "prefill_delta_pct": 25.28,
+          "decode_delta_pct": 0.52
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": -1.66,
+          "ttft_delta_pct": 1.18,
+          "prefill_delta_pct": -1.13,
+          "decode_delta_pct": -2.26
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": -0.54,
+          "ttft_delta_pct": 4.33,
+          "prefill_delta_pct": -8.62,
+          "decode_delta_pct": -0.41
+        }
+      }
+    },
+    {
+      "comparison": "fp16 KV, fp16-core4292ace2-stall0-w4a8-ssm16-real-hip6789 -> fp16-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": -2.54,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": 0.39,
+          "decode_delta_pct": -2.97
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": -1.03,
+          "ttft_delta_pct": -1.23,
+          "prefill_delta_pct": 1.14,
+          "decode_delta_pct": -0.71
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": -1.74,
+          "ttft_delta_pct": 1.18,
+          "prefill_delta_pct": -1.17,
+          "decode_delta_pct": -2.41
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": -1.23,
+          "ttft_delta_pct": 4.0,
+          "prefill_delta_pct": -5.51,
+          "decode_delta_pct": -0.61
         }
       }
     },
@@ -698,6 +943,35 @@
       }
     },
     {
+      "comparison": "int4 KV, int4-core4292ace2-base-ssm16-real-hip6789 -> int4-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": -0.86,
+          "ttft_delta_pct": -22.34,
+          "prefill_delta_pct": 28.54,
+          "decode_delta_pct": -3.86
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": 15.58,
+          "ttft_delta_pct": -44.34,
+          "prefill_delta_pct": 86.6,
+          "decode_delta_pct": 6.98
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": 13.41,
+          "ttft_delta_pct": -19.03,
+          "prefill_delta_pct": 23.45,
+          "decode_delta_pct": 1.22
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": 26.1,
+          "ttft_delta_pct": -23.88,
+          "prefill_delta_pct": 32.99,
+          "decode_delta_pct": 14.67
+        }
+      }
+    },
+    {
       "comparison": "int4 KV, int4-core4292ace2-w4a8-ssm16-real-hip6789 -> int4-core4292ace2-stall0-w4a8-ssm16-real-hip6789",
       "cells": {
         "1k x c=1": {
@@ -723,6 +997,64 @@
           "ttft_delta_pct": -11.74,
           "prefill_delta_pct": 17.66,
           "decode_delta_pct": -0.32
+        }
+      }
+    },
+    {
+      "comparison": "int4 KV, int4-core4292ace2-w4a8-ssm16-real-hip6789 -> int4-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": 2.71,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": -0.46,
+          "decode_delta_pct": 2.47
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": 1.69,
+          "ttft_delta_pct": -14.9,
+          "prefill_delta_pct": 27.23,
+          "decode_delta_pct": 1.34
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": 0.59,
+          "ttft_delta_pct": -1.07,
+          "prefill_delta_pct": 1.05,
+          "decode_delta_pct": 0.01
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": 2.99,
+          "ttft_delta_pct": -6.88,
+          "prefill_delta_pct": 8.62,
+          "decode_delta_pct": 0.43
+        }
+      }
+    },
+    {
+      "comparison": "int4 KV, int4-core4292ace2-stall0-w4a8-ssm16-real-hip6789 -> int4-core4292ace2-recipe-final-hip6789",
+      "cells": {
+        "1k x c=1": {
+          "aggregate_output_delta_pct": 2.48,
+          "ttft_delta_pct": 0.0,
+          "prefill_delta_pct": -0.31,
+          "decode_delta_pct": 2.33
+        },
+        "1k x c=8": {
+          "aggregate_output_delta_pct": 1.12,
+          "ttft_delta_pct": 5.36,
+          "prefill_delta_pct": -4.0,
+          "decode_delta_pct": -0.94
+        },
+        "16k x c=1": {
+          "aggregate_output_delta_pct": 1.23,
+          "ttft_delta_pct": -0.94,
+          "prefill_delta_pct": 0.92,
+          "decode_delta_pct": 1.45
+        },
+        "16k x c=8": {
+          "aggregate_output_delta_pct": 0.5,
+          "ttft_delta_pct": 5.5,
+          "prefill_delta_pct": -7.68,
+          "decode_delta_pct": 0.75
         }
       }
     }
