@@ -566,7 +566,7 @@ class RdnaAttentionImpl(AttentionImpl):
             # There is deliberately no row-count gate here. The prefill
             # kernel has no split-K over the KV range, so a decode row routed
             # through it gets one CTA that walks the whole context: at a 16k
-            # context that is a handful of CTAs on a 36-CU GPU. The decode
+            # context that is a handful of CTAs on a 72-CU GPU. The decode
             # kernel splits the KV range 16 ways, so it stays occupied
             # whatever the batch size. Gating the split on the row count
             # therefore turned a high-concurrency batch into a streaming

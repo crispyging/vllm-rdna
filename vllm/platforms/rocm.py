@@ -1399,7 +1399,10 @@ class RocmPlatform(Platform):
         cu = torch.cuda.get_device_properties(device_id).multi_processor_count
         if on_gfx10x():
             # Fork tuning for the gfx1030 skinny-GEMM dispatch heuristics;
-            # RDNA3/4 keep upstream's value.
+            # RDNA3/4 keep upstream's value. On gfx10 torch reports half the
+            # physical CU count, because HIP counts 128-lane units there: a
+            # 72-CU V620 reads as 36. This doubling undoes that, so the
+            # number matches the driver and the V620 spec sheet.
             cu *= 2
         return cu
 
