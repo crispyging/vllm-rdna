@@ -509,13 +509,14 @@ backend is the one that writes and reads it natively, in the FA kernel itself.
 | --- | --- | --- |
 | `RDNA_ATTN` (gfx1030, Qwen3.x-style text models) | yes, native read and write | the FA-RDNA2 kernels dequantise in registers and keep the FP16 dot |
 | `TRITON_ATTN` | no | no Triton kernel packs the record, so the backend refuses the dtype up front (`vllm/v1/attention/backends/triton_attn.py`) |
-| `QWEN4_EXP_QSA_TRITON` (Qwen4Exp, Flash-Next) | no | the QSA owner reads the main KV cache as FP16/BF16 words and refuses any other cache dtype (`vllm/models/qwen4_exp/amd/qsa.py`) |
+| `QWEN4_EXP_QSA_TRITON` (Qwen4Exp, Flash-Next) | yes, native read and write | the fused packed-int4 QSA decode reads the record in registers (`vllm/models/qwen4_exp/amd/ops/qsa_rdna2.py`); the Triton QSA path still refuses the dtype |
 | `--monokernel` (Qwen4Exp MonoKernel on gfx1030) | no | the mono QSA kernels read K and V as FP16 words; the switch refuses a quantized KV cache up front (`vllm/models/qwen4_exp/amd/mono_decode_rdna2.py`) |
 
-The MonoKernel and the Qwen4Exp QSA owner are a different model family from
-the one this PR was measured on (a Qwen3.8 AWQ dense model), and their
-attention path is not `RDNA_ATTN`. INT4 KV is therefore *refused* for them,
-loudly and early, rather than being read wrongly.
+The MonoKernel is a different model family from the one this PR was measured
+on (a Qwen3.8 AWQ dense model), and its attention path is not `RDNA_ATTN`.
+INT4 KV is therefore *refused* for it, loudly and early, rather than being read
+wrongly. The Qwen4Exp QSA owner was in the same position when this table was
+written, but it has since gained a native packed-int4 decode (`2e9fe02c79`).
 
 ## The INT8 backport: what it actually costs
 
