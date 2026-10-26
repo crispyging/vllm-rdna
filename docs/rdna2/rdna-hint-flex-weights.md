@@ -127,7 +127,17 @@ Routed experts follow the same mode (I8 for batches up to 48 tokens with
   a transform per (token, expert) pair, a GEMV per pair for gate/up, SiLU and
   mul, and the down GEMV with the routing-weighted top-k sum inside the kernel
   (no atomics, fixed shapes, cudagraph-capturable). Pairs whose expert is not
-  on this rank (`-1`) add nothing.
+  on this rank (`-1`) add nothing. Used for batches up to 16 tokens
+  (`RDNA_HINT_FLEX_MOE_GROUPED_MIN`) and for I8.
+* Grouped routed-expert prefill (F16, batches over 16 tokens): the pairs are
+  sorted by expert into 64-row blocks (`moe_align_block_size`),
+  `rdna_hint_flex_moe_transform_rdna2` writes each pair's transformed
+  activation with its expert's `col_scale`/`had`, and
+  `rdna_hint_flex_moe_gemm_rdna2` runs the fused decode-in-GEMM tile kernel
+  (`gemm2_kernel` in MOE mode: each 64-row block reads one expert's rows, padded
+  slots are skipped) for gate/up and again for down after SiLU and mul; the
+  routing-weighted top-k sum is a torch reduction. Each expert's weights are
+  read once per 64 routed tokens instead of once per token.
 
 All launches use the current torch stream and `C10_CUDA_KERNEL_LAUNCH_CHECK`.
 The kernels trust the offsets; the loader validates them on the host first.
@@ -156,8 +166,8 @@ Activations must be fp16 (`--dtype float16`): RDNA2 has no bf16 dot.
 
 ## Quantizing routed experts (tool side)
 
-No HI2 MoE checkpoint exists yet; the method is tested on a synthetic one. For
-`tools/hi2` to produce one:
+The tool now writes MoE checkpoints (OLMoE-1B-7B, see "Routed experts:
+OLMoE-1B-7B"); the points below were the requirements and still hold:
 
 * Per-expert 2-D tensors (`mlp.experts.E.{gate,up,down}_proj.weight`) are
   already eligible (2-D, K a multiple of 64) and the router is excluded by
@@ -178,11 +188,11 @@ No HI2 MoE checkpoint exists yet; the method is tested on a synthetic one. For
 ## Checks
 
 Unit tests: `bash tools/rdna/rdna_hint_flex/run_tests.sh <hip_device>`,
-**163 passed** on a V620. The dequant kernel and the I8 activation quantization
+**201 passed** on a V620. The dequant kernel and the I8 activation quantization
 are bit-identical to the reference; `rdna_hint_flex_linear_rdna2` matches
 `reference_linear` (float64) within 2e-3 relative error for M = 1..37 (F16),
 the I8 GEMV matches the integer-exact I8 reference within 1e-3; the synthetic
-4-expert MoE matches the dense reference within 1e-2 (F16) and 3e-2 (I8); the fused prefill GEMM matches reference_linear within 2e-3.
+4-expert MoE matches the dense reference within 1e-2 (F16) and 3e-2 (I8) for 1 to 300 tokens (per-pair and grouped paths); the fused prefill GEMM matches reference_linear within 2e-3.
 
 End to end (`tools/rdna/rdna_hint_flex/e2e_check.py`: teacher-forced log-probs
 on a fixed 137-token text and 4 greedy prompts of 48 tokens, against the
@@ -400,18 +410,170 @@ Tensor parallelism (Qwen3.5-4B, F16, full cudagraphs): ppl 7.7913 (TP=1),
 7.7915 (TP=2), 7.7912 (TP=4); log-prob gap to TP=1 mean 0.0025 (TP=2) and
 0.0026 (TP=4), the same as TP=1 graphs against TP=1 eager (0.0025).
 
-## Routed experts: candidates on the box
+## Routed experts: OLMoE-1B-7B
 
-No small unquantized MoE model is present (nothing downloaded). Found:
-Qwen3.6-35B-A3B only as GPTQ-Int4 / MLX (no bf16 source); Qwen3.8-Flash-Next
-only quantized (AWQ, AutoRound, MLX, EXL3); DeepSeek-V4-Flash fp8 (89-108 GB);
-`Nemotron-derived-fp16-890ab464-20261021` (fp16, 65.8 GB, 128 experts top-6,
-per-expert 2-D `backbone.layers.N.mixer.experts.E.{up,down}_proj.weight`), whose
-experts are ungated (relu^2, no gate projection), which `RdnaHintFlexMoEMethod`
-does not implement (it assumes SiLU-gated gate/up). A suitable small source would
-be `allenai/OLMoE-1B-7B-0924` (bf16, about 14 GB, 64 experts top-8, per-expert
-2-D gate/up/down, SiLU) or `Qwen/Qwen1.5-MoE-A2.7B` (about 29 GB, with a shared
-expert).
+`allenai/OLMoE-1B-7B-0924` (16 layers, 64 experts top-8, SiLU-gated, expert
+`[1024, 2048]` gate/up and `[2048, 1024]` down, max context 4096), quantized by
+`tools/hi2` into two checkpoints on the box
+(`~/w4a8_runs/hadamard-int2/runsmoe/`):
+
+| checkpoint | avg bpw (experts / rest) | rows at INT2 / INT4 | size |
+| --- | --- | --- | --- |
+| `olmoe-r4` | 3.54 (3.49 / 4.67) | 40 % / 60 % | 3.2 GB |
+| `olmoe-b3.0` | 3.00 (2.93 / 4.57) | 67 % / 33 % | 2.8 GB |
+
+**Loader.** The writer's names (`model.layers.N.mlp.experts.E.{gate,up,down}_proj.hi2_*`,
+attention `hi2_*`, router and norms plain) load without any change. There is
+no mismatch: gate and up of each expert share `col_scale` and `had`, as
+decision 6 requires, so the loader stacks them into one gate/up tensor per
+layer.
+
+**bf16 to fp16.** The checkpoints and the original are bf16 and run as fp16
+(`--dtype float16`). The held-out perplexity of the original in fp16 is finite
+and matches the tool's numbers (table below), and no NaN or inf showed up in
+any run. Nothing overflows.
+
+### Correctness
+
+Held-out teacher-forced perplexity over 16,376 tokens (`acc_tp.sh`, TP=1,
+FULL_AND_PIECEWISE). `study` is the held-out text and `mix` is the calibration
+mix (`eval_mix.txt`). Each checkpoint is compared with its `hi2 export-dense`
+and with the quantizer's own HF evaluation:
+
+| model | study ppl | mix ppl | mean / max abs log-prob gap vs dense export |
+| --- | --- | --- | --- |
+| original, fp16 | 6.6331 | 3.9233 | - |
+| `olmoe-r4`, dense export | 6.7079 | 4.1071 | - |
+| `olmoe-r4`, rdna_hint_flex (tool HF: 6.707 / 4.108) | **6.7071** | **4.1063** | 0.0072 / 0.62 (study), 0.0083 / 0.63 (mix) |
+| `olmoe-b3.0`, dense export | 6.7724 | 4.2867 | - |
+| `olmoe-b3.0`, rdna_hint_flex (tool HF: 6.773 / 4.287) | **6.7729** | **4.2870** | 0.0062 / 0.60 (study), 0.0084 / 0.57 (mix) |
+
+The kernels reproduce the dense export to within 0.03 % perplexity.
+`olmoe-r4` costs +1.1 % (study) / +4.7 % (mix) over the original, and
+`olmoe-b3.0` +2.1 % / +9.3 %. The grouped prefill path and the per-pair path
+differ by a mean of 0.0056 nats per token (study ppl 6.7071 vs 6.7076).
+Greedy probes were coherent on both checkpoints in eager mode and under
+graphs ("Paris", factorial code, "42", sky colour). Every serving boot passed:
+
+* the probe (3/3) and its PPL probe;
+* the concurrency probe: 48/48 identical for r4 and b3.0; an earlier b3.0 boot gave 47/48 plus one near-tie;
+* the probe after load.
+
+No boot hit a fault (0 serve-log markers, 0 new amdgpu dmesg faults).
+
+### Serving
+
+The setup for every arm is TP=1 on one V620, FULL_AND_PIECEWISE, RDNA_ATTN, and
+TunableOp lookup on the merged rows (2707 per rank, lookup-hit proof 2613/2613 FP16 keys). The cells are 1k/512 and
+2k/512, because OLMoE's max context is 4096, so the standard 16k/1k cells do
+not fit. Each cell has the usual four numbers:
+
+* prefill tok/s per request, with the wave aggregate in brackets;
+* decode tok/s per request (1000 / TPOT), with aggregate output tok/s in brackets;
+* mean TTFT;
+* median ITL.
+
+Dense fp16 runs once on the fork's default unquantized MoE backend and once on
+`--moe-backend triton`. `r4 pair-GEMV` is `olmoe-r4` with the grouped prefill
+path disabled (`RDNA_HINT_FLEX_MOE_GROUPED_MIN=1000000`). Every arm had the GPU
+to itself: `gpu-pids.log` shows one process per arm. Results are in
+`~/w4a8_runs/hi2-support/olmoe-clean/`.
+
+| cell | arm | prefill tok/s | decode tok/s | TTFT s | ITL ms |
+| --- | --- | --- | --- | --- | --- |
+| 1k/512 c=1 | `olmoe-r4` | **5096** (4974) | **209.1** (193.5) | **0.20** | 4.8 |
+| 1k/512 c=1 | `olmoe-b3.0` | 4989 (4864) | 206.4 (190.9) | 0.21 | **4.6** |
+| 1k/512 c=1 | dense fp16 | 1371 (1364) | 98.8 (86.5) | 0.75 | 10.1 |
+| 1k/512 c=1 | dense fp16, Triton MoE | 3917 (3839) | 47.6 (46.5) | 0.26 | 21.0 |
+| 1k/512 c=1 | r4 pair-GEMV | 1157 (1146) | 205.9 (152.0) | 0.88 | 4.8 |
+| 1k/512 c=8 | `olmoe-r4` | **1552** (7104) | 59.2 (440.4) | **0.66** | 15.6 |
+| 1k/512 c=8 | `olmoe-b3.0` | 1421 (6467) | **60.9** (449.1) | 0.72 | **15.2** |
+| 1k/512 c=8 | dense fp16 | 369 (1594) | 36.2 (242.2) | 2.77 | 22.8 |
+| 1k/512 c=8 | dense fp16, Triton MoE | 968 (3526) | 24.5 (187.0) | 1.06 | 38.6 |
+| 1k/512 c=8 | r4 pair-GEMV | 310 (1359) | 46.2 (285.3) | 3.30 | 15.8 |
+| 2k/512 c=1 | `olmoe-r4` | **8391** (8186) | **189.7** (174.2) | **0.24** | 5.2 |
+| 2k/512 c=1 | `olmoe-b3.0` | 8336 (8169) | 188.2 (172.9) | 0.25 | **5.1** |
+| 2k/512 c=1 | dense fp16 | 2588 (2582) | 93.8 (82.0) | 0.79 | 10.5 |
+| 2k/512 c=1 | dense fp16, Triton MoE | 6783 (6718) | 46.5 (45.3) | 0.30 | 21.4 |
+| 2k/512 c=1 | r4 pair-GEMV | 2195 (2177) | 189.0 (140.8) | 0.93 | 5.3 |
+| 2k/512 c=8 | `olmoe-r4` | 2420 (8645) | 48.9 (362.3) | 0.85 | 19.1 |
+| 2k/512 c=8 | `olmoe-b3.0` | **2587** (9729) | **50.0** (371.4) | **0.79** | **18.7** |
+| 2k/512 c=8 | dense fp16 | 733 (2531) | 32.2 (219.3) | 2.79 | 25.5 |
+| 2k/512 c=8 | dense fp16, Triton MoE | 1923 (7423) | 23.3 (177.9) | 1.06 | 41.5 |
+| 2k/512 c=8 | r4 pair-GEMV | 766 (2948) | 37.9 (253.2) | 2.67 | 19.5 |
+
+**Decode.** Both checkpoints decode about 2.1x faster per request than dense
+fp16 on its best backend, which is the default one (209 vs 99 tok/s at 1k
+c=1). At c=8 the gain is 1.6x per request and 1.8x in aggregate. Decode reads
+3.5 or 3.0 bpw expert weights instead of 16. The two checkpoints are within 2 %
+of each other, so at this batch size the per-token cost is mostly not the
+weight bytes. The Triton MoE backend decodes at half the speed of the default
+backend.
+
+**Prefill.** HI2 prefill is ahead of both dense backends: 1.2x Triton and
+3.2x the default backend at 2k c=1 (1.3x and 3.7x at 1k). HI2 prefill is not behind dense, so this
+round needed no prefill fix. The fix that mattered was the grouped path
+(above, unit-tested). Before it, routed-expert prefill ran the per-pair GEMV,
+which re-reads each expert for every routed token. Against the per-pair path,
+the grouped path is:
+
+* 4.4x faster prefill at 1k c=1 (5096 vs 1157) and 3.8x at 2k c=1;
+* 3x (2k) to 5x (1k) lower TTFT at c=8;
+* 28 % faster at c=8 decode, which interleaves prefill chunks.
+
+**TunableOp.** The first (untuned) runs of r4, b3.0 and both dense arms
+recorded the GEMM shapes: 113 FP16 keys. These are attention, router
+and lm_head GEMMs; routed experts never reach rocBLAS on any arm. With the
+M=1..8 extensions the census gave 145 shapes. Curation adopted 113 rows
+(median 1.57x over the rocBLAS heuristic, best 3.55x for the 64x512x2048
+router GEMM) and left 32 on the heuristic. The rows were appended to the
+shared profile.
+
+**Runs not used.**
+
+* The first untuned runs overlapped another job's sweep on HIP 3/4.
+* The first tuned campaign shared HIP 2 with a QAD quantize job (started 14:01,
+  after this campaign's lock file).
+* A second QAD job (`q-bud-es`) started on HIP 4 at 15:06 while that GPU's
+  lock file was held.
+
+The numbers from these runs (r4/b3.0 c=8 swinging 2x, decode at 2k down by a
+quarter) are kept under `~/w4a8_runs/hi2-support/serve-olmoe-*` but not
+reported. `bench_serve.sh` now logs the processes on its GPUs (`gpu-pids.log`)
+so a shared run shows up.
+
+### Format notes for MoE (spec not edited)
+
+* **Tensor count.** Every expert projection is its own HI2 tensor with nine
+  arrays, so the checkpoint has 28,307 tensors and a 3.3 MiB safetensors
+  header. The loader stacks 64 experts x 3 projections per layer into one
+  ragged tensor per stage. That stacking means `torch.cat` over 64 parts
+  per array, plus 64-entry `[E, K]` / `[E, K/16]` transform tables. On a
+  quiet host model loading takes about 95 s (r4 96 s, b3.0 92 s; dense
+  fp16 loads in 22 s). With host load around 150 (other jobs' quantizers) it took
+  350-560 s.
+* **Metadata size (`olmoe-r4` experts).**
+    * Codes are 2412 MiB (3.14 bpw) and block params 235 MiB (0.31 bpw).
+    * Row metadata (`code_off`, `param_off`, `row_consts`, `row_nbits`,
+      `row_block`) is 64 MiB (0.08 bpw).
+    * `col_scale` + `had` are 10.3 MiB.
+    * Per-expert transform tables are cheap. The per-row offsets are 8 of the
+      16 bytes per row and are absolute within each tensor, so stacking has to
+      rebase them, which is a host pass over 4 M rows.
+* **Suggestion (tool side, optional).** Writing the experts of one
+  layer/projection as one stacked HI2 tensor would make the file the
+  in-memory layout. The expert arrays would drop from 27,648 to 288 (two
+  stages x nine arrays x 16 layers), about 950 tensors in all instead of
+  28,307. The stacked tensor
+  would have ragged rows concatenated in expert order, offsets already
+  rebased, `col_scale [E, K]`, `had [E, K/16]`, and gate and up fused when
+  they share the transform. The per-expert layout keeps working; the loader
+  would accept both.
+* **Rarely routed experts.** The quantizer fell back to data-free
+  calibration for 3 tensors in each checkpoint (layer 7 expert 51,
+  gate/up/down). That is visible in `hi2_report.json`
+  (`experts.coverage.*.fallback`), and the minimum per-expert token count is
+  in the same table.
 
 ## I8 prefill: parked
 
@@ -510,6 +672,7 @@ map), not a checkpoint change.
 * A prefill kernel faster than dequant + rocBLAS (the fused kernel is opt-in;
   see above). I8 prefill is parked (see above): kernel built and tested, not
   benchmarked or wired.
-* Routed experts were not run end to end (no suitable checkpoint); the forward is
-  a per-pair GEMV (prefill re-reads each expert per token).
+* OLMoE at TP=2 (no two GPUs were free together); I8 for the grouped MoE
+  prefill path (F16 only; I8 batches over 16 tokens use the per-pair path).
+* A stacked-experts checkpoint layout (tool side, see "Format notes for MoE").
 * The tuned dense Qwen2.5-0.5B concurrency failure was not investigated.
