@@ -1336,3 +1336,14 @@ void rdna_hint_flex_i8gemm_rdna2(
     torch::Tensor code_off, torch::Tensor blk_params, torch::Tensor param_off,
     torch::Tensor row_consts, torch::Tensor row_nbits, torch::Tensor row_block,
     torch::Tensor out, int64_t tile);
+void rdna_hint_flex_moe_transform_rdna2(torch::Tensor x, int64_t src_div,
+                                        torch::Tensor expert,
+                                        torch::Tensor col_scale,
+                                        torch::Tensor had, bool transform,
+                                        torch::Tensor out);
+void rdna_hint_flex_moe_gemm_rdna2(
+    torch::Tensor x, torch::Tensor sorted_ids, torch::Tensor expert_ids,
+    torch::Tensor ntpp, torch::Tensor codes, torch::Tensor code_off,
+    torch::Tensor blk_params, torch::Tensor param_off, torch::Tensor row_consts,
+    torch::Tensor row_nbits, torch::Tensor row_block, int64_t n_out,
+    torch::Tensor out);

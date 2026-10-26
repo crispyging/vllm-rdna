@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 _SHARDS = ("w1", "w3", "w2")
+# Batches above this many tokens use the grouped (per-expert GEMM) path.
+GROUPED_MIN_TOKENS = 16
+MOE_BLOCK_M = 64  # must match kMoeBlockM in rdna_hint_flex_rdna2.cu
 
 
 def stack_experts(
@@ -180,6 +183,9 @@ class RdnaHintFlexMoEMethod(FusedMoEMethodBase):
         m = x2.shape[0]
         ids = topk_ids.reshape(m, -1).long()
         emap = getattr(layer, "expert_map", None)
+        if m > GROUPED_MIN_TOKENS and self.compute_mode == 0:
+            return self._apply_grouped(layer, x2, topk_ids.reshape(m, -1),
+                                       topk_weights.reshape(m, -1), emap)  # fmt: skip
         if emap is not None:
             ids = emap[ids]
         return ops.rdna_hint_flex_moe_rdna2(
@@ -194,6 +200,47 @@ class RdnaHintFlexMoEMethod(FusedMoEMethodBase):
             self._inter,
             self.compute_mode,
         )
+
+    def _apply_grouped(self, layer, x2, topk_ids, topk_weights, emap):
+        """Prefill: pairs grouped by expert (moe_align_block_size, block 64) so
+        each expert's weights are decoded once per 64 pairs, through the fused
+        decode-in-GEMM kernel; per-pair transforms; weighted top-k sum."""
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        m, top_k = topk_ids.shape
+        p = m * top_k
+        n, h = self._inter, self._hidden
+        flat = topk_ids.reshape(-1)
+        num_experts = int(emap.shape[0]) if emap is not None else self._num_experts
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(
+            flat.view(p, 1),
+            MOE_BLOCK_M,
+            num_experts,
+            expert_map=emap,
+            pad_sorted_ids=True,
+            ignore_invalid_experts=True,
+        )
+        local = (emap[flat.long()] if emap is not None else flat).to(torch.int32)
+        w13, w2 = layer._rdna_hint_flex_w13, layer._rdna_hint_flex_w2
+        xp = torch.empty(p, h, dtype=torch.float16, device=x2.device)
+        ops.rdna_hint_flex_moe_transform_rdna2(
+            x2, top_k, local, w13, layer._rdna_hint_flex_w13_tr, xp
+        )
+        g13 = torch.empty(p, 2 * n, dtype=torch.float16, device=x2.device)
+        ops.rdna_hint_flex_moe_gemm_rdna2(
+            xp, sorted_ids, expert_ids, ntpp, w13, 2 * n, g13
+        )
+        hmid = F.silu(g13[:, :n]) * g13[:, n:]
+        hp = torch.empty(p, n, dtype=torch.float16, device=x2.device)
+        ops.rdna_hint_flex_moe_transform_rdna2(
+            hmid, 1, local, w2, layer._rdna_hint_flex_w2_tr, hp
+        )
+        y = torch.empty(p, h, dtype=torch.float16, device=x2.device)
+        ops.rdna_hint_flex_moe_gemm_rdna2(hp, sorted_ids, expert_ids, ntpp, w2, h, y)
+        wts = topk_weights.float() * (local.view(m, top_k) >= 0)
+        return (y.view(m, top_k, h).float() * wts.unsqueeze(-1)).sum(1).to(x2.dtype)
 
 
 def moe_reference(
@@ -220,13 +267,15 @@ def moe_reference(
 
     xd = x.double().cpu()
     out = torch.zeros_like(xd)
+    cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     for tok in range(x.shape[0]):
         for k in range(topk_ids.shape[1]):
             e = int(topk_ids[tok, k])
             if e < 0:
                 continue
-            g = xd[tok] @ dense(gate[e]).T
-            u = xd[tok] @ dense(up[e]).T
-            hmid = F.silu(g) * u
-            out[tok] += float(topk_weights[tok, k]) * (hmid @ dense(down[e]).T)
+            if e not in cache:
+                cache[e] = (dense(gate[e]), dense(up[e]), dense(down[e]))
+            wg, wu, wd = cache[e]
+            hmid = F.silu(xd[tok] @ wg.T) * (xd[tok] @ wu.T)
+            out[tok] += float(topk_weights[tok, k]) * (hmid @ wd.T)
     return out

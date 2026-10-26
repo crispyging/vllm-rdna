@@ -1130,6 +1130,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int tile) -> ()");
   rocm_ops.impl("rdna_hint_flex_i8gemm_rdna2", torch::kCUDA,
                 &rdna_hint_flex_i8gemm_rdna2);
+  rocm_ops.def(
+      "rdna_hint_flex_moe_transform_rdna2(Tensor x, int src_div, Tensor "
+      "expert, "
+      "Tensor col_scale, Tensor had, bool transform, Tensor! out) -> ()");
+  rocm_ops.impl("rdna_hint_flex_moe_transform_rdna2", torch::kCUDA,
+                &rdna_hint_flex_moe_transform_rdna2);
+  rocm_ops.def(
+      "rdna_hint_flex_moe_gemm_rdna2(Tensor x, Tensor sorted_ids, "
+      "Tensor expert_ids, Tensor ntpp, Tensor codes, Tensor code_off, "
+      "Tensor blk_params, Tensor param_off, Tensor row_consts, "
+      "Tensor row_nbits, Tensor row_block, int n_out, Tensor! out) -> ()");
+  rocm_ops.impl("rdna_hint_flex_moe_gemm_rdna2", torch::kCUDA,
+                &rdna_hint_flex_moe_gemm_rdna2);
   rocm_ops.impl("rdna_hint_flex_gemv_i8_rdna2", torch::kCUDA,
                 &rdna_hint_flex_gemv_i8_rdna2);
 #endif

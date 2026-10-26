@@ -732,7 +732,11 @@ __global__ void __launch_bounds__(kThreads)
 constexpr int kGemmPad = 8;  // halves of padding per LDS row
 constexpr int kGemm2BK = 64;
 
-template <int GM, int GN>
+// MOE: grouped GEMM over the (token, expert) pairs of moe_align_block_size:
+// tile row block y covers sorted_ids[y*GM .. y*GM+GM) (pair indices; >= M is
+// padding), all of one expert e = expert_ids[y], whose weight rows are
+// [e*R, (e+1)*R); output rows are the pair indices.
+template <int GM, int GN, bool MOE = false>
 __global__ void __launch_bounds__(kThreads)
     gemm2_kernel(const half* __restrict__ x, const int M, const int K,
                  const int32_t* __restrict__ codes,
@@ -742,7 +746,10 @@ __global__ void __launch_bounds__(kThreads)
                  const half* __restrict__ row_consts,
                  const uint8_t* __restrict__ row_nbits,
                  const uint8_t* __restrict__ row_block, half* __restrict__ out,
-                 const int64_t ldo, const int R) {
+                 const int64_t ldo, const int R,
+                 const int32_t* __restrict__ sorted_ids = nullptr,
+                 const int32_t* __restrict__ expert_ids = nullptr,
+                 const int32_t* __restrict__ ntpp = nullptr) {
   constexpr int TM = GM / 16;
   constexpr int TN = GN / 16;
   constexpr int BK = kGemm2BK;
@@ -756,17 +763,34 @@ __global__ void __launch_bounds__(kThreads)
   const int tid = threadIdx.x;
   const int m_base = blockIdx.y * GM;
   const int r_base = blockIdx.x * GN;
+  int row_off = 0;
+  if constexpr (MOE) {
+    if (m_base >= ntpp[0]) return;  // block-uniform, before any barrier
+    const int e = expert_ids[blockIdx.y];
+    if (e < 0) return;
+    row_off = e * R;
+  }
+  // Activation / output row of tile row m (pair index under MOE).
+  auto xrow = [&](int m) -> int {
+    if constexpr (MOE) {
+      const int p = sorted_ids[m_base + m];
+      return p < M ? p : -1;
+    } else {
+      return m_base + m < M ? m_base + m : -1;
+    }
+  };
   for (int i = tid; i < GN; i += kThreads) {
     const int r = r_base + i;
     RowHdrS h;
     if (r < R) {
-      h.nb = row_nbits[r];
-      h.lb = log2_block(row_block[r]);
-      h.lo_min = __half2float(row_consts[3 * r + 0]);
-      h.lo_scale = __half2float(row_consts[3 * r + 1]);
-      h.step_scale = __half2float(row_consts[3 * r + 2]);
-      h.code_off = code_off[r];
-      h.param_off = param_off[r];
+      const int gr = row_off + r;
+      h.nb = row_nbits[gr];
+      h.lb = log2_block(row_block[gr]);
+      h.lo_min = __half2float(row_consts[3 * gr + 0]);
+      h.lo_scale = __half2float(row_consts[3 * gr + 1]);
+      h.step_scale = __half2float(row_consts[3 * gr + 2]);
+      h.code_off = code_off[gr];
+      h.param_off = param_off[gr];
     } else {
       h.nb = 0;
     }
@@ -783,9 +807,10 @@ __global__ void __launch_bounds__(kThreads)
       const int i = tid + v * kThreads;
       const int row = i / (BK / 8), c = (i % (BK / 8)) * 8;
       xr[v] = make_uint4(0, 0, 0, 0);
-      if (m_base + row < M)
+      const int xm = xrow(row);
+      if (xm >= 0)
         xr[v] = *reinterpret_cast<const uint4*>(
-            x + static_cast<int64_t>(m_base + row) * K + k0 + c);
+            x + static_cast<int64_t>(xm) * K + k0 + c);
     }
   #pragma unroll
     for (int v = 0; v < WG; ++v) {
@@ -898,8 +923,8 @@ __global__ void __launch_bounds__(kThreads)
   }
   #pragma unroll
   for (int i = 0; i < TM; ++i) {
-    const int m = m_base + ty + 16 * i;
-    if (m >= M) continue;
+    const int m = xrow(ty + 16 * i);
+    if (m < 0) continue;
   #pragma unroll
     for (int j = 0; j < TN; ++j) {
       const int r = r_base + tx + 16 * j;
@@ -1346,11 +1371,13 @@ __global__ void moe_gemv_i8_kernel(const int8_t*, const half*, const int32_t*,
                                    const uint8_t*, const uint8_t*, const int,
                                    half*, const int64_t) {}
 
-template <int GM, int GN>
+template <int GM, int GN, bool MOE = false>
 __global__ void gemm2_kernel(const half*, const int, const int, const int32_t*,
                              const int32_t*, const uint8_t*, const int32_t*,
                              const half*, const uint8_t*, const uint8_t*, half*,
-                             const int64_t, const int) {}
+                             const int64_t, const int, const int32_t* = nullptr,
+                             const int32_t* = nullptr,
+                             const int32_t* = nullptr) {}
 
 __global__ void moe_act_transform_kernel(const half*, const int64_t, const int,
                                          const int32_t*, const half*,
@@ -1780,6 +1807,30 @@ void launch_i8gemm(const torch::Tensor& xq, const torch::Tensor& sx,
     launch_i8gemm_t<128, 128>(xq, sx, sq16, w, out, R, stream);
 }
 
+// Grouped MoE GEMM (prefill): see gemm2_kernel's MOE mode.
+constexpr int kMoeBlockM = 64;
+
+void launch_moe_gemm(const torch::Tensor& x, const torch::Tensor& sorted_ids,
+                     const torch::Tensor& expert_ids, const torch::Tensor& ntpp,
+                     const Hi2Weight& w, int64_t n_out, torch::Tensor& out,
+                     cudaStream_t stream) {
+  const int64_t P = x.size(0), K = x.size(1);
+  const int64_t nblk = sorted_ids.numel() / kMoeBlockM;
+  if (P == 0 || nblk == 0) return;
+  dim3 grid((n_out + 127) / 128, nblk);
+  hf::gemm2_kernel<kMoeBlockM, 128, true><<<grid, hf::kThreads, 0, stream>>>(
+      reinterpret_cast<const half*>(x.data_ptr()), static_cast<int>(P),
+      static_cast<int>(K), w.codes.data_ptr<int32_t>(),
+      w.code_off.data_ptr<int32_t>(), w.blk_params.data_ptr<uint8_t>(),
+      w.param_off.data_ptr<int32_t>(),
+      reinterpret_cast<const half*>(w.row_consts.data_ptr()),
+      w.row_nbits.data_ptr<uint8_t>(), w.row_block.data_ptr<uint8_t>(),
+      reinterpret_cast<half*>(out.data_ptr()), out.stride(0),
+      static_cast<int>(n_out), sorted_ids.data_ptr<int32_t>(),
+      expert_ids.data_ptr<int32_t>(), ntpp.data_ptr<int32_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 // x [M, K] fp16 -> out [M, K] fp16 = H16(x / s) on flagged groups.
@@ -1978,6 +2029,52 @@ void rdna_hint_flex_i8gemm_rdna2(
   auto stream = at::cuda::getCurrentCUDAStream();
   if (xq.size(0) > 0 && R > 0)
     launch_i8gemm(xq, sx, sq16, w, out, R, static_cast<int>(tile), stream);
+}
+
+// Routed experts, prefill building blocks. Per-pair transform with the
+// expert's smoothing/rotation: out[p] = T_{expert[p]}(x[p / src_div]).
+void rdna_hint_flex_moe_transform_rdna2(torch::Tensor x, int64_t src_div,
+                                        torch::Tensor expert,
+                                        torch::Tensor col_scale,
+                                        torch::Tensor had, bool transform,
+                                        torch::Tensor out) {
+  check_act(x, x.size(1));
+  check_dev(expert, "expert", torch::kInt32);
+  check_dev(out, "out", torch::kHalf);
+  TORCH_CHECK(out.size(0) == expert.numel() && out.size(1) == x.size(1),
+              "rdna_hint_flex: out must be [P, K]");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_moe_transform(x, static_cast<int>(src_div), expert, col_scale, had,
+                       transform, out, stream);
+}
+
+// Grouped GEMM of the pairs of moe_align_block_size (block 64):
+// out[p] = x[p] . W_{expert(p)}^T, stacked expert rows [e*n_out, (e+1)*n_out).
+void rdna_hint_flex_moe_gemm_rdna2(
+    torch::Tensor x, torch::Tensor sorted_ids, torch::Tensor expert_ids,
+    torch::Tensor ntpp, torch::Tensor codes, torch::Tensor code_off,
+    torch::Tensor blk_params, torch::Tensor param_off, torch::Tensor row_consts,
+    torch::Tensor row_nbits, torch::Tensor row_block, int64_t n_out,
+    torch::Tensor out) {
+  const Hi2Weight w{codes,      code_off,  blk_params, param_off,
+                    row_consts, row_nbits, row_block};
+  check_weight(w);
+  check_act(x, x.size(1));
+  TORCH_CHECK(x.is_contiguous(), "rdna_hint_flex: x must be contiguous");
+  check_dev(sorted_ids, "sorted_ids", torch::kInt32);
+  check_dev(expert_ids, "expert_ids", torch::kInt32);
+  check_dev(ntpp, "ntpp", torch::kInt32);
+  TORCH_CHECK(sorted_ids.numel() % kMoeBlockM == 0 &&
+                  expert_ids.numel() * kMoeBlockM >= sorted_ids.numel(),
+              "rdna_hint_flex: moe_align_block_size must use block size 64");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kHalf &&
+                  out.size(0) == x.size(0) && out.size(1) == n_out &&
+                  out.stride(1) == 1,
+              "rdna_hint_flex: out must be fp16 [P, n_out]");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_moe_gemm(x, sorted_ids, expert_ids, ntpp, w, n_out, out, stream);
 }
 
 // I8 activation quantization (transform included when `transform`).

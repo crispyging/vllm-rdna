@@ -1459,6 +1459,36 @@ def rdna_hint_flex_i8gemm_rdna2(
     )  # fmt: skip
 
 
+def rdna_hint_flex_moe_transform_rdna2(
+    x: torch.Tensor,
+    src_div: int,
+    expert: torch.Tensor,
+    w: dict[str, torch.Tensor],
+    transform: bool,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.rdna_hint_flex_moe_transform_rdna2(
+        x, src_div, expert, w["col_scale"], w["had"], transform, out
+    )
+
+
+def rdna_hint_flex_moe_gemm_rdna2(
+    x: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    ntpp: torch.Tensor,
+    w: dict[str, torch.Tensor],
+    n_out: int,
+    out: torch.Tensor,
+) -> None:
+    """Grouped expert GEMM over moe_align_block_size(block 64) pairs."""
+    torch.ops._rocm_C.rdna_hint_flex_moe_gemm_rdna2(
+        x, sorted_ids, expert_ids, ntpp, w["codes"], w["code_off"],
+        w["blk_params"], w["param_off"], w["row_consts"], w["row_nbits"],
+        w["row_block"], n_out, out,
+    )  # fmt: skip
+
+
 def rdna_hint_flex_act_quant_rdna2(
     x: torch.Tensor,
     col_scale: torch.Tensor,
@@ -1567,6 +1597,14 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
 
     @register_fake("_rocm_C::rdna_hint_flex_i8gemm_rdna2")
     def _rdna_hint_flex_i8gemm_rdna2_fake(*args) -> None:
+        return
+
+    @register_fake("_rocm_C::rdna_hint_flex_moe_transform_rdna2")
+    def _rdna_hint_flex_moe_transform_rdna2_fake(*args) -> None:
+        return
+
+    @register_fake("_rocm_C::rdna_hint_flex_moe_gemm_rdna2")
+    def _rdna_hint_flex_moe_gemm_rdna2_fake(*args) -> None:
         return
 
     @register_fake("_rocm_C::rdna_hint_flex_act_quant_rdna2")

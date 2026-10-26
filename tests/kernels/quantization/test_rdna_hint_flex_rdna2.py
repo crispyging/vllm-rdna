@@ -489,8 +489,10 @@ class _Experts(torch.nn.Module):
 
 @gfx1030_only
 @pytest.mark.parametrize("mode", [0, 2])
-@pytest.mark.parametrize("tokens", [1, 3, 9])
+@pytest.mark.parametrize("tokens", [1, 3, 9, 40, 300])
 def test_moe_vs_dense_reference(tokens, mode):
+    """Up to 16 tokens: per-pair GEMV; above (F16 mode): pairs grouped by
+    expert through the fused decode-in-GEMM kernel."""
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.quantization.rdna_hint_flex_moe import (
