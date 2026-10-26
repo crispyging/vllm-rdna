@@ -6,9 +6,9 @@
     "rocblas": "5.5.0.cd957402",
     "dtype": "float16, bfloat16",
     "gpu": "4x Radeon PRO V620 (gfx1030), TP4",
-    "model": "Qwen3.8-Flash-Next-AWQ-W4A16 (MTP=0/2, DFlash2); Qwen3.8-27B AWQ (W4A16/W4A8) and EXL3 (MTP=0/2); Qwen3.6-35B-A3B GPTQ (MTP=0/2); DeepSeek-V4-Flash K128",
+    "model": "Qwen3.8-Flash-Next-AWQ-W4A16 (MTP=0/2, DFlash2); Qwen3.8-27B AWQ (W4A16/W4A8) and EXL3 (MTP=0/2); Qwen3.6-35B-A3B GPTQ (MTP=0/2); DeepSeek-V4-Flash K128; OLMoE-1B-7B-0924 rdna_hint_flex (r4, b3.0) and dense fp16 (TP=1)",
     "source": "Offline-tuned with tools/rdna2_028/tune_prod_shapes.py (>=10 iterations, 25 ms/solver budget, numerical check tolerances 0.01/0.01) on all four GPUs in parallel. Shape list = the union of the committed rows and every GemmTunableOp key observed by the 2026-09-30 record-untuned census over the full serving matrix (4 configs x MTP=0/2; see campaign block). The census replaces the earlier harvest-only derivation: record_untuned records EVERY half-precision GEMM the process issues, so mixed prefill+decode batches (M = 1024+k, 2048+k) that the harvested set never contained are now covered. Curated against fresh same-process heuristic / current / new measurements (tools/rdna2_028/tune_prod_shapes.py --mode measure, GPU 0, 5 warmup + 15 reps median): the chosen solver is whichever condition is fastest, new is adopted only when it beats both current and heuristic by >= 3 %, and rows slower than the heuristic by more than 3 % are dropped. Default rows fold into the dropped set so the shipped file is small and behaviourally identical to the heuristic at those shapes.",
-    "rows_per_rank": 2594,
+    "rows_per_rank": 2707,
     "dflash2_bf16": {
         "date": "2026-10-20",
         "capture": "Flash-Next AWQ target + DFlash2 BF16 draft, TP4/EP4 on HIP 6-9, 1k/512 and 16k/1k at concurrency 8; union of 58 regular BF16 GEMM keys across all four ranks",
@@ -217,5 +217,30 @@
             ],
             "conclusion": "Native MTP2 faster in all four cells; tuned DFlash2 output is 28.98%,11.85%,24.15%,6.87% lower. One paired run per cell. Native alone uses client --save-detailed for result retention."
         }
+    },
+    "olmoe_hi2": {
+        "date": "2026-10-26",
+        "arms": "OLMoE-1B-7B-0924 rdna_hint_flex olmoe-r4 and olmoe-b3.0, dense fp16 on the RDNA2 HIP and Triton MoE backends; TP=1, FULL_AND_PIECEWISE, max context 4096",
+        "capture_method": "tools/rdna/rdna_hint_flex/bench_serve.sh CENSUS_DIR (record-untuned) over the probes and the four bench cells (1k/512, 2k/512 at c=1/c=8) per arm; 113 unique GemmTunableOp_Half keys (attention/router/lm_head projections; routed experts do not go through rocBLAS on any of these arms)",
+        "tune_method": "tools/rdna/rdna_hint_flex/tunableop_campaign.sh (tune_prod_shapes.py --mode tune, census keys + M=1..8 extensions: 145 shapes, one V620, >=10 iterations, 25 ms/solver, numerical check 0.01/0.01)",
+        "curate": {
+            "tool": "tools/rdna2_028/curate_tunableop_rows.py",
+            "adopt_margin": 0.03,
+            "drop_margin": 0.03,
+            "new": 113,
+            "current": 0,
+            "dropped": 32,
+            "median_heur_over_new": 1.566,
+            "best": "tn_64_512_2048: 0.211 -> 0.059 ms (3.55x)",
+            "sum_ms_heur_to_new_adopted": [
+                50.6,
+                28.4
+            ]
+        },
+        "merge": "Additive: the 2594 shipped rows are kept byte-for-byte; 113 adopted rows appended to each rank file.",
+        "rows_before": 2594,
+        "rows_after": 2707,
+        "files": "~/w4a8_runs/hi2-support/{census/olmoe-*,tunable-olmoe} on par1-cs25",
+        "lookup_hits": "2613/2613 FP16 keys (tools/rdna2_028/verify_tunableop_lookup.py, rank 0 file, one V620)"
     }
 }

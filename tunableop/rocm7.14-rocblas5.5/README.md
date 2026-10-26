@@ -6,6 +6,18 @@ captured 2026-09-29 by re-tuning the production Flash-Next shapes with the
 `lib_sha256` is the `librocblas.so.5` sha256 (see `provenance.json`), and
 `configure_tunableop` matches it against the loaded build.
 
+## rdna_hint_flex / dense OLMoE-1B-7B (2026-10-26)
+
+Census during the four bench cells (1k/512 and 2k/512 at c=1/c=8, max context
+4096) of OLMoE-1B-7B-0924 as rdna_hint_flex `olmoe-r4` and `olmoe-b3.0` and as
+dense fp16 on the RDNA2 HIP and Triton MoE backends, TP=1: 113 unique FP16
+keys (attention, router and lm_head; routed experts do not reach rocBLAS on
+any arm). Tuned with the M=1..8 extensions (145 shapes) on one V620 and curated
+at the usual 3 % margin: 113 rows adopted (median 1.57x over the heuristic,
+best 3.55x), 32 left on the heuristic, appended to each rank file:
+**2707 rows/rank**. Lookup-hit proof 2613/2613 FP16 keys. Details in
+`provenance.json` (`olmoe_hi2`).
+
 ## rdna_hint_flex / dense Qwen3.5-4B and Qwen2.5-0.5B (2026-10-25)
 
 Census during the four bench cells of `tools/rdna/rdna_hint_flex/bench_serve.sh`
