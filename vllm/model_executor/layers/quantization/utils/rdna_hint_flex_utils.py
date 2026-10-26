@@ -132,6 +132,73 @@ def select_rows(t: Hi2, r0: int, r1: int) -> Hi2:
     return out
 
 
+STACK_FIELD = "part_off"
+# Stacked routed-expert groups (tools/hi2 --moe-layout stacked) and the fork
+# stage each one fills; the parts are listed in row order.
+STACK_GROUPS = {
+    "gate_up": ("w13", ("gate_proj", "up_proj")),
+    "down": ("w2", ("down_proj",)),
+    "w13": ("w13", ("w1", "w3")),
+    "w2": ("w2", ("w2",)),
+}
+
+
+def canonicalize_stack(t: Hi2) -> Hi2:
+    """Dtypes and shapes of a stacked expert group: the row arrays as for one
+    tensor, ``had [E, K/16]``, ``col_scale [E, K]`` (if present) and
+    ``part_off [E*P+1]``. No copy when the checkpoint already has them."""
+    out = canonicalize({**t, "had": t["had"][0], "col_scale": None})
+    e = int(t["had"].shape[0])
+    out["had"] = t["had"].reshape(e, -1).to(torch.uint8)
+    if t.get("col_scale") is not None:
+        out["col_scale"] = t["col_scale"].reshape(e, -1).to(torch.float16)
+    out[STACK_FIELD] = t[STACK_FIELD].reshape(-1).to(torch.int64)
+    return out
+
+
+def validate_stack(t: Hi2, parts: int, k: int | None = None) -> None:
+    """Check a canonical stack: one valid flat container of R rows with
+    ``K = had.shape[1] * 16``, per-expert transform tables and ``part_off``
+    covering the rows in order."""
+    e = int(t["had"].shape[0])
+    kk = int(t["had"].shape[1]) * GROUP
+    if t.get("col_scale") is not None and tuple(t["col_scale"].shape) != (e, kk):
+        raise ValueError(
+            f"rdna_hint_flex stack: col_scale {tuple(t['col_scale'].shape)}, "
+            f"expected {(e, kk)}"
+        )
+    validate({**t, "had": t["had"][0], "col_scale": None}, k)
+    po = t[STACK_FIELD]
+    if po.numel() != e * parts + 1 or int(po[0]) != 0:
+        raise ValueError(
+            f"rdna_hint_flex stack: part_off has {po.numel()} entries, "
+            f"expected {e * parts + 1} starting at 0"
+        )
+    if int(po[-1]) != num_rows(t) or bool((po[1:] < po[:-1]).any()):
+        raise ValueError("rdna_hint_flex stack: part_off does not cover the rows")
+
+
+def split_stack(
+    t: Hi2, parts: int, experts: list[int] | None = None
+) -> list[list[Hi2]]:
+    """Per-expert tensors of a canonical stack (``[expert][part]``), each with
+    its expert's ``had`` / ``col_scale``: byte for byte the per-expert
+    checkpoint tensors (views, no copy). ``experts`` picks a subset."""
+    po = t[STACK_FIELD].tolist()
+    base = {f: t[f] for f in FIELDS if f != "had"}
+    out = []
+    for e in range(int(t["had"].shape[0])) if experts is None else experts:
+        row = []
+        for p in range(parts):
+            j = e * parts + p
+            u = select_rows({**base, "had": t["had"][e]}, po[j], po[j + 1])
+            if t.get("col_scale") is not None:
+                u["col_scale"] = t["col_scale"][e]
+            row.append(u)
+        out.append(row)
+    return out
+
+
 def _same_transform(a: Hi2, b: Hi2) -> bool:
     ca, cb = a.get("col_scale"), b.get("col_scale")
     if (ca is None) != (cb is None):

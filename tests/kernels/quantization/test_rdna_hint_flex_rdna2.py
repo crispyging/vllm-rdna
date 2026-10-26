@@ -467,6 +467,157 @@ def test_i8_linear_vs_reference(m, nbits, blocks):
     assert rel_err(y_all, ref_linear(x, t)) < 1e-2
 
 
+# ---- CPU: stacked expert layout (tools/hi2 --moe-layout stacked) ----------
+def _write_stack(experts: list[list[dict]]) -> dict:
+    """What the writer stores for one group: the experts' parts concatenated
+    in expert-major order, rebased offsets, ``had [E, K/16]``, ``col_scale
+    [E, K]`` (all or none) and ``part_off``."""
+    flat = [p for e in experts for p in e]
+    t = hu.concat_rows(flat, check_transform=False)
+    out = {f: t[f].clone() for f in hu.FIELDS if f != "had"}
+    out["had"] = torch.stack([e[0]["had"] for e in experts])
+    if experts[0][0].get("col_scale") is not None:
+        out["col_scale"] = torch.stack([e[0]["col_scale"] for e in experts])
+    rows = [hu.num_rows(p) for p in flat]
+    out["part_off"] = torch.tensor([0] + rows, dtype=torch.int64).cumsum(0).int()
+    return out
+
+
+def _moe_experts(e, hidden, inter, seed, smooth_down=True):
+    gate, up, down = [], [], []
+    for i in range(e):
+        g = make_hi2(inter, hidden, seed=seed + 10 * i, smooth=True)
+        u = make_hi2(inter, hidden, seed=seed + 10 * i + 1, smooth=True)
+        u["had"], u["col_scale"] = g["had"], g["col_scale"]
+        d = make_hi2(hidden, inter, seed=seed + 10 * i + 2, smooth=smooth_down)
+        gate.append(g)
+        up.append(u)
+        down.append(d)
+    return gate, up, down
+
+
+def _moe_layer(e_local, hidden, inter_part, tp=1, rank=0, local=None, e_global=None):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.rdna_hint_flex_moe import (
+        RdnaHintFlexMoEMethod,
+    )
+
+    layer = torch.nn.Module()
+    method = RdnaHintFlexMoEMethod(None, 0)
+    method.create_weights(layer, e_local, hidden, inter_part, torch.float16)
+    layer.moe_config = SimpleNamespace(tp_size=tp, tp_rank=rank)
+    layer.global_num_experts = e_global or e_local
+    local = local or {g: g for g in range(e_local)}
+    layer._map_global_expert_id_to_local_expert_id = lambda g: local.get(g, -1)
+    return layer, method
+
+
+def _load_per_expert(layer, method, gate, up, down, local, stages=("w13", "w2")):
+    for shard, tensors in (("w1", gate), ("w3", up), ("w2", down)):
+        stage = "w2" if shard == "w2" else "w13"
+        if stage not in stages:
+            continue
+        for g, t in enumerate(tensors):
+            if g in local:
+                for f, v in t.items():
+                    method.absorb(layer, v, f"{stage}_weight.hi2_{f}", shard, local[g])
+
+
+def _load_stacked(layer, method, gate, up, down, stages=("w13", "w2")):
+    groups = {
+        "w13": ("gate_up", [[a, b] for a, b in zip(gate, up)]),
+        "w2": ("down", [[d] for d in down]),
+    }
+    for stage in stages:
+        group, experts = groups[stage]
+        for f, v in _write_stack(experts).items():
+            method.absorb_stack(layer, v, group, f)
+
+
+def _assert_same_stages(a, b):
+    for stage in ("w13", "w2"):
+        ta = getattr(a, f"_rdna_hint_flex_{stage}")
+        tb = getattr(b, f"_rdna_hint_flex_{stage}")
+        assert set(ta) == set(tb)
+        for f in ta:
+            assert ta[f].dtype == tb[f].dtype, (stage, f)
+            assert torch.equal(ta[f], tb[f]), (stage, f)
+        assert getattr(a, f"_rdna_hint_flex_{stage}_tr") == getattr(
+            b, f"_rdna_hint_flex_{stage}_tr"
+        )
+
+
+@pytest.mark.parametrize(
+    "tp,rank,local,smooth_down",
+    [
+        (1, 0, None, True),
+        (1, 0, None, False),
+        (2, 0, None, True),
+        (2, 1, None, False),
+        (1, 0, {2: 0, 3: 1}, True),  # expert parallel: experts 2, 3 local
+        (2, 1, {0: 1, 3: 0}, True),  # EP with a non-monotonic local order
+    ],
+)
+def test_moe_stacked_layout_equals_per_expert(tp, rank, local, smooth_down):
+    """Loading the stacked group gives exactly the stage tensors of the
+    per-expert checkpoint (TP=1 direct, TP>1 / EP through part_off)."""
+    e, hidden, inter = 4, 128, 128
+    gate, up, down = _moe_experts(e, hidden, inter * tp, 7, smooth_down)
+    local = local or {g: g for g in range(e)}
+    a, ma = _moe_layer(len(local), hidden, inter, tp, rank, local, e)
+    _load_per_expert(a, ma, gate, up, down, local)
+    ma.process_weights_after_loading(a)
+    b, mb = _moe_layer(len(local), hidden, inter, tp, rank, local, e)
+    _load_stacked(b, mb, gate, up, down)
+    mb.process_weights_after_loading(b)
+    _assert_same_stages(a, b)
+    if tp == 1 and len(local) == e:
+        assert b._rdna_hint_flex_w13["had"].shape == (e, hidden // 16)
+        if not smooth_down:
+            assert b._rdna_hint_flex_w2["col_scale"].numel() == 0
+
+
+def test_moe_stacked_and_per_expert_mixed():
+    """A checkpoint can stack one stage and keep the other per expert (the
+    writer leaves a group per expert when it cannot stack it)."""
+    e, hidden, inter = 4, 128, 64
+    gate, up, down = _moe_experts(e, hidden, inter, 11)
+    for i in range(1, e, 2):  # mixed smoothing: the writer keeps down per expert
+        down[i].pop("col_scale")
+    local = {g: g for g in range(e)}
+    a, ma = _moe_layer(e, hidden, inter)
+    _load_per_expert(a, ma, gate, up, down, local)
+    ma.process_weights_after_loading(a)
+    b, mb = _moe_layer(e, hidden, inter)
+    _load_stacked(b, mb, gate, up, down, stages=("w13",))
+    _load_per_expert(b, mb, gate, up, down, local, stages=("w2",))
+    mb.process_weights_after_loading(b)
+    _assert_same_stages(a, b)
+
+
+def test_moe_stacked_layout_rejects_bad_stacks():
+    e, hidden, inter = 2, 128, 64
+    gate, up, down = _moe_experts(e, hidden, inter, 3)
+    for mutate, msg in (
+        (lambda s: s.__setitem__("part_off", s["part_off"][:-1]), "part_off"),
+        (lambda s: s.pop("part_off"), "lacks"),
+        (lambda s: s.__setitem__("col_scale", s["col_scale"][:1]), "col_scale"),
+        (None, "experts"),  # a stack of one expert for a two-expert layer
+    ):
+        b, mb = _moe_layer(e, hidden, inter)
+        if mutate is None:
+            st = _write_stack([[gate[0], up[0]]])
+        else:
+            st = _write_stack([[a, c] for a, c in zip(gate, up)])
+            mutate(st)
+        for f, v in st.items():
+            mb.absorb_stack(b, v, "gate_up", f)
+        _load_stacked(b, mb, gate, up, down, stages=("w2",))
+        with pytest.raises(ValueError, match=msg):
+            mb.process_weights_after_loading(b)
+
+
 # ---- GPU: routed experts on a tiny synthetic checkpoint --------------------
 def _synthetic_experts(e: int, hidden: int, inter: int, seed: int):
     """Per expert: gate/up sharing one transform, down with its own, mixed

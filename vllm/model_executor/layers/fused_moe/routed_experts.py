@@ -27,6 +27,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     resolve_quant_method,
 )
+from vllm.model_executor.layers.quantization.utils.rdna_hint_flex_utils import (
+    STACK_GROUPS as _HINT_FLEX_STACK_GROUPS,
+)
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -920,10 +923,21 @@ class RoutedExperts(PluggableLayer):
         expert_mapping = self.get_expert_mapping(include_fused=True)
         mapping_by_expert = _index_expert_mapping(expert_mapping)
 
+        hint_flex = type(self.quant_method).__name__ == "RdnaHintFlexMoEMethod"
         for expert_name, loaded_weight in weights:
             if expert_name.endswith((".mul1", ".mcg")):
                 # EXL3 codebook markers (empty); the codebook comes from config.
                 continue
+            if hint_flex:
+                # Stacked rdna_hint_flex experts: gate_up.hi2_<field> (or
+                # w13 / down / w2) holds every expert of the stage at once.
+                group, dot, rest = expert_name.partition(".")
+                if dot and group in _HINT_FLEX_STACK_GROUPS and rest.startswith("hi2_"):
+                    cast(Any, self.quant_method).absorb_stack(
+                        self, loaded_weight, group, rest.removeprefix("hi2_")
+                    )
+                    yield f"{_HINT_FLEX_STACK_GROUPS[group][0]}_weight"
+                    continue
             qual_name = f"{self.layer_name}.{expert_name}"
             # An EXL3 trellis is 3-D per expert (tiles x tiles x words).
             is_fused = loaded_weight.dim() == 3 and not expert_name.endswith(".trellis")
