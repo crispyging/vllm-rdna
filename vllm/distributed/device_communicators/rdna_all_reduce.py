@@ -220,6 +220,16 @@ class RdnaOneShotAllReduce:
                         )
                 except Exception as e:  # noqa: BLE001
                     err = str(e)
+                    # A failed hipDeviceEnablePeerAccess leaves its error in
+                    # HIP's sticky last-error slot (the .cu init clears it
+                    # only on the non-throwing path); it would surface at
+                    # torch's next launch as `invalid device ordinal` and
+                    # kill worker init after the graceful disable. Consume it.
+                    try:
+                        import ctypes
+                        ctypes.CDLL("libamdhip64.so.7").hipGetLastError()
+                    except OSError:
+                        pass
             dist.barrier(group=group)
         status: list = [None] * self.world_size
         dist.all_gather_object(status, err, group=group)
