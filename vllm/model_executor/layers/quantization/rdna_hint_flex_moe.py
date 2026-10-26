@@ -20,6 +20,7 @@ so it is cudagraph-capturable. F16 and I8 compute modes (the config's
 compute_mode).
 """
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,8 +38,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 _SHARDS = ("w1", "w3", "w2")
-# Batches above this many tokens use the grouped (per-expert GEMM) path.
-GROUPED_MIN_TOKENS = 16
+# Batches above this many tokens use the grouped (per-expert GEMM) path;
+# RDNA_HINT_FLEX_MOE_GROUPED_MIN overrides it (A/B only).
+GROUPED_MIN_TOKENS = int(os.environ.get("RDNA_HINT_FLEX_MOE_GROUPED_MIN", "16"))
 MOE_BLOCK_M = 64  # must match kMoeBlockM in rdna_hint_flex_rdna2.cu
 
 
