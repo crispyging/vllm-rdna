@@ -366,7 +366,7 @@ QSA ring alignment requirements remain independent of graph sizes.
 
 | Env | Default | Notes |
 | --- | --- | --- |
-| `VLLM_RDNA2_W4A8_SDOT4` | 0 | **Opt-in.** int8-activation prefill GEMMs; decode stays W4A16. Dense from M ≥ 33 (27B AWQ: prefill +24–34 %, PPL 4.90 vs 4.94); MoE from 512 tokens (Flash-Next: prefill +14–17 %, PPL 4.84 vs 4.86). `tools/rdna/bench_moe_w4a8.py` A/Bs the MoE kernel. |
+| `VLLM_RDNA2_W4A8_SDOT4` | 0 | **Opt-in** (the `27b-awq` recipe sets it to 1). int8-activation prefill GEMMs; decode stays W4A16. Dense from M ≥ 33 (27B AWQ: prefill +24–34 %, PPL 4.90 vs 4.94); MoE from 512 tokens (Flash-Next: prefill +14–17 %, PPL 4.84 vs 4.86). `tools/rdna/bench_moe_w4a8.py` A/Bs the MoE kernel. Re-measured on the 27B AWQ tree (2026-10-25, one boot, one knob changed, raw PASS): the fitted prefill cost falls from 0.94–1.15 to 0.70–0.93 ms/token, 16k c=1 prefill 860 → 1075 tok/s (TTFT 19.1 → 15.2 s), 16k c=8 aggregate output 42.5 → 52.3 tok/s (TTFT 48.8 → 34.4 s), paired PPL 4.94 → 4.91, greedy 3/3 on both sides. |
 | `VLLM_RDNA2_W4A16_RUNTIME_DISPATCH` | 0 | Choose decode/prefill kernel per call at run time (custom op) instead of at trace time. |
 | `VLLM_RDNA_DENSE_INT8`, `_ONLY`, `_MIN_ROWS` | 0, 0, 64 | int8 weight-only shadow copies of dense fp16 projections for decode. Off in all recipes. |
 | `VLLM_RDNA_DENSE_GEMV` | 0 | Force `gemv_f16_rdna2` for n ≤ 5. **Never route anything to wvSplitK on gfx1030**: it asserts on device. |
