@@ -6,6 +6,7 @@
 # backends) plus a per-pair-GEMV A/B arm, then held-out perplexity of the
 # dense exports and of the original model in fp16.
 #   GPU=3 BENCH_TREE=~/vllm-rdna-hi2-bench3 bash tools/rdna/rdna_hint_flex/olmoe_phase.sh
+# SKIP_TUNE=1 / SKIP_PPL=1 skip those phases; ROOT moves the serving results.
 set -uo pipefail
 TREE=$(cd "$(dirname "$0")/../../.." && pwd)
 GPU=${GPU:?GPU}
@@ -30,6 +31,8 @@ if [[ ${SKIP_TUNE:-0} != 1 ]]; then
     "$BENCH_TREE"/tunableop/rocm7.14-rocblas5.5/
 fi
 
+export ROOT=${ROOT:-$R}  # serving results: ROOT/serve-<arm>
+mkdir -p "$ROOT"
 export SERVE_OVERRIDES="MAXLEN=4096 MIN_MAXLEN=0"
 export CELLS="1024:512:1 1024:512:8:32 2048:512:1:4 2048:512:8:16"
 B=$BENCH_TREE/tools/rdna/rdna_hint_flex/bench_serve.sh
@@ -37,6 +40,7 @@ GPU=$GPU PORT=18741 bash "$B" "olmoe-r4=$M/olmoe-r4" "olmoe-b30=$M/olmoe-b3.0" "
 EXTRA_ARGS="--moe-backend triton" GPU=$GPU PORT=18741 bash "$B" "olmoe-densetriton=$O"
 RDNA_HINT_FLEX_MOE_GROUPED_MIN=1000000 GPU=$GPU PORT=18741 bash "$B" "olmoe-r4-pairgemv=$M/olmoe-r4"
 
+[[ ${SKIP_PPL:-0} == 1 ]] && { log "campaign finished (no ppl)"; exit 0; }
 MIX=$A/eval_mix.txt
 for arm in r4:$R/dense/olmoe-r4 b30:$R/dense/olmoe-b3.0 orig:$O; do
   tag=${arm%%:*}

@@ -17,6 +17,38 @@ CELLS = [
 ]
 
 
+def _parse_cell(name: str) -> tuple[int, int, int] | None:
+    """bench-<in>x<out>-c<conc>.json -> (in, out, conc)."""
+    if not (name.startswith("bench-") and name.endswith(".json")):
+        return None
+    io, _, conc = name[len("bench-") : -len(".json")].partition("-c")
+    i, _, o = io.partition("x")
+    if not (i.isdigit() and o.isdigit() and conc.isdigit()):
+        return None
+    return int(i), int(o), int(conc)
+
+
+def _k(n: int) -> str:
+    return f"{n // 1024}k" if n % 1024 == 0 else str(n)
+
+
+def cells_present(root: Path, tags: list[str]) -> list[tuple[str, str]]:
+    """The cells found under the arms' result dirs (e.g. 2k/512 at max
+    context 4096), or the standard four when none is found."""
+    seen = set()
+    for tag in tags:
+        for f in (root / f"serve-{tag}").glob("bench-*.json"):
+            c = _parse_cell(f.name)
+            if c:
+                seen.add(c)
+    if not seen:
+        return CELLS
+    return [
+        (f"{_k(i)}/{_k(o) if o >= 1024 else o} c={c}", f"bench-{i}x{o}-c{c}")
+        for i, o, c in sorted(seen)
+    ]
+
+
 def cell(path: Path) -> str:
     if not path.exists():
         return "| n/a | n/a | n/a | n/a |"
@@ -40,8 +72,9 @@ def main() -> None:
     root = Path(sys.argv[1])
     print("| cell | arm | prefill tok/s | decode tok/s | TTFT s | ITL ms (median) |")
     print("| --- | --- | --- | --- | --- | --- |")
-    for label, name in CELLS:
-        for tag in sys.argv[2:]:
+    tags = sys.argv[2:]
+    for label, name in cells_present(root, tags):
+        for tag in tags:
             print(f"| {label} | {tag} " + cell(root / f"serve-{tag}" / f"{name}.json"))
 
 
