@@ -52,7 +52,7 @@ actually sets.
 | `TUNABLEOP`, `TUNABLEOP_PROFILE` | 1 / name | TunableOp lookup on/off, force a named profile. |
 | `TUNABLEOP_ROOT` | directory | Optional alternate profile registry and rank files for a serving A/B; defaults to the fork's `tunableop/`. The same rocBLAS hash validation applies. |
 | `TUNED_CONFIG` | 0, 1 | Use `tuned-moe/` MoE configs (`VLLM_TUNED_CONFIG_FOLDER`). |
-| `SEQS`, `MAXBAT`, `MAXLEN`, `KV`, `GMEM`, `BLOCK_SIZE`, `LPTH`, `PREFILL_INTERVAL` | | `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len`, `--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--block-size`, `--long-prefill-token-threshold`, `--prefill-schedule-interval`. `KV=auto` (needs `GMEM`) drops `--kv-cache-memory-bytes` so vLLM sizes the cache after profiling. |
+| `SEQS`, `MAXBAT`, `MAXLEN`, `KV`, `GMEM`, `BLOCK_SIZE`, `LPTH`, `PREFILL_INTERVAL` | | `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len`, `--kv-cache-memory-bytes`, `--gpu-memory-utilization`, `--block-size`, `--long-prefill-token-threshold`, `--prefill-schedule-interval`. `KV=auto` (needs `GMEM`) drops `--kv-cache-memory-bytes` so vLLM sizes the cache after profiling. An empty `MAXBAT` is derived from the KV and SSM dtypes (2048 for an FP16 KV cache, 4096 for a packed KV cache with an FP16 SSM state, 6144 with the model's own FP32 state): a prefill chunk ends on a mamba state block boundary, so the budget must cover two blocks or a long prompt drains at half rate at concurrency. The other recipes pin `MAXBAT=2048`, which is right for their FP16 KV cache; a recipe that switches to a packed KV cache has to let the launcher derive the budget instead. |
 | `PP`, `PP_PARTITION` | | `--pipeline-parallel-size`; layers per stage → `VLLM_PP_LAYER_PARTITION`. See [Pipeline parallel](#pipeline-parallel-3-or-4-cards). |
 | `ALLOC_CONF` | true, false, auto | `expandable_segments`. `auto` turns it off with the PLE sidecar. |
 | `FEATURES` | tokens | `prefix-caching mamba-align expert-parallel language-model-only skip-mm-profiling vision-cap trust-remote-code reasoning auto-tool prompt-tokens-details`. |
@@ -416,7 +416,7 @@ QSA ring alignment requirements remain independent of graph sizes.
 
 | Env | Default | Notes |
 | --- | --- | --- |
-| `VLLM_RDNA_DECODE_STALL_MS` | 0 | Default for `--decode-stall-budget-ms` on RDNA. Dense TP=4 recipes: 250 (max decode gap during 16k prefill 2672 → 320 ms, −8 % c=8 output). Opt-in on Flash-Next (−13 %), off at TP=2. |
+| `VLLM_RDNA_DECODE_STALL_MS` | 0 | Default for `--decode-stall-budget-ms` on RDNA. Dense TP=4 recipes: 250 (max decode gap during 16k prefill 2672 → 320 ms, −8 % c=8 output). Opt-in on Flash-Next (−13 %), off at TP=2. The 27B AWQ recipe now sets 0: once the prefill budget is derived from the mamba state block, the cap only chunks the prefill below that boundary, and it costs 12–19 % TTFT at c=8 for 0–2.5 % output (2026-10-25, one boot, raw PASS). |
 | `VLLM_RDNA_DECODE_SHARE` | 0 | Default for `--decode-time-share`. |
 | `VLLM_DECODE_STALL_MAX_OVERHEAD` | 0.25 | Floor on the cap so per-step fixed cost stays below this fraction of per-token work. |
 | `VLLM_DECODE_STALL_FIT_ALL` | auto | Fit step cost on all prefill steps (dense default) or mixed steps only (MoE default). |
