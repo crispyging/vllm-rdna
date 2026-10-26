@@ -13,6 +13,7 @@ TREE=$(cd "$(dirname "$0")/../../.." && pwd)
 GPU=${GPU:?GPU (HIP indices among ours) required}
 TP=${TP:-1}
 ROOT=${ROOT:-$HOME/w4a8_runs/hi2-support}
+mkdir -p "$ROOT"
 CELLS=${CELLS:-"1024:512:1 1024:512:8:32 16384:1024:1:4 16384:1024:8:16"}
 PORT=${PORT:-18731}
 SMI_OFFSET=${SMI_OFFSET:-2}  # rocm-smi GPU[i+2] = HIP i on par1-cs25
