@@ -188,7 +188,7 @@ OLMoE-1B-7B"); the points below were the requirements and still hold:
 ## Checks
 
 Unit tests: `bash tools/rdna/rdna_hint_flex/run_tests.sh <hip_device>`,
-**201 passed** on a V620. The dequant kernel and the I8 activation quantization
+**209 passed** on a V620. The dequant kernel and the I8 activation quantization
 are bit-identical to the reference; `rdna_hint_flex_linear_rdna2` matches
 `reference_linear` (float64) within 2e-3 relative error for M = 1..37 (F16),
 the I8 GEMV matches the integer-exact I8 reference within 1e-3; the synthetic
@@ -560,20 +560,135 @@ so a shared run shows up.
     * Per-expert transform tables are cheap. The per-row offsets are 8 of the
       16 bytes per row and are absolute within each tensor, so stacking has to
       rebase them, which is a host pass over 4 M rows.
-* **Suggestion (tool side, optional).** Writing the experts of one
-  layer/projection as one stacked HI2 tensor would make the file the
-  in-memory layout. The expert arrays would drop from 27,648 to 288 (two
-  stages x nine arrays x 16 layers), about 950 tensors in all instead of
-  28,307. The stacked tensor
-  would have ragged rows concatenated in expert order, offsets already
-  rebased, `col_scale [E, K]`, `had [E, K/16]`, and gate and up fused when
-  they share the transform. The per-expert layout keeps working; the loader
-  would accept both.
+* **Stacked layout.** The tool now writes this layout (`--moe-layout
+  stacked`), and the loader reads it. See "Stacked expert layout" below.
 * **Rarely routed experts.** The quantizer fell back to data-free
   calibration for 3 tensors in each checkpoint (layer 7 expert 51,
   gate/up/down). That is visible in `hi2_report.json`
   (`experts.coverage.*.fallback`), and the minimum per-expert token count is
   in the same table.
+
+## Stacked expert layout
+
+`tools/hi2 quantize --moe-layout stacked` and `hi2 restack` write one group
+per layer and stage: `<pre>.gate_up.hi2_*` and `<pre>.down.hi2_*`, or `w13` /
+`w2` for Mixtral names. A `hi2_part_off` array marks the group. The writer's
+description is in `docs/rdna2/hi2-moe.md`, "Stacked expert layout", on
+`feat/hadamard-int2-weights`. The arrays are:
+
+* the seven row arrays of one flat container, offsets already rebased;
+* `had [E, K/16]`;
+* `col_scale [E, K]`, all or none;
+* `part_off [E*P + 1]`.
+
+Rows are expert-major with gate before up. That is exactly the
+`_rdna_hint_flex_w13` / `_w2` layout the MoE method builds in memory.
+
+**Loader.** `RoutedExperts.load_weights` sends `gate_up|down|w13|w2.hi2_<field>`
+names to `RdnaHintFlexMoEMethod.absorb_stack`, which collects the arrays per
+stage. `process_weights_after_loading` then picks one of three paths per stage:
+
+* **Stacked, TP=1, every expert local.** It checks the arrays with
+  `validate_stack`:
+    * one valid container with `K = had.shape[1] * 16`;
+    * `part_off` covering the rows;
+    * every part with the layer's row count;
+    * the expert count equal to the layer's.
+
+  It then copies the arrays to the GPU as they are, with no per-expert
+  stacking and no offset rebase. An absent `col_scale` becomes the empty tensor.
+* **Stacked, TP>1 or expert parallel.** `split_stack` cuts each local expert's
+  parts out by `part_off`. Under EP the local experts come from
+  `_map_global_expert_id_to_local_expert_id`, in local order. The parts are views
+  and byte for byte the per-expert tensors. They then take the per-expert path:
+  `select_rows` gives the rank's gate/up rows, `select_cols` gives the down
+  columns, and the result is restacked.
+* **Per-expert.** This path is unchanged. It covers older checkpoints, and any
+  group the writer left per expert inside a stacked checkpoint (the forms can mix
+  per stage).
+
+The config's module scan needs no change: the routed-expert method is chosen by
+the experts prefix.
+
+**Checks.**
+
+* **Unit tests:** `test_moe_stacked_layout_equals_per_expert` checks that the
+  stage tensors and transform flags are equal to the per-expert load (dtypes and
+  `torch.equal`). It covers six cases: TP=1, with smoothed and unsmoothed down;
+  TP=2 at ranks 0 and 1; and EP with experts {2,3} local, plus a non-monotonic
+  local order at TP=2. Two more tests: `test_moe_stacked_and_per_expert_mixed`
+  (w13 stacked, w2 per expert with mixed smoothing) and
+  `test_moe_stacked_layout_rejects_bad_stacks`.
+* **Real checkpoints:** `tools/rdna/rdna_hint_flex/compare_layouts.py` loads all
+  16 layers of `olmoe-r4` and `olmoe-r4-stacked` through the method on the CPU,
+  at TP=1 and at TP=2 rank 1. Every stage tensor is equal: `RESULT PASS` both
+  times.
+* **Serve probes:** the probe, PPL-probe and probe-after-load outputs are
+  byte-identical between the layouts on all five boot pairs:
+    * r4 and b3.0, cold and warm;
+    * r4 for the serving cells.
+
+  The greedy replies are "Paris", "2, 2+2=4, ..." and "Berlin". The
+  concurrency probe gave 48/48 identical for stacked r4 and 47/48 plus one
+  near-tie for per-expert r4.
+* **Faults:** none in any boot.
+
+**Perplexity through the fork** (teacher-forced, 16,376 tokens, TP=1,
+FULL_AND_PIECEWISE):
+
+| checkpoint | per-expert study / mix | stacked study / mix |
+| --- | --- | --- |
+| `olmoe-r4` | 6.7071 / 4.1072 | 6.7071 / 4.1072 |
+| `olmoe-b3.0` | 6.7727 / 4.2871 | 6.7727 / 4.2871 |
+
+With the engine in-process (`VLLM_ENABLE_V1_MULTIPROCESSING=0`), the per-token
+log-probs are bit-identical across layouts. That holds for four r4 study runs,
+alternating layouts, and for the r4 mix pair. With the default engine process,
+the log-probs vary between runs **of either layout**, independently of the
+layout:
+
+* 2 of 5 stacked graph runs differed;
+* eager mode gave two outcomes (study ppl 6.7081 and 6.7067), each produced by
+  both layouts.
+
+The divergent runs differ from the first token of every prompt, by a mean of
+0.0055 nats. This is batch composition: requests reach the separate engine-core
+process at timing-dependent moments, and the GEMMs are not batch-invariant. It is
+not the weights. Use the in-process engine for bit-exact A/B. (The 4.1063 mix
+figure in the OLMoE section came from the per-pair path; the grouped path gives
+4.1072.)
+
+**Model load time** ("Model loading took" in the serve log, one V620, TP=1). A
+cold load has the checkpoint's pages evicted with `posix_fadvise(DONTNEED)`
+just before the boot. A warm load is the next boot. The host's 1-minute load
+average at the time was 11 to 52, out of 96 threads.
+
+| checkpoint | layout | tensors | cold | warm |
+| --- | --- | ---: | ---: | ---: |
+| `olmoe-r4` | per-expert | 28,307 | 94.2 s | 84.6 s |
+| `olmoe-r4` | stacked | 979 | **16.1 s** | **9.2 s** |
+| `olmoe-b3.0` | per-expert | 28,307 | 73.9 s | 72.4 s |
+| `olmoe-b3.0` | stacked | 979 | **9.9 s** | **8.8 s** |
+
+Stacked loads 8-9x faster warm and 6-7x faster cold. It is now faster than the
+dense fp16 model (22 s for 12.9 GiB), because it reads 3.2 GiB with no
+per-expert work. The cold-cache penalty is only the disk read, 1-7 s.
+
+**Serving, no regression** (TP=1, FULL_AND_PIECEWISE, tuned rows, the same
+session, each arm alone on the GPU):
+
+| cell | layout | prefill tok/s | decode tok/s | TTFT s | ITL ms |
+| --- | --- | --- | --- | --- | --- |
+| 1k/512 c=1 | per-expert | 4996 (4848) | 203.9 (188.8) | 0.20 | 4.8 |
+| 1k/512 c=1 | stacked | 5015 (4931) | 206.5 (191.1) | 0.20 | 4.8 |
+| 1k/512 c=8 | per-expert | 1305 (6203) | 59.8 (438.5) | 0.78 | 15.7 |
+| 1k/512 c=8 | stacked | 1315 (5425) | 60.0 (440.4) | 0.78 | 15.6 |
+
+The layouts are within noise: the kernels get identical tensors.
+
+Drivers: `tools/rdna/rdna_hint_flex/olmoe_stacked.sh` (load times, probes,
+cells, perplexity) and `compare_layouts.py`. Results:
+`~/w4a8_runs/hi2-support/stacked/` and `acc_long/olmoe_*_layout|rep*|eager*|inproc*`.
 
 ## I8 prefill: parked
 
@@ -674,5 +789,7 @@ map), not a checkpoint change.
   benchmarked or wired.
 * OLMoE at TP=2 (no two GPUs were free together); I8 for the grouped MoE
   prefill path (F16 only; I8 batches over 16 tokens use the per-pair path).
-* A stacked-experts checkpoint layout (tool side, see "Format notes for MoE").
+* Stacked groups for models whose vLLM `load_weights` maps expert names itself
+  instead of passing them to `RoutedExperts.load_weights` (OLMoE goes through
+  `AutoWeightsLoader` and works; other MoE models are untested with stacks).
 * The tuned dense Qwen2.5-0.5B concurrency failure was not investigated.
