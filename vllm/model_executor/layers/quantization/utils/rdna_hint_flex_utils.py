@@ -357,3 +357,60 @@ def i8_linear_reference(
     sxd = sx.double().unsqueeze(1)  # [m, 1, g]
     sq = sumq.double().unsqueeze(1)
     return (sxd * (step.unsqueeze(0) * s_int + lo.unsqueeze(0) * sq)).sum(-1)
+
+
+# ---- I8 prefill: activation scale per 64 columns ---------------------------
+QG = 64
+
+
+def act_quant64(
+    x: torch.Tensor, t: Hi2, transform: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per token and 64-column group: ``sx = fp16(absmax / 127)`` (returned
+    as float32), ``xq = clamp(rint(x' / sx), -127, 127)`` and per 16-column
+    chunk ``sq16 = sx * sum(xq)``. Returns ``(xq int8 [M, K], sx float32
+    [M, K/64], sq16 float32 [M, K/16])``."""
+    v = act_transform_f32(x, t) if transform else x.float()
+    m, k = v.shape
+    vg = v.reshape(m, k // QG, QG)
+    sx = (vg.abs().amax(-1) / 127.0).to(torch.float16).float()
+    sf = sx.unsqueeze(-1)
+    q = torch.where(sf > 0, torch.round(vg / torch.where(sf > 0, sf, 1.0)), 0.0)
+    q = q.clamp(-127, 127)
+    sums = q.reshape(m, k // GROUP, GROUP).sum(-1)
+    sq16 = sums * sx.repeat_interleave(QG // GROUP, dim=1)
+    return q.reshape(m, k).to(torch.int8), sx, sq16
+
+
+def unrounded_weight(t: Hi2) -> torch.Tensor:
+    """float64 ``[R, K]`` with ``step_b = step_scale * u_b`` and ``lo_b =
+    lo_min + lo_scale * lou_b`` kept unrounded (the I8 prefill math)."""
+    r, k = num_rows(t), num_cols(t)
+    out = torch.zeros(r, k, dtype=torch.float64)
+    nb = t["row_nbits"].to(torch.int64)
+    bl = t["row_block"].to(torch.int64)
+    co = t["code_off"].to(torch.int64)
+    po = t["param_off"].to(torch.int64)
+    pv = t["blk_params"].view(-1, 2)
+    for nbits in sorted(set(nb.tolist())):
+        for bs in sorted(set(bl.tolist())):
+            rows = ((nb == nbits) & (bl == bs)).nonzero().flatten()
+            if rows.numel() == 0:
+                continue
+            wr, nblk = k * nbits // 32, k // bs
+            words = t["codes"][co[rows].unsqueeze(1) + torch.arange(wr)]
+            codes = unpack_codes(words, nbits).reshape(rows.numel(), nblk, bs)
+            p = pv[po[rows].unsqueeze(1) + torch.arange(nblk)].double()
+            rc = t["row_consts"][rows].unsqueeze(1).double()
+            lo = p[..., 0] * rc[..., 1] + rc[..., 0]
+            step = p[..., 1] * rc[..., 2]
+            w = lo.unsqueeze(-1) + codes.double() * step.unsqueeze(-1)
+            out[rows] = w.reshape(-1, k)
+    return out
+
+
+def i8g64_reference(xq: torch.Tensor, sx: torch.Tensor, t: Hi2) -> torch.Tensor:
+    """float64 ``[M, R]`` of the I8 prefill math: (xq * sx) . W_unrounded^T."""
+    m, k = xq.shape
+    xd = xq.double().reshape(m, k // QG, QG) * sx.double().unsqueeze(-1)
+    return xd.reshape(m, k) @ unrounded_weight(t).T

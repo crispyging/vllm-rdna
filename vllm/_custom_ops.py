@@ -1429,6 +1429,36 @@ def rdna_hint_flex_gemm_rdna2(
     )  # fmt: skip
 
 
+def rdna_hint_flex_act_quant64_rdna2(
+    x: torch.Tensor,
+    col_scale: torch.Tensor,
+    had: torch.Tensor,
+    transform: bool,
+    xq: torch.Tensor,
+    sx: torch.Tensor,
+    sq16: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.rdna_hint_flex_act_quant64_rdna2(
+        x, col_scale, had, transform, xq, sx, sq16
+    )
+
+
+def rdna_hint_flex_i8gemm_rdna2(
+    xq: torch.Tensor,
+    sx: torch.Tensor,
+    sq16: torch.Tensor,
+    w: dict[str, torch.Tensor],
+    out: torch.Tensor,
+    tile: int = 0,
+) -> None:
+    """I8 prefill GEMM (activation scale per 64 columns)."""
+    torch.ops._rocm_C.rdna_hint_flex_i8gemm_rdna2(
+        xq, sx, sq16, w["codes"], w["code_off"], w["blk_params"],
+        w["param_off"], w["row_consts"], w["row_nbits"], w["row_block"], out,
+        tile,
+    )  # fmt: skip
+
+
 def rdna_hint_flex_act_quant_rdna2(
     x: torch.Tensor,
     col_scale: torch.Tensor,
@@ -1529,6 +1559,14 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
 
     @register_fake("_rocm_C::rdna_hint_flex_gemm_rdna2")
     def _rdna_hint_flex_gemm_rdna2_fake(*args) -> None:
+        return
+
+    @register_fake("_rocm_C::rdna_hint_flex_act_quant64_rdna2")
+    def _rdna_hint_flex_act_quant64_rdna2_fake(*args) -> None:
+        return
+
+    @register_fake("_rocm_C::rdna_hint_flex_i8gemm_rdna2")
+    def _rdna_hint_flex_i8gemm_rdna2_fake(*args) -> None:
         return
 
     @register_fake("_rocm_C::rdna_hint_flex_act_quant_rdna2")

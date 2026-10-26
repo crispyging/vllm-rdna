@@ -1037,7 +1037,302 @@ __global__ void __launch_bounds__(kThreads) moe_gemv_i8_kernel(
     out[static_cast<int64_t>(row) * ldo + r] = __float2half_rn(acc);
 }
 
+// ---------------------------------------------------------------------------
+// I8 prefill (activation scale per 64 columns).
+//
+// Pre-pass, one thread per (token, 64-column group): x' = H16(x / s) per
+// 16-column sub-group (fp32), sx = fp16(absmax / 127) over the 64 columns,
+// xq = clamp(rint(x' / sx), -127, 127), and per 16-column chunk
+// sq16 = sx * sum(xq) (float). Per weight block b:
+//   y += sx * (step_b * sum(code * xq) + lo_b * sum(xq))
+// with step_b = step_scale * u_b and lo_b = lo_min + lo_scale * lou_b taken
+// unrounded (exactly linear in the stored bytes). INT2/INT4 codes are already
+// valid int8; INT8 codes enter as code - 128 and lo_b gains 128 * step_b.
+// ---------------------------------------------------------------------------
+constexpr int kQG = 64;  // activation quantization group (columns)
+
+__global__ void act_quant64_kernel(
+    const half* __restrict__ x, const int64_t ldx,
+    const half* __restrict__ col_scale, const uint8_t* __restrict__ had,
+    int8_t* __restrict__ xq, float* __restrict__ sx, float* __restrict__ sq16,
+    const int M, const int K) {
+  const int groups = K / kQG;
+  const int64_t gid =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= static_cast<int64_t>(M) * groups) return;
+  const int m = static_cast<int>(gid / groups);
+  const int g = static_cast<int>(gid % groups);
+  float v[kQG];
+  #pragma unroll
+  for (int c = 0; c < kQG / kGroup; ++c) {
+    const int col = g * kQG + c * kGroup;
+    const half* xp = x + m * ldx + col;
+    float t[kGroup];
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i) t[i] = __half2float(xp[i]);
+    if (col_scale != nullptr || had != nullptr)
+      transform16(t, col_scale != nullptr ? col_scale + col : nullptr,
+                  had != nullptr && had[col / kGroup]);
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i) v[c * kGroup + i] = t[i];
+  }
+  float amax = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < kQG; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  const float sf = __half2float(__float2half_rn(amax / 127.0f));
+  union {
+    int8_t b[kQG];
+    uint4 u[kQG / 16];
+  } q;
+  int sums[kQG / kGroup];
+  #pragma unroll
+  for (int c = 0; c < kQG / kGroup; ++c) {
+    int sum = 0;
+  #pragma unroll
+    for (int i = 0; i < kGroup; ++i) {
+      float r = sf > 0.0f ? rintf(v[c * kGroup + i] / sf) : 0.0f;
+      r = fminf(fmaxf(r, -127.0f), 127.0f);
+      q.b[c * kGroup + i] = static_cast<int8_t>(r);
+      sum += q.b[c * kGroup + i];
+    }
+    sums[c] = sum;
+  }
+  uint4* dst =
+      reinterpret_cast<uint4*>(xq + static_cast<int64_t>(m) * K + g * kQG);
+  #pragma unroll
+  for (int i = 0; i < kQG / 16; ++i) dst[i] = q.u[i];
+  sx[static_cast<int64_t>(m) * groups + g] = sf;
+  #pragma unroll
+  for (int c = 0; c < kQG / kGroup; ++c)
+    sq16[static_cast<int64_t>(m) * (K / kGroup) + g * 4 + c] =
+        sf * static_cast<float>(sums[c]);
+}
+
+// I8 prefill GEMM: GM x GN tile, 16 x 16 threads with TM x TN micro-tiles,
+// one 64-column activation group per K step. Per 16-column chunk:
+// d = 4 x v_dot4_i32_i8, S1 += u_chunk * d (integer), acc += lo'_chunk * sq16;
+// per group: acc += sx * step_scale * float(S1).
+template <int GM, int GN>
+__global__ void __launch_bounds__(kThreads)
+    i8gemm_kernel(const int8_t* __restrict__ xq, const float* __restrict__ sx,
+                  const float* __restrict__ sq16, const int M, const int K,
+                  const int32_t* __restrict__ codes,
+                  const int32_t* __restrict__ code_off,
+                  const uint8_t* __restrict__ blk_params,
+                  const int32_t* __restrict__ param_off,
+                  const half* __restrict__ row_consts,
+                  const uint8_t* __restrict__ row_nbits,
+                  const uint8_t* __restrict__ row_block, half* __restrict__ out,
+                  const int64_t ldo, const int R) {
+  constexpr int TM = GM / 16, TN = GN / 16;
+  constexpr int BK = kQG;
+  constexpr int LDB = BK + 16;  // bytes per LDS row (16-byte pad)
+  constexpr int XV = GM * (BK / 16) / kThreads;      // uint4 of xq per thread
+  constexpr int WC = GN * (BK / kGroup) / kThreads;  // weight chunks per thread
+  static_assert(XV >= 1 && WC >= 1, "tile too small for 256 threads");
+  __shared__ __align__(16) int8_t xs[GM * LDB];
+  __shared__ __align__(16) int8_t ws[GN * LDB];
+  __shared__ int wu[GN][4];
+  __shared__ float wl[GN][4];
+  __shared__ float sxs[GM];
+  __shared__ float sqs[GM][4];
+  __shared__ RowHdrS hdr[GN];
+  const int tid = threadIdx.x;
+  const int m_base = blockIdx.y * GM;
+  const int r_base = blockIdx.x * GN;
+  const int groups = K / kQG;
+  for (int i = tid; i < GN; i += kThreads) {
+    const int r = r_base + i;
+    RowHdrS h;
+    if (r < R) {
+      h.nb = row_nbits[r];
+      h.lb = log2_block(row_block[r]);
+      h.lo_min = __half2float(row_consts[3 * r + 0]);
+      h.lo_scale = __half2float(row_consts[3 * r + 1]);
+      h.step_scale = __half2float(row_consts[3 * r + 2]);
+      h.code_off = code_off[r];
+      h.param_off = param_off[r];
+    } else {
+      h.nb = 0;
+    }
+    hdr[i] = h;
+  }
+  __syncthreads();
+
+  uint4 xr[XV];
+  uint4 wr[WC];
+  uint32_t pr[WC];
+  float sxr = 0.0f;
+  float4 sqr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  auto load = [&](int g) {
+    const int k0 = g * BK;
+  #pragma unroll
+    for (int v = 0; v < XV; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / (BK / 16), c = (i % (BK / 16)) * 16;
+      xr[v] = make_uint4(0, 0, 0, 0);
+      if (m_base + row < M)
+        xr[v] = *reinterpret_cast<const uint4*>(
+            xq + static_cast<int64_t>(m_base + row) * K + k0 + c);
+    }
+  #pragma unroll
+    for (int v = 0; v < WC; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / 4, ch = i % 4;
+      const RowHdrS& h = hdr[row];
+      wr[v] = make_uint4(0, 0, 0, 0);
+      pr[v] = 0;
+      if (h.nb != 0) {
+        const int g16 = k0 / kGroup + ch;
+        const uint32_t* words =
+            reinterpret_cast<const uint32_t*>(codes) + h.code_off;
+        if (h.nb == 2)
+          wr[v].x = words[g16];
+        else if (h.nb == 4) {
+          const uint2 t = *reinterpret_cast<const uint2*>(words + 2 * g16);
+          wr[v].x = t.x;
+          wr[v].y = t.y;
+        } else
+          wr[v] = *reinterpret_cast<const uint4*>(words + 4 * g16);
+        const int blk = (g16 * kGroup) >> h.lb;
+        const uint8_t* p =
+            blk_params + 2 * (static_cast<int64_t>(h.param_off) + blk);
+        pr[v] =
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+      }
+    }
+    if (tid < GM) {
+      const int m = m_base + tid;
+      sxr = 0.0f;
+      sqr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if (m < M) {
+        sxr = sx[static_cast<int64_t>(m) * groups + g];
+        sqr = *reinterpret_cast<const float4*>(
+            sq16 + static_cast<int64_t>(m) * (K / kGroup) + g * 4);
+      }
+    }
+  };
+  auto store = [&]() {
+  #pragma unroll
+    for (int v = 0; v < XV; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / (BK / 16), c = (i % (BK / 16)) * 16;
+      *reinterpret_cast<uint4*>(xs + row * LDB + c) = xr[v];
+    }
+  #pragma unroll
+    for (int v = 0; v < WC; ++v) {
+      const int i = tid + v * kThreads;
+      const int row = i / 4, ch = i % 4;
+      const RowHdrS& h = hdr[row];
+      int d[4] = {0, 0, 0, 0};
+      int u = 0;
+      float lo = 0.0f;
+      if (h.nb != 0) {
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(&wr[v]);
+        if (h.nb == 2)
+          group_codes<2>(q, d);
+        else if (h.nb == 4)
+          group_codes<4>(q, d);
+        else
+          group_codes<8>(q, d);
+        u = static_cast<int>(pr[v] >> 8);
+        const float step = h.step_scale * static_cast<float>(u);
+        lo = __fmaf_rn(static_cast<float>(pr[v] & 0xFFu), h.lo_scale, h.lo_min);
+        if (h.nb == 8) lo = __fmaf_rn(128.0f, step, lo);
+      }
+      *reinterpret_cast<int4*>(ws + row * LDB + ch * 16) =
+          make_int4(d[0], d[1], d[2], d[3]);
+      wu[row][ch] = u;
+      wl[row][ch] = lo;
+    }
+    if (tid < GM) {
+      sxs[tid] = sxr;
+      sqs[tid][0] = sqr.x;
+      sqs[tid][1] = sqr.y;
+      sqs[tid][2] = sqr.z;
+      sqs[tid][3] = sqr.w;
+    }
+  };
+
+  const int tx = tid % 16, ty = tid / 16;
+  float ss[TN];
+  #pragma unroll
+  for (int j = 0; j < TN; ++j) ss[j] = hdr[tx + 16 * j].step_scale;
+  float acc[TM][TN];
+  #pragma unroll
+  for (int i = 0; i < TM; ++i)
+  #pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+
+  load(0);
+  for (int g = 0; g < groups; ++g) {
+    __syncthreads();
+    store();
+    __syncthreads();
+    if (g + 1 < groups) load(g + 1);
+    int s1[TM][TN];
+  #pragma unroll
+    for (int i = 0; i < TM; ++i)
+  #pragma unroll
+      for (int j = 0; j < TN; ++j) s1[i][j] = 0;
+  #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      int4 a[TM], b[TN];
+  #pragma unroll
+      for (int i = 0; i < TM; ++i)
+        a[i] =
+            *reinterpret_cast<const int4*>(xs + (ty + 16 * i) * LDB + c * 16);
+  #pragma unroll
+      for (int j = 0; j < TN; ++j)
+        b[j] =
+            *reinterpret_cast<const int4*>(ws + (tx + 16 * j) * LDB + c * 16);
+  #pragma unroll
+      for (int i = 0; i < TM; ++i) {
+        const float sq = sqs[ty + 16 * i][c];
+  #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+          int dd = __builtin_amdgcn_sdot4(a[i].x, b[j].x, 0, false);
+          dd = __builtin_amdgcn_sdot4(a[i].y, b[j].y, dd, false);
+          dd = __builtin_amdgcn_sdot4(a[i].z, b[j].z, dd, false);
+          dd = __builtin_amdgcn_sdot4(a[i].w, b[j].w, dd, false);
+          s1[i][j] += __mul24(wu[tx + 16 * j][c], dd);
+          acc[i][j] = __fmaf_rn(wl[tx + 16 * j][c], sq, acc[i][j]);
+        }
+      }
+    }
+  #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+      const float sxi = sxs[ty + 16 * i];
+  #pragma unroll
+      for (int j = 0; j < TN; ++j)
+        acc[i][j] =
+            __fmaf_rn(sxi * ss[j], static_cast<float>(s1[i][j]), acc[i][j]);
+    }
+  }
+  #pragma unroll
+  for (int i = 0; i < TM; ++i) {
+    const int m = m_base + ty + 16 * i;
+    if (m >= M) continue;
+  #pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int r = r_base + tx + 16 * j;
+      if (r < R)
+        out[static_cast<int64_t>(m) * ldo + r] = __float2half_rn(acc[i][j]);
+    }
+  }
+}
+
 #else  // non-RDNA2 device pass: empty kernels for symbol parity.
+
+__global__ void act_quant64_kernel(const half*, const int64_t, const half*,
+                                   const uint8_t*, int8_t*, float*, float*,
+                                   const int, const int) {}
+template <int GM, int GN>
+__global__ void i8gemm_kernel(const int8_t*, const float*, const float*,
+                              const int, const int, const int32_t*,
+                              const int32_t*, const uint8_t*, const int32_t*,
+                              const half*, const uint8_t*, const uint8_t*,
+                              half*, const int64_t, const int) {}
 
 __global__ void moe_act_quant_kernel(const half*, const int64_t, const int,
                                      const int32_t*, const half*,
@@ -1435,6 +1730,56 @@ void launch_moe_gemv_i8(const torch::Tensor& xq, const torch::Tensor& sx,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void launch_act_quant64(const torch::Tensor& x, const torch::Tensor& col_scale,
+                        const torch::Tensor& had, bool transform,
+                        torch::Tensor& xq, torch::Tensor& sx,
+                        torch::Tensor& sq16, cudaStream_t stream) {
+  const int64_t M = x.size(0), K = x.size(1);
+  const half* s = nullptr;
+  const uint8_t* h = nullptr;
+  if (transform) {
+    if (col_scale.numel() > 0)
+      s = reinterpret_cast<const half*>(col_scale.data_ptr());
+    h = had.data_ptr<uint8_t>();
+  }
+  const int64_t n = M * (K / hf::kQG);
+  if (n == 0) return;
+  const int threads = 128;
+  hf::act_quant64_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+      reinterpret_cast<const half*>(x.data_ptr()), x.stride(0), s, h,
+      xq.data_ptr<int8_t>(), sx.data_ptr<float>(), sq16.data_ptr<float>(),
+      static_cast<int>(M), static_cast<int>(K));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int GM, int GN>
+void launch_i8gemm_t(const torch::Tensor& xq, const torch::Tensor& sx,
+                     const torch::Tensor& sq16, const Hi2Weight& w,
+                     torch::Tensor& out, int64_t R, cudaStream_t stream) {
+  const int64_t M = xq.size(0), K = xq.size(1);
+  dim3 grid((R + GN - 1) / GN, (M + GM - 1) / GM);
+  hf::i8gemm_kernel<GM, GN><<<grid, hf::kThreads, 0, stream>>>(
+      xq.data_ptr<int8_t>(), sx.data_ptr<float>(), sq16.data_ptr<float>(),
+      static_cast<int>(M), static_cast<int>(K), w.codes.data_ptr<int32_t>(),
+      w.code_off.data_ptr<int32_t>(), w.blk_params.data_ptr<uint8_t>(),
+      w.param_off.data_ptr<int32_t>(),
+      reinterpret_cast<const half*>(w.row_consts.data_ptr()),
+      w.row_nbits.data_ptr<uint8_t>(), w.row_block.data_ptr<uint8_t>(),
+      reinterpret_cast<half*>(out.data_ptr()), out.stride(0),
+      static_cast<int>(R));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_i8gemm(const torch::Tensor& xq, const torch::Tensor& sx,
+                   const torch::Tensor& sq16, const Hi2Weight& w,
+                   torch::Tensor& out, int64_t R, int tile,
+                   cudaStream_t stream) {
+  if (tile == 1)
+    launch_i8gemm_t<64, 128>(xq, sx, sq16, w, out, R, stream);
+  else
+    launch_i8gemm_t<128, 128>(xq, sx, sq16, w, out, R, stream);
+}
+
 }  // namespace
 
 // x [M, K] fp16 -> out [M, K] fp16 = H16(x / s) on flagged groups.
@@ -1581,6 +1926,58 @@ void rdna_hint_flex_gemm_rdna2(torch::Tensor x, torch::Tensor codes,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();
   if (x.size(0) > 0 && R > 0) launch_gemm(x.contiguous(), w, out, R, stream);
+}
+
+// I8 prefill: per-64-column activation quantization (transform included when
+// `transform`) -> xq [M, K] int8, sx [M, K/64] float, sq16 [M, K/16] float.
+void rdna_hint_flex_act_quant64_rdna2(torch::Tensor x, torch::Tensor col_scale,
+                                      torch::Tensor had, bool transform,
+                                      torch::Tensor xq, torch::Tensor sx,
+                                      torch::Tensor sq16) {
+  check_act(x, x.size(1));
+  const int64_t M = x.size(0), K = x.size(1);
+  check_dev(xq, "xq", torch::kInt8);
+  check_dev(sx, "sx", torch::kFloat);
+  check_dev(sq16, "sq16", torch::kFloat);
+  TORCH_CHECK(
+      xq.numel() == M * K && sx.numel() == M * K / 64 &&
+          sq16.numel() == M * K / 16,
+      "rdna_hint_flex: xq/sx/sq16 must be [M, K], [M, K/64], [M, K/16]");
+  if (transform) {
+    check_dev(had, "had", torch::kUInt8);
+    TORCH_CHECK(had.numel() == K / 16, "rdna_hint_flex: had must be K/16");
+    if (col_scale.numel() > 0) {
+      check_dev(col_scale, "col_scale", torch::kHalf);
+      TORCH_CHECK(col_scale.numel() == K, "rdna_hint_flex: col_scale size");
+    }
+  }
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  launch_act_quant64(x, col_scale, had, transform, xq, sx, sq16, stream);
+}
+
+// I8 prefill GEMM on a pre-quantized activation -> out [M, R] fp16.
+void rdna_hint_flex_i8gemm_rdna2(
+    torch::Tensor xq, torch::Tensor sx, torch::Tensor sq16, torch::Tensor codes,
+    torch::Tensor code_off, torch::Tensor blk_params, torch::Tensor param_off,
+    torch::Tensor row_consts, torch::Tensor row_nbits, torch::Tensor row_block,
+    torch::Tensor out, int64_t tile) {
+  const Hi2Weight w{codes,      code_off,  blk_params, param_off,
+                    row_consts, row_nbits, row_block};
+  const int64_t R = check_weight(w);
+  check_dev(xq, "xq", torch::kInt8);
+  check_dev(sx, "sx", torch::kFloat);
+  check_dev(sq16, "sq16", torch::kFloat);
+  TORCH_CHECK(xq.dim() == 2 && xq.size(1) % 64 == 0,
+              "rdna_hint_flex: xq [M, K]");
+  TORCH_CHECK(
+      out.is_cuda() && out.scalar_type() == torch::kHalf && out.dim() == 2 &&
+          out.size(0) == xq.size(0) && out.size(1) == R && out.stride(1) == 1,
+      "rdna_hint_flex: out must be fp16 [M, R] with unit column stride");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(xq));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (xq.size(0) > 0 && R > 0)
+    launch_i8gemm(xq, sx, sq16, w, out, R, static_cast<int>(tile), stream);
 }
 
 // I8 activation quantization (transform included when `transform`).

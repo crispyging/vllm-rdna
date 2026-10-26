@@ -541,3 +541,48 @@ def test_fused_gemm_vs_reference(m, r, k):
     ops.rdna_hint_flex_gemm_rdna2(xt, d, out)
     torch.accelerator.synchronize()
     assert rel_err(out, ref_linear(x, t)) < 2e-3
+
+
+@gfx1030_only
+@pytest.mark.parametrize("smooth", [False, True])
+def test_act_quant64_kernel(smooth):
+    from vllm import _custom_ops as ops
+
+    t = make_hi2(1, 1024, had="mixed", smooth=smooth, seed=70)
+    d = _dev(t)
+    x = torch.randn(5, 1024, dtype=torch.float16)
+    x[1, :64] = 0  # an all-zero group
+    xq = torch.empty(5, 1024, dtype=torch.int8, device="cuda")
+    sx = torch.empty(5, 16, dtype=torch.float32, device="cuda")
+    sq = torch.empty(5, 64, dtype=torch.float32, device="cuda")
+    ops.rdna_hint_flex_act_quant64_rdna2(
+        x.cuda(), d["col_scale"], d["had"], True, xq, sx, sq
+    )
+    torch.accelerator.synchronize()
+    rq, rs, rsq = hu.act_quant64(x, t)
+    assert torch.equal(sx.cpu(), rs)
+    assert torch.equal(xq.cpu(), rq)
+    assert torch.allclose(sq.cpu(), rsq, rtol=1e-6, atol=0)
+
+
+@gfx1030_only
+@pytest.mark.parametrize("tile", [0, 1])
+@pytest.mark.parametrize("m", [1, 48, 130, 257])
+@pytest.mark.parametrize(
+    "nbits,blocks",
+    [((2,), (64,)), ((4,), (32,)), ((8,), (16,)), ((2, 4, 8), (16, 32, 64))],
+)
+def test_i8gemm_vs_reference(m, nbits, blocks, tile):
+    from vllm import _custom_ops as ops
+
+    r, k = 200, 1024
+    t = make_hi2(r, k, nbits=nbits, blocks=blocks, seed=80 + m)
+    d = _dev(t)
+    x = torch.randn(m, k, dtype=torch.float16)
+    xq, sx, sq = hu.act_quant64(x, t)
+    out = torch.empty(m, r, dtype=torch.float16, device="cuda")
+    ops.rdna_hint_flex_i8gemm_rdna2(xq.cuda(), sx.cuda(), sq.cuda(), d, out, tile)
+    torch.accelerator.synchronize()
+    assert rel_err(out, hu.i8g64_reference(xq, sx, t)) < 1e-3
+    # Per-64 int8 activations stay within the spec 5 error budget.
+    assert rel_err(out, ref_linear(x, t)) < 2e-2
