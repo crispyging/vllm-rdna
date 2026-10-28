@@ -4,7 +4,7 @@
 """Quiescent, same-server expert-copy A/B with retained per-rank counters.
 
 Requires ExpertCacheWorker and the development RPC endpoint on an isolated
-server. Prefix state is reset before each cell; expert residency is retained.
+server. GPU and external prefix state reset each cell; expert residency remains.
 Alternating arms reduce order bias but do not give identical cache histories.
 Performance requests force output lengths and are not semantic quality gates.
 """
@@ -51,13 +51,21 @@ def control(args, mode=""):
 def reset_prefix(args):
     for _ in range(5):
         request = urllib.request.Request(
-            args.base_url + "/reset_prefix_cache", method="POST"
+            args.base_url + "/reset_prefix_cache?reset_external=true", method="POST"
         )
         with urllib.request.urlopen(request, timeout=60) as response:
             if response.status == 200 and json.load(response).get("success") is True:
                 return
         time.sleep(1)
     raise RuntimeError("prefix reset did not acknowledge success")
+
+
+def check_cold_prefix(result):
+    for name in ("vllm:prefix_cache_hits", "vllm:external_prefix_cache_hits"):
+        if result["counter_deltas"].get(name) != 0:
+            raise RuntimeError(
+                f"cold-prefix benchmark has hits or missing counter: {name}"
+            )
 
 
 def main():
@@ -85,7 +93,9 @@ def main():
     root.mkdir(parents=True, exist_ok=False)
     report = {
         "passed": False,
-        "scope": "same-server copy A/B; expert residency retained across arms",
+        "scope": (
+            "same-server copy A/B; cold GPU/CPU prefixes, retained expert residency"
+        ),
         "counter_scope": (
             "measured requests only; client ready-check request disabled after "
             "worker RPC readiness check; no client warmup requests"
@@ -107,6 +117,7 @@ def main():
                 args.out = root / f"{name}-{index}-{mode}"
                 args.out.mkdir()
                 result = bench(args, CELLS[name], 12345)
+                check_cold_prefix(result)
                 after = control(args)
                 deltas = []
                 for old, new in zip(before, after):

@@ -53,6 +53,9 @@ and captured compute graphs; it requires released leases and synchronizes the
 device first. Counters measure distinct expert demands per committed bounded
 pass, not token-level cache hits. Native calls and successful HIP batch calls
 are reported separately, so fallback cannot be mistaken for batching.
+The copy A/B clears both GPU and external CPU prefix caches before each arm
+and rejects warm or missing prefix-hit counters. Expert residency remains
+order-dependent; the results do not isolate a causal model-level speedup.
 The optional `finite_checks="on"` / `"off"` RPC argument toggles the existing
 Mono debug mode while quiescent. Runs with this debugging are diagnostic and
 must not be used as clean performance comparisons.
