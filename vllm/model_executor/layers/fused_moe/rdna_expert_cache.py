@@ -177,6 +177,7 @@ class PackedExpertCache:
             device="cpu",
             pin_memory=self.device.type == "cuda",
         )
+        self._host_slot_map_array = self._host_slot_map.numpy()
         self._copy_stream = (
             torch.cuda.Stream(device=self.device)
             if self.device.type == "cuda"
@@ -249,9 +250,9 @@ class PackedExpertCache:
                 # completes, even when the consumer switches streams.
                 if self._map_upload_event is not None:
                     self._map_upload_event.synchronize()
-                self._host_slot_map.fill_(-1)
+                self._host_slot_map_array.fill(-1)
                 for expert, slot in active:
-                    self._host_slot_map[expert] = slot
+                    self._host_slot_map_array[expert] = slot
                 self.slot_map.copy_(self._host_slot_map, non_blocking=True)
                 if self.device.type == "cuda":
                     self._map_upload_event = torch.cuda.Event()

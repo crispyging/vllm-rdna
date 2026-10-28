@@ -3,7 +3,7 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 TREE=$(cd "$(dirname "$0")/../../.." && pwd)
 GPU=${GPU:-6}
-case "$GPU" in 6|7|8) ;; *) echo 'GPU must be HIP 6, 7 or 8.' >&2; exit 2 ;; esac
+case "$GPU" in 6|7) ;; *) echo 'GPU must be HIP 6 or 7.' >&2; exit 2 ;; esac
 export HIP_VISIBLE_DEVICES=$GPU
 unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 export PYTHONPATH=$TREE
