@@ -34,6 +34,10 @@ COUNTERS = (
     "vllm:kv_offload_store_bytes",
     "vllm:kv_offload_load_time",
     "vllm:kv_offload_store_time",
+    "vllm:external_prefix_cache_queries",
+    "vllm:external_prefix_cache_hits",
+    "vllm:prefix_cache_queries",
+    "vllm:prefix_cache_hits",
 )
 
 

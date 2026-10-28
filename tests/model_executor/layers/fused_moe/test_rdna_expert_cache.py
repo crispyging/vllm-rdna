@@ -389,6 +389,18 @@ def test_worker_copy_control_requires_quiescence_and_keeps_pool_storage(
     assert synchronizations == [True]
     assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
     assert cache.policy.mapping == {0: 0, 1: 1}
+    options = SimpleNamespace(timing=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.models.qwen4_exp.amd.mono.rdna2",
+        SimpleNamespace(OPTS=options),
+    )
+    result = worker.rdna_expert_cache_control(finite_checks="on")
+    assert result["debug_timing"] is options.timing is True
+    assert cache.policy.mapping == {0: 0, 1: 1}
+    assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
+    worker.rdna_expert_cache_control(finite_checks="off")
+    assert options.timing is False
 
 
 @pytest.mark.skipif(

@@ -8,6 +8,7 @@ with an optional copy_mode string (tensor/native). Call only between workloads.
 Captured compute graphs, expert residency and all payload pointers stay intact.
 """
 
+import sys
 from typing import Any
 
 import torch
@@ -16,10 +17,19 @@ import torch
 class ExpertCacheWorker:
     """Development-only mixin for the existing worker-extension interface."""
 
-    def rdna_expert_cache_control(self: Any, copy_mode: str = "") -> dict[str, Any]:
+    def rdna_expert_cache_control(
+        self: Any, copy_mode: str = "", finite_checks: str = ""
+    ) -> dict[str, Any]:
         """Inspect successful expert passes, optionally selecting their copy backend."""
         if copy_mode not in ("", "tensor", "native"):
             raise ValueError("copy_mode must be tensor or native")
+        if finite_checks not in ("", "on", "off"):
+            raise ValueError("finite_checks must be on or off")
+        options = getattr(
+            sys.modules.get("vllm.models.qwen4_exp.amd.mono.rdna2"), "OPTS", None
+        )
+        if finite_checks and options is None:
+            raise RuntimeError("Mono options are not loaded")
         caches = []
         seen = set()
         for module in self.get_model().modules():
@@ -40,14 +50,19 @@ class ExpertCacheWorker:
                 raise RuntimeError(
                     "rebuild the ROCm extension for native expert copies"
                 )
-        if copy_mode:
+        if copy_mode or finite_checks:
             if any(cache.policy._active is not None for cache in caches):
                 raise RuntimeError("expert-copy switching requires released leases")
             torch.accelerator.synchronize()
-            for cache in caches:
-                cache._copy_op = op
+            if copy_mode:
+                for cache in caches:
+                    cache._copy_op = op
+            if finite_checks:
+                # Existing debug mode: excludes this run from performance claims.
+                options.timing = finite_checks == "on"
         return {
             "caches": len(caches),
+            "debug_timing": None if options is None else bool(options.timing),
             "copy_modes": sorted(
                 {
                     "native" if cache._copy_op is not None else "tensor"
