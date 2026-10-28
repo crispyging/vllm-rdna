@@ -168,8 +168,12 @@ class BreakableCUDAGraphCapture:
         """
         return self._capturing
 
-    def __init__(self, pool: Any | None = None) -> None:
+    def __init__(
+        self, pool: Any | None = None, *, publish_replay_context: bool = False
+    ) -> None:
         self.pool = pool
+        self.publish_replay_context = publish_replay_context
+        self.replaying = False
         self.segments: list[Callable[[], Any]] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
@@ -231,8 +235,20 @@ class BreakableCUDAGraphCapture:
     # --- replay ----------------------------------------------------------
 
     def replay(self) -> None:
-        for r in self.segments:
-            r()
+        if not self.publish_replay_context:
+            for r in self.segments:
+                r()
+            return
+        previous = getattr(self._tls, "active", None)
+        previous_replaying = self.replaying
+        self.replaying = True
+        self._tls.active = self
+        try:
+            for r in self.segments:
+                r()
+        finally:
+            self._tls.active = previous
+            self.replaying = previous_replaying
 
     # --- introspection ---------------------------------------------------
 
@@ -295,6 +311,8 @@ class BreakableCUDAGraphWrapper:
         runnable: Callable[..., Any],
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode | None = None,
+        *,
+        publish_replay_context: bool = False,
     ) -> None:
         # runtime_mode=None matches any non-NONE dispatch mode; entries
         # are keyed by BatchDescriptor, which already encodes batch
@@ -302,6 +320,7 @@ class BreakableCUDAGraphWrapper:
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
+        self.publish_replay_context = publish_replay_context
         self.compilation_config = vllm_config.compilation_config
         self.graph_pool = current_platform.get_global_graph_pool()
         self.is_debugging_mode = logger.isEnabledFor(logging.DEBUG)
@@ -404,7 +423,10 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        capture = BreakableCUDAGraphCapture(
+            pool=self.graph_pool,
+            publish_replay_context=self.publish_replay_context,
+        )
         with capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last

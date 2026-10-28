@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -92,6 +93,7 @@ def short_conv_flat_prefill(
     flat.index_copy_(1, positions + (req + 1) * state_len, x_p.t())
     seg_starts = None
     if state_len > 0:
+        assert initial_state is not None
         seg_starts = (
             q_starts[:-1]
             + torch.arange(num_prefills, device=device, dtype=torch.int64) * state_len
@@ -107,6 +109,7 @@ def short_conv_flat_prefill(
 
     next_state = None
     if state_len > 0:
+        assert seg_starts is not None
         cols = (
             seg_starts.view(-1, 1)
             + lengths.view(-1, 1)
@@ -190,6 +193,11 @@ _NGramEmbeddingBase: type[nn.Module] = (
 
 
 class Qwen4ExpNGramEmbedding(_NGramEmbeddingBase):  # type: ignore[valid-type,misc]
+    positions_buffer: torch.Tensor
+    padded_buffer: torch.Tensor
+    ngram_heads_vocab_sizes: torch.Tensor
+    ngram_heads_offsets: torch.Tensor
+
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -1096,6 +1104,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         output.masked_fill_(~token_valid.unsqueeze(-1), 0)
 
         if self.conv_state_len > 0 and conv_state.shape[0] > 0:
+            assert next_state is not None
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
@@ -1511,11 +1520,13 @@ def qwen4_exp_amd_ple_embedding_rdna(
     output.copy_(layer.ple_embedding(input_ids, query_start_loc, ngram_context))
 
 
+@eager_break_during_capture
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
+    # Prefill/decode dispatch reads current metadata at replay time.
     layer = get_forward_context().no_compile_layers[layer_name]
     result = layer._short_conv(inputs)
     output[: result.shape[0]].copy_(result)

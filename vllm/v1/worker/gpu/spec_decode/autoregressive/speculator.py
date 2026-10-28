@@ -8,8 +8,8 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
-from vllm.platforms.rdna import on_rdna2_hip
 from vllm.logger import init_logger
+from vllm.platforms.rdna import on_rdna2_hip
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -144,6 +144,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.decode_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config, self.device, cudagraph_mode, decode_query_len=1
         )
+        # Expert offloading applies to the target decoder. Draft weights remain
+        # resident, so replay their original full graphs without eager hooks.
+        self.prefill_cudagraph_manager.expert_cache_graphs = False
+        self.decode_cudagraph_manager.expert_cache_graphs = False
 
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
