@@ -43,7 +43,21 @@ construction where labeled `batch_rebuild`; `batch_prebuilt` excludes it.
 GPU event intervals can include host starvation and are not pure DMA time.
 The 16-miss tensor-copy timing needs broader repetition before generalization.
 
-Model-level native-copy quality and same-process performance qualification are
-pending. Tensor copies remain the default. Pool sizes and tensor addresses are
+The integrated serving extension registered 159 ROCm ops; all 119 focused
+policy/cache/model tests passed on GPU8 without skips (`integrated-native-tests.txt`).
+`native-quality/` records the full TP2 native-copy quality run: greedy, PPL 4.78,
+prefix caching (12.05 s cold / 2.29 s warm), 48 concurrency checks with zero
+hard failures, and the after-load greedy probe all passed. No GPU faults were
+reported. The client A/B hook failed on an unavailable, unexercised KV-load
+metric; that run is not a completed performance comparison. The client gate
+was corrected without changing engine code, retaining strict KV-boundary tests.
+
+`native-startup-counters.json` is a snapshot after startup/probes/warmup, not a
+steady workload benchmark. Both ranks report 48 native caches and equal native
+and batch call counts. Expert payload pools are 11,767,037,952 device bytes and
+31,378,685,952 host bytes per rank, including their small slot maps.
+
+Same-process native-copy performance qualification is pending. Tensor copies
+remain the default. Pool sizes and tensor addresses are
 unchanged by selecting the native submission backend; HIP command metadata and
 host descriptor allocations are not a measured zero-overhead claim.

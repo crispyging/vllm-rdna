@@ -28,6 +28,12 @@ counters alongside latency and throughput. Prefix state resets between cells;
 expert-cache histories remain order-dependent, so alternating repeats are needed.
 No model-level native-copy speedup is claimed yet.
 
+The integrated extension subsequently passed all 119 focused GPU tests without
+skips. Full TP2 native-copy greedy, PPL (4.78), prefix-cache and concurrency
+(48 checks, zero hard failures) gates passed with zero GPU faults. The first
+performance hook stopped on an unexported KV-load metric, and its client gate
+was fixed without engine changes; the replacement same-process A/B is pending.
+
 The matched gate-8/gate-24 serving experiment completed all four cells and
 quality gates without GPU faults. Gate 24 changed aggregate output throughput
 by +19.33% at 1k/c1, -14.04% at 1k/c8, -1.57% at 16k/c1 and -5.16% at 16k/c8.
