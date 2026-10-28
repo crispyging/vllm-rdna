@@ -1,0 +1,12 @@
+{"k": 3072, "n": 2560, "m": 4096, "group": 128, "v2": false, "mode": "graph", "us128": 2678.1901359558105, "us256": 2686.6363525390625, "speedup": 0.9968562114573974}
+PASS 20 timing cells with correctness checks
+25ed819a0ecc7aa24c133c8b374c1fcc09eff7b9d4c0f37983cd0284d9c9d8fd  csrc/libtorch_stable/quantization/gptq/q_gemm.hip
+c24671db05257fa160c04e2d07977b70e859d6369a462dd53cdc2d0f718f504c  csrc/libtorch_stable/quantization/gptq/compat.cuh
+af0c866118d03ed1b30e4cd612ddd741cc90d2da6509ea4e372c11a6186c4ffb  csrc/libtorch_stable/quantization/gptq/matrix_view.cuh
+c90f7f64e6cbebcac293666d4edc15a4c39c7996c2e62b97c376de84236283ae  csrc/libtorch_stable/quantization/gptq/matrix_view_hip.cuh
+297e013464b4cf3f6b36b848fe5b49f38bb1b3df6797d3897b948ac940df7593  csrc/libtorch_stable/quantization/gptq/qdq_2.cuh
+62d4cf582520ccb46e87a3484d72eec18f48b3f4a2477575fedf6fc1f2adae13  csrc/libtorch_stable/quantization/gptq/qdq_3.cuh
+68af682decc3028b636d25d43bf48c60ae65be397de98115735284f97e35f798  csrc/libtorch_stable/quantization/gptq/qdq_4.cuh
+d67150d6a339306dd553415d9b521f3c9ea24b18f933bdaf8e5b9f811b09b976  csrc/libtorch_stable/quantization/gptq/qdq_8.cuh
+f841b309ad713a400cec2b7f316fb206213a5b9e267ba6ff57bd4d8cd36f914d  csrc/libtorch_stable/quantization/gptq/qdq_util.cuh
+f619e1943039a67a3254f7e0679e1f3e0faa9d8fccae795f3b20df9e91a8a429  csrc/libtorch_stable/torch_utils.h

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+TREE=/home/chenco_adm/opengfx1030_vllm-rdna_moe_offloading
+SITE=$TREE/.venv/lib/python3.12/site-packages
+export LD_LIBRARY_PATH=$SITE/_rocm_sdk_libraries/lib:$SITE/_rocm_sdk_core/lib/host-math/lib:$SITE/_rocm_sdk_core/lib/rocm_sysdeps/lib:$SITE/_rocm_sdk_core/lib/core/lib:$SITE/torch/lib
+export HIP_VISIBLE_DEVICES=8 GPU_MAX_HW_QUEUES=2 PYTORCH_TUNABLEOP_ENABLED=0 TORCH_BLAS_PREFER_HIPBLASLT=0
+unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+cd /home/chenco_adm/w4a8_runs/pr18-tile-theory
+timeout 900 "$TREE/.venv/bin/python" -u bench.py > bench.log 2>&1

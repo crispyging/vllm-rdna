@@ -1,0 +1,54 @@
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+
+build = Path('/home/chenco_adm/w4a8_runs/moe-offload/guarded-fixedpoint-build/native-build')
+run = Path('/home/chenco_adm/w4a8_runs/pr18-tile-theory')
+run.mkdir(exist_ok=True)
+obj = 'CMakeFiles/_C_stable_libtorch.dir/csrc/libtorch_stable/quantization/gptq/q_gemm.hip.o'
+cmd = subprocess.check_output(['/home/chenco_adm/.local/bin/ninja', '-t', 'commands', obj], cwd=build, text=True).splitlines()[-1]
+args = shlex.split(cmd)
+if args[0] == 'ccache': args = args[1:]
+source = build / 'csrc/libtorch_stable/quantization/gptq/q_gemm.hip'
+base = source.read_text()
+# Preserve all real hipified includes, with their original resolution roots.
+flags = []
+skip = False
+for arg in args[1:]:
+    if skip:
+        skip = False
+        continue
+    if arg in ('-MT','-MF','-o'):
+        skip = True
+        continue
+    if arg in ('-MD','-c',str(source)): continue
+    flags.append(arg)
+flags += ['-I'+str(source.parent)]
+registration = '''
+#include <torch/csrc/stable/library.h>
+STABLE_TORCH_LIBRARY_FRAGMENT(pr18_TILE, ops) {
+  ops.def("gemm(Tensor a, Tensor w, Tensor z, Tensor s, bool exllama, bool v2, int bit) -> Tensor");
+  ops.def("shuffle(Tensor! w, int bit) -> ()");
+}
+STABLE_TORCH_LIBRARY_IMPL(pr18_TILE, CUDA, ops) {
+  ops.impl("gemm", TORCH_BOX(&gptq_gemm));
+  ops.impl("shuffle", TORCH_BOX(&gptq_shuffle));
+}
+'''
+site = Path(os.environ['TORCH_SITE'])
+libs = site / 'torch/lib'
+for tile in (128,256):
+    text = base.replace('#define BLOCK_KN_SIZE 128', f'#define BLOCK_KN_SIZE {tile}')
+    text = text.replace('namespace gptq {', f'namespace gptq{tile} {{ using namespace ::vllm::gptq;').replace('vllm::gptq::', f'vllm::gptq{tile}::')
+    text += registration.replace('TILE', str(tile))
+    text = text.replace('gptq_gemm', f'gptq_gemm_{tile}').replace('gptq_shuffle', f'gptq_shuffle_{tile}')
+    src = run / f'tile{tile}.hip'
+    src.write_text(text)
+    output = run / f'tile{tile}.so'
+    command = [args[0], *flags, '-shared', str(src), '-o', str(output), '-L'+str(libs), '-ltorch', '-ltorch_cpu', '-ltorch_hip', '-lc10', '-lc10_hip', '-L/opt/rocm/core-7.14/lib', '-lhipblas', '-lamdhip64']
+    (run / f'compile{tile}.json').write_text(json.dumps(command, indent=2))
+    print('Building',tile,flush=True)
+    subprocess.run(command, cwd=build, check=True)
+print('Built isolated 128/256 variants',flush=True)

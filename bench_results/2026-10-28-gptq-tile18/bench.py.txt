@@ -1,0 +1,83 @@
+import gc
+import hashlib
+import json
+from pathlib import Path
+import random
+import statistics
+import time
+import torch
+
+run = Path('/home/chenco_adm/w4a8_runs/pr18-tile-theory')
+for tile in (128, 256):
+    torch.ops.load_library(str(run / f'tile{tile}.so'))
+ops = {tile: getattr(torch.ops, f'pr18_{tile}') for tile in (128,256)}
+torch.manual_seed(1801)
+random.seed(1801)
+torch.set_num_threads(4)
+
+def pack(x, dim):
+    parts = [x.narrow(dim, i, x.shape[dim]-i)[tuple(slice(None,None,8) if d==dim else slice(None) for d in range(x.ndim))].to(torch.int64) << (4*i) for i in range(8)]
+    return sum(parts).to(torch.int32).contiguous()
+
+def timing(fn, count):
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(count): fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end)*1000/count
+
+results = []
+metadata = dict(gpu=torch.cuda.get_device_properties(0).name, arch=torch.cuda.get_device_properties(0).gcnArchName, torch=torch.__version__, hip=torch.version.hip, seed=1801, repeats=6, iterations=100, libraries={str(t): hashlib.sha256((run/f'tile{t}.so').read_bytes()).hexdigest() for t in (128,256)})
+shapes = [(5120,8192),(5120,5120),(17408,5120),(2560,7168),(3072,2560)]
+for k,n in shapes:
+    q = torch.randint(0,16,(k,n),device='cuda',dtype=torch.int32)
+    packed = pack(q,0)
+    shuffled = packed.clone()
+    ops[128].shuffle(shuffled,4)
+    second = packed.clone()
+    ops[256].shuffle(second,4)
+    assert torch.equal(shuffled,second), 'shuffle differs'
+    for group in (128,32):
+        z = torch.randint(5,10,(k//group,n),device='cuda',dtype=torch.int32)
+        zp = pack(z,1)
+        scale = (torch.rand(k//group,n,device='cuda')*.01+.01).half()
+        for v2 in (True,False):
+            refweight = (q.float() - (z.repeat_interleave(group,0).float() + (not v2))) * scale.repeat_interleave(group,0).float()
+            for m in (1,3,4,8,16,24,32,64,256):
+                a = (torch.randn(m,k,device='cuda')*.1).half()
+                ref = a.float() @ refweight
+                calls = {t: (lambda t=t: ops[t].gemm(a,shuffled,zp,scale,True,v2,4)) for t in (128,256)}
+                outputs = {t: calls[t]() for t in (128,256)}
+                torch.cuda.synchronize()
+                errs = {t: float(torch.linalg.vector_norm(outputs[t].float()-ref)/torch.linalg.vector_norm(ref)) for t in (128,256)}
+                delta = float(torch.linalg.vector_norm(outputs[128].float()-outputs[256].float())/torch.linalg.vector_norm(ref))
+                assert max(errs.values()) < .05, (k,n,group,v2,m,errs)
+                assert delta < .02, (k,n,group,v2,m,delta)
+                for fn in calls.values():
+                    for _ in range(10): fn()
+                graphs = {}
+                held = {}
+                for t in (128,256):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph): held[t] = calls[t]()
+                    graphs[t] = graph
+                for mode in ('eager','graph'):
+                    values = {128:[],256:[]}
+                    for repeat in range(6):
+                        order = (128,256) if repeat%2==0 else (256,128)
+                        for t in order:
+                            fn = calls[t] if mode=='eager' else graphs[t].replay
+                            values[t].append(timing(fn,100))
+                    med = {t:statistics.median(v) for t,v in values.items()}
+                    row = dict(k=k,n=n,m=m,group=group,v2=v2,mode=mode,us128=med[128],us256=med[256],speedup=med[128]/med[256],samples=values,rel_l2=errs,between_rel_l2=delta)
+                    results.append(row)
+                    print(json.dumps({key:row[key] for key in ('k','n','m','group','v2','mode','us128','us256','speedup')}),flush=True)
+                    (run/'results.json').write_text(json.dumps(dict(metadata=metadata,results=results),indent=2))
+                del graphs, graph, held, outputs, calls, a, ref
+                gc.collect()
+            del refweight
+        del z,zp,scale
+    del q,packed,shuffled,second
+    gc.collect()
+print('PASS',len(results),'timing cells with correctness checks',flush=True)
