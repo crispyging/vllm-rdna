@@ -9,6 +9,8 @@ from vllm.distributed.parallel_state import get_tp_group
 from .layout import _WORKSPACES
 
 _ZERO: dict[int, torch.Tensor] = {}
+# Development worker RPC may select wait-only completion to isolate pacing.
+_USE_TP_COLLECTIVE = True
 
 
 def enabled(vllm_config) -> bool:
@@ -48,7 +50,10 @@ def local_error_view(device: torch.device) -> torch.Tensor:
 
 def collect_tp_error(device: torch.device) -> torch.Tensor:
     """One post-proposal GPU collective; no host/device synchronization."""
-    return get_tp_group().all_reduce(local_error_view(device))
+    error = local_error_view(device)
+    if not _USE_TP_COLLECTIVE:  # diagnostic only; caller still waits for its copy
+        return error
+    return get_tp_group().all_reduce(error)
 
 
 def raise_if_error(error_cpu: torch.Tensor, device: torch.device | None = None) -> None:

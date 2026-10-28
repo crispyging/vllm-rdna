@@ -1,14 +1,30 @@
 # RDNA2 MoE offloading improvement backlog
 
-This draft tracks follow-up work after #146. Default runtime behavior is unchanged;
-an opt-in native expert-copy backend is under qualification.
+This draft tracks follow-up work after #146. The default copy backend and pool
+budgets are unchanged; an opt-in native copy backend is under qualification.
+The existing post-step fault check now also monitors the model-offload workspace.
 The qualified baseline and receipts live in `moe-offloading-target.md` and
 `bench_results/2026-10-28-moe-offload/`.
 
 The long native-copy MTP2 test subsequently failed with NaN logits at 810/1024
 output tokens. The default remains tensor copies and this optimization is not
-fully qualified. A finite-check reproduction with optional CPU KV disabled is
-in progress; native-copy causality has not been established.
+fully qualified; native-copy causality has not been established.
+
+With CPU KV disabled and per-layer finite checks enabled, the subsequent tensor
+and native 16k/c1 arms both completed all 1024 tokens without NaNs. These two
+changed conditions prevent attributing the original failure to either one.
+The joint CPU-KV-enabled test also completed both arms with finite checks on
+and off, while the new post-step completion monitor remained enabled. This
+does not exclude a pacing-sensitive failure.
+
+A separate GDN defect is reproducible: its Q32 squared-sum accumulator overflows
+for large finite FP16 core values, producing Inf or NaN during RMS normalization.
+FP32 partial sums in fixed tile order cover the finite FP16 range without an
+additional kernel launch. GPU 7 validation passed 17 diagnostic tests and 49
+default-path tests (four diagnostics-only skips), including existing recurrence,
+state and repeatability parity. The receipts are in the `gdn-range/` subdirectory.
+The earlier serving NaN has not yet been tied to this defect. Full TP2 testing
+now compares post-step checks off, completion-wait-only, and collective modes.
 
 ## Implementation status
 
@@ -107,6 +123,6 @@ Report prefill tok/s, decode tok/s per request, TTFT, ITL and TPOT for 16k/1k
 and 1k/512 at c=1 and c=8, plus peak GPU/host memory and expert transfer counters.
 Use identical seeds, launch configuration and warmed tuning rows for A/B runs.
 
-Only physical GPUs 6, 7 and 8 are allocated. Full-resident TP2 needs about
+Only physical GPUs 6 and 7 are allocated. Full-resident TP2 needs about
 39.655 GiB per GPU before KV and graphs, so it is not a feasible control on
 these V620 devices. Use a feasible matched control and state its limits.

@@ -53,7 +53,13 @@ and captured compute graphs; it requires released leases and synchronizes the
 device first. Counters measure distinct expert demands per committed bounded
 pass, not token-level cache hits. Native calls and successful HIP batch calls
 are reported separately, so fallback cannot be mistaken for batching.
+The optional `finite_checks="on"` / `"off"` RPC argument toggles the existing
+Mono debug mode while quiescent. Runs with this debugging are diagnostic and
+must not be used as clean performance comparisons.
+The diagnostic `post_step_checks="collective" | "wait" | "off"` control
+separates TP collective pacing from the post-step completion wait. `collective`
+is the normal guard; the other modes are solely for reproducing failures.
 
-Native-copy kernel/cache tests pass on HIP 7.14 gfx1030. Full-model performance
-qualification is pending; neither this backend nor a wider K2 gate is enabled
-by default.
+Native-copy kernel/cache tests pass on HIP 7.14 gfx1030. A long native-copy
+MTP2 qualification hit NaN logits and remains under investigation; this backend
+and the wider K2 gate are not enabled by default.

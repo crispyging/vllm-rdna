@@ -98,6 +98,22 @@ def test_clean_fallback_participates_once_without_mutating_zero(
     failstop.raise_if_error(result)
 
 
+def test_diagnostic_wait_only_retains_local_fault_without_collective(
+    monkeypatch, isolated_scope
+):
+    spaces, _ = isolated_scope
+    arena = torch.zeros(64, dtype=torch.uint8)
+    arena.view(torch.int32)[2] = 1
+    spaces[(0, "model-offload")] = arena
+    monkeypatch.setattr(failstop, "_USE_TP_COLLECTIVE", False)
+    monkeypatch.setattr(
+        failstop, "get_tp_group", lambda: pytest.fail("unexpected TP collective")
+    )
+    result = failstop.collect_tp_error(torch.device("cpu:0"))
+    assert result.item() == 1
+    assert result.data_ptr() == arena.data_ptr() + 8
+
+
 def test_offline_recovery_clears_entire_arena_and_preserves_pointer(
     monkeypatch, isolated_scope
 ):

@@ -401,6 +401,17 @@ def test_worker_copy_control_requires_quiescence_and_keeps_pool_storage(
     assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
     worker.rdna_expert_cache_control(finite_checks="off")
     assert options.timing is False
+    worker.model_runner = SimpleNamespace(_mono_mtp_failstop=True)
+    failstop = SimpleNamespace(_USE_TP_COLLECTIVE=True)
+    monkeypatch.setitem(
+        sys.modules, "vllm.models.qwen4_exp.amd.mono.rdna2.failstop", failstop
+    )
+    for mode in ("wait", "off", "collective"):
+        result = worker.rdna_expert_cache_control(post_step_checks=mode)
+        assert result["post_step_checks"] == mode
+        assert worker.model_runner._mono_mtp_failstop is (mode != "off")
+        assert failstop._USE_TP_COLLECTIVE is (mode != "wait")
+    assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
 
 
 @pytest.mark.skipif(

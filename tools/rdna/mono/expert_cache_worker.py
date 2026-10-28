@@ -18,18 +18,31 @@ class ExpertCacheWorker:
     """Development-only mixin for the existing worker-extension interface."""
 
     def rdna_expert_cache_control(
-        self: Any, copy_mode: str = "", finite_checks: str = ""
+        self: Any,
+        copy_mode: str = "",
+        finite_checks: str = "",
+        post_step_checks: str = "",
     ) -> dict[str, Any]:
         """Inspect successful expert passes, optionally selecting their copy backend."""
         if copy_mode not in ("", "tensor", "native"):
             raise ValueError("copy_mode must be tensor or native")
         if finite_checks not in ("", "on", "off"):
             raise ValueError("finite_checks must be on or off")
+        if post_step_checks not in ("", "collective", "wait", "off"):
+            raise ValueError("post_step_checks must be collective, wait or off")
         options = getattr(
             sys.modules.get("vllm.models.qwen4_exp.amd.mono.rdna2"), "OPTS", None
         )
         if finite_checks and options is None:
             raise RuntimeError("Mono options are not loaded")
+        failstop = sys.modules.get("vllm.models.qwen4_exp.amd.mono.rdna2.failstop")
+        runner = getattr(self, "model_runner", None)
+        if post_step_checks and (
+            runner is None
+            or failstop is None
+            or not hasattr(failstop, "_USE_TP_COLLECTIVE")
+        ):
+            raise RuntimeError("worker has no post-step diagnostic controls")
         caches = []
         seen = set()
         for module in self.get_model().modules():
@@ -50,7 +63,7 @@ class ExpertCacheWorker:
                 raise RuntimeError(
                     "rebuild the ROCm extension for native expert copies"
                 )
-        if copy_mode or finite_checks:
+        if copy_mode or finite_checks or post_step_checks:
             if any(cache.policy._active is not None for cache in caches):
                 raise RuntimeError("expert-copy switching requires released leases")
             torch.accelerator.synchronize()
@@ -60,9 +73,22 @@ class ExpertCacheWorker:
             if finite_checks:
                 # Existing debug mode: excludes this run from performance claims.
                 options.timing = finite_checks == "on"
+            if post_step_checks:
+                runner._mono_mtp_failstop = post_step_checks != "off"
+                failstop._USE_TP_COLLECTIVE = post_step_checks != "wait"
+        post_mode = None
+        if runner is not None and failstop is not None:
+            post_mode = (
+                "collective"
+                if getattr(failstop, "_USE_TP_COLLECTIVE", True)
+                else "wait"
+            )
+            if not runner._mono_mtp_failstop:
+                post_mode = "off"
         return {
             "caches": len(caches),
             "debug_timing": None if options is None else bool(options.timing),
+            "post_step_checks": post_mode,
             "copy_modes": sorted(
                 {
                     "native" if cache._copy_op is not None else "tensor"

@@ -7,8 +7,8 @@ export PYTHONDONTWRITEBYTECODE=1
 TREE=$(cd "$(dirname "$0")/../../.." && pwd)
 export GPUS=${GPUS:-6,7}
 case "$GPUS" in
-    6,7|7,6|6,8|8,6|7,8|8,7) ;;
-    *) echo 'This work allocation permits exactly two HIP GPUs from 6,7,8.' >&2; exit 2 ;;
+    6,7|7,6) ;;
+    *) echo 'This work allocation permits only HIP GPUs 6 and 7.' >&2; exit 2 ;;
 esac
 export MODEL=${MODEL:-$HOME/.cache/huggingface/hub/models--wtdcode--Qwen3.8-Flash-Next-AWQ-W4A16/snapshots/0939125b929543a783ce700c90e36dd1a575c00c}
 export PLE_QUANT_DIR=${PLE_QUANT_DIR:-$HOME/.cache/huggingface/hub/models--primitive-ai--Qwen3.8-Flash-Next-PLE-quant/snapshots/4f861b63f69e61bfc2e22130ec91ec67f03ec43e/ples_int4}
