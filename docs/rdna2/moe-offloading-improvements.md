@@ -23,8 +23,18 @@ FP32 partial sums in fixed tile order cover the finite FP16 range without an
 additional kernel launch. GPU 7 validation passed 17 diagnostic tests and 49
 default-path tests (four diagnostics-only skips), including existing recurrence,
 state and repeatability parity. The receipts are in the `gdn-range/` subdirectory.
-The earlier serving NaN has not yet been tied to this defect. Full TP2 testing
-now compares post-step checks off, completion-wait-only, and collective modes.
+The earlier serving NaN has not yet been tied to this defect. Full TP2/MTP2
+testing on GPUs 6–7 completed 58 forced-length requests and 40,960 output tokens
+with the fix: short c1/c8 alternating arms, long c1 tensor/native pairs with
+post-step checks off, completion-wait-only and collective, then long c8 arms
+under the normal collective guard. Every request reached its exact output
+length. CPU KV was enabled throughout; counters confirm external-prefix hits
+and restores. No GDN nonfinite, K2 fault, logit NaN or new amdgpu fault markers
+were observed. Greedy, PPL (4.86), prefix reuse (11.85 s cold / 2.31 s warm) and
+post-load greedy checks passed. Receipts and launch scripts are in
+`bench_results/2026-10-28-moe-offload-improvements/gdn-serving-diagnostic/`.
+This bounded passing replay does not establish the cause of the original NaN
+or qualify a causal model-level copy-backend speedup.
 
 ## Implementation status
 
