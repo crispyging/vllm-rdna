@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=/home/chenco_adm/w4a8_runs/pr23-nixl
+cd "$ROOT"
+if ! command -v libtoolize >/dev/null; then
+  if [[ ! -x $ROOT/autotools/bin/libtoolize ]]; then
+    curl -fL --connect-timeout 10 --max-time 45 https://mirrors.kernel.org/gnu/libtool/libtool-2.4.7.tar.xz -o libtool-2.4.7.tar.xz
+    sha256sum libtool-2.4.7.tar.xz > libtool-source.sha256
+    tar -xf libtool-2.4.7.tar.xz
+    (cd libtool-2.4.7 && ./configure --prefix="$ROOT/autotools" && make -j8 && make install)
+  fi
+fi
+export PATH=$ROOT/autotools/bin:$PATH
+export ACLOCAL_PATH=$ROOT/autotools/share/aclocal:${ACLOCAL_PATH:-}
+export HIP_VISIBLE_DEVICES=8
+export LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib:${LD_LIBRARY_PATH:-}
+cd ucx
+./autogen.sh
+mkdir -p build
+cd build
+../configure --prefix="$ROOT/ucx-install" --enable-shared --disable-static --disable-doxygen-doc --enable-optimizations --enable-devel-headers --with-rocm=/opt/rocm/core-7.14 --without-verbs --enable-mt
+make -j8
+make install
+"$ROOT/ucx-install/bin/ucx_info" -d > "$ROOT/ucx-transports.txt"

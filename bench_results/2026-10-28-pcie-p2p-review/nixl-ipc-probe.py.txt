@@ -1,0 +1,147 @@
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+ROOT=Path('/home/chenco_adm/w4a8_runs/pr23-nixl')
+SIZES=[131072,32768,513,768,8192,640]
+NAMES=['main-kv','compressed-keys','raw-ring','gdn-conv','gdn-recurrent','ple-conv']
+OFFSETS=[]
+for size in SIZES:
+    OFFSETS.append(128 if not OFFSETS else OFFSETS[-1]+SIZES[len(OFFSETS)-1]+64)
+TOTAL=OFFSETS[-1]+SIZES[-1]+128
+
+def send(sock,value):
+    data=json.dumps(value).encode()
+    sock.sendall(struct.pack('!I',len(data))+data)
+
+def receive(sock):
+    def read(n):
+        data=b''
+        while len(data)<n:
+            part=sock.recv(n-len(data))
+            if not part: raise RuntimeError('peer closed control connection')
+            data+=part
+        return data
+    return json.loads(read(struct.unpack('!I',read(4))[0]))
+
+def child(role):
+    import numpy as np
+    import torch
+    from nixl_rocm._api import nixl_agent,nixl_agent_config
+    torch.cuda.set_device(0)
+    import ctypes
+    bus=ctypes.create_string_buffer(32)
+    lib=ctypes.CDLL(torch._C.__file__)
+    lib.hipDeviceGetPCIBusId.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.c_int]
+    assert lib.hipDeviceGetPCIBusId(bus,32,0)==0
+    props=torch.cuda.get_device_properties(0)
+    print(json.dumps(dict(role=role,hip_visible=os.environ.get('HIP_VISIBLE_DEVICES'),gpu=props.name,arch=props.gcnArchName,bus=bus.value.decode())),flush=True)
+    agent=nixl_agent('pr23-'+role+'-'+str(os.getpid()),nixl_agent_config(backends=[]))
+    agent.create_backend('UCX',{'ucx_error_handling_mode':os.environ.get('PR23_UCX_ERROR_MODE','peer')})
+    buffer=torch.full((TOTAL,),165,dtype=torch.uint8,device='cuda')
+    if role=='producer':
+        stream=torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for i,(offset,size) in enumerate(zip(OFFSETS,SIZES)):
+                buffer[offset:offset+size]=((torch.arange(size,device='cuda',dtype=torch.int32)+i)%251).to(torch.uint8)
+        stream.synchronize()
+    reg=agent.register_memory([(buffer.data_ptr(),TOTAL,0,'')],'VRAM')
+    descs=[(buffer.data_ptr()+offset,size,0) for offset,size in zip(OFFSETS,SIZES)]
+    path=str(ROOT/'ipc-test.sock')
+    if role=='producer':
+        server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+        server.settimeout(45)
+        server.bind(path)
+        server.listen(1)
+        conn,_=server.accept()
+        conn.settimeout(45)
+        send(conn,dict(metadata=agent.get_agent_metadata().hex(),descs=descs))
+        result=receive(conn)
+        assert result['ok'],result
+        end=time.monotonic()+10
+        notifications={}
+        while time.monotonic()<end and not notifications:
+            notifications=agent.get_new_notifs()
+            time.sleep(.001)
+        assert any(b'pr23-complete' in values for values in notifications.values()), notifications
+        agent.deregister_memory(reg)
+        send(conn,dict(released=True))
+        conn.close()
+        server.close()
+    else:
+        conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+        conn.settimeout(45)
+        end=time.monotonic()+30
+        while True:
+            try:
+                conn.connect(path)
+                break
+            except (FileNotFoundError,ConnectionRefusedError):
+                if time.monotonic()>end: raise
+                time.sleep(.05)
+        remote=receive(conn)
+        peer=agent.add_remote_agent(bytes.fromhex(remote['metadata']))
+        local=agent.prep_xfer_dlist('',agent.get_xfer_descs(descs,'VRAM'))
+        other=agent.prep_xfer_dlist(peer,agent.get_xfer_descs([tuple(d) for d in remote['descs']],'VRAM'))
+        handle=agent.make_prepped_xfer('READ',local,list(range(len(SIZES))),other,list(range(len(SIZES))),notif_msg=b'pr23-complete')
+        state=agent.transfer(handle)
+        end=time.monotonic()+20
+        while state not in ('DONE','ERR') and time.monotonic()<end:
+            state=agent.check_xfer_state(handle)
+            time.sleep(.001)
+        assert state=='DONE',state
+        torch.cuda.synchronize()
+        expected=np.full(TOTAL,165,dtype=np.uint8)
+        for i,(offset,size) in enumerate(zip(OFFSETS,SIZES)):
+            expected[offset:offset+size]=(np.arange(size,dtype=np.uint32)+i)%251
+        actual=buffer.cpu().numpy()
+        assert np.array_equal(actual,expected),'payload or guard-region mismatch'
+        agent.release_xfer_handle(handle)
+        agent.release_dlist_handle(local)
+        agent.release_dlist_handle(other)
+        agent.remove_remote_agent(peer)
+        agent.deregister_memory(reg)
+        send(conn,dict(ok=True,bytes=sum(SIZES),regions=NAMES,guards_exact=True))
+        assert receive(conn)['released']
+        conn.close()
+        print(json.dumps(dict(ok=True,bytes=sum(SIZES),regions=NAMES,guards_exact=True)),flush=True)
+
+def parent(a,b):
+    path=ROOT/'ipc-test.sock'
+    path.unlink(missing_ok=True)
+    procs=[]
+    files=[]
+    try:
+        for role,gpu in (('producer',a),('consumer',b)):
+            env=dict(os.environ,HIP_VISIBLE_DEVICES=str(gpu),UCX_TLS='rocm_ipc,rocm_copy,self,sm,tcp',UCX_LOG_LEVEL='info',UCX_PROTO_INFO='y',PYTORCH_TUNABLEOP_ENABLED='0')
+            env.pop('ROCR_VISIBLE_DEVICES',None)
+            env.pop('CUDA_VISIBLE_DEVICES',None)
+            out=(ROOT/f'ipc-{role}.log').open('w')
+            files.append(out)
+            procs.append(subprocess.Popen([sys.executable,__file__,'--role',role],env=env,stdout=out,stderr=subprocess.STDOUT))
+        for process in procs:
+            assert process.wait(timeout=90)==0,'IPC child failed; inspect logs'
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+                try:p.wait(timeout=5)
+                except subprocess.TimeoutExpired:p.kill();p.wait()
+        for f in files:f.close()
+        path.unlink(missing_ok=True)
+    print('PASS NIXL/UCX exact-byte READ across separately masked GPUs',a,b,flush=True)
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser()
+    p.add_argument('--role',choices=['producer','consumer'])
+    p.add_argument('--producer-gpu',type=int,choices=[6,7,8],default=6)
+    p.add_argument('--consumer-gpu',type=int,choices=[6,7,8],default=8)
+    args=p.parse_args()
+    if args.role:child(args.role)
+    else:parent(args.producer_gpu,args.consumer_gpu)

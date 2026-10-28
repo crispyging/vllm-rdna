@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=/home/chenco_adm/w4a8_runs/pr23-nixl
+SITE=/home/chenco_adm/Apps/vllm/venv-7.14.0_0.31.0-final/lib/python3.12/site-packages
+export PYTHONPATH=$ROOT/nixl-install/lib64/python3.12/site-packages
+export LD_LIBRARY_PATH=$ROOT/nixl-install/lib64:$ROOT/ucx-install/lib:$SITE/_rocm_sdk_libraries/lib:$SITE/_rocm_sdk_core/lib/host-math/lib:$SITE/_rocm_sdk_core/lib/rocm_sysdeps/lib:$SITE/_rocm_sdk_core/lib/core/lib:$SITE/torch/lib:/opt/rocm/core-7.14/lib
+export NIXL_PLUGIN_DIR=$ROOT/nixl-install/lib64/plugins
+export HIP_VISIBLE_DEVICES=8 PYTORCH_TUNABLEOP_ENABLED=0
+unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+"$ROOT/.venv/bin/python" "$ROOT/ipc-test.py" "$@"

@@ -1,0 +1,17 @@
+{
+  "remote_count_bug": {
+    "exported": 16,
+    "claimed": 127
+  },
+  "partial_transfer_bug": {
+    "requested_blocks": 2,
+    "copied": 1,
+    "acknowledged_as_complete": [
+      "decode-id"
+    ]
+  },
+  "ambiguous_axis_bug": {
+    "expected_planes": 2,
+    "actual_planes": 1
+  }
+}

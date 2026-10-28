@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=/home/chenco_adm/w4a8_runs/pr23-nixl
+BASE=/home/chenco_adm/Apps/vllm/venv-7.14.0_0.31.0-final
+export PATH=$ROOT/.venv/bin:/opt/rocm/core-7.14/bin:$PATH
+export PKG_CONFIG_PATH=$ROOT/ucx-install/lib/pkgconfig:${PKG_CONFIG_PATH:-}
+export LD_LIBRARY_PATH=$ROOT/ucx-install/lib:/opt/rocm/core-7.14/lib:${LD_LIBRARY_PATH:-}
+export ROCM_PATH=/opt/rocm/core-7.14 HIP_VISIBLE_DEVICES=8
+SITE=$($ROOT/.venv/bin/python -c 'import sysconfig;print(sysconfig.get_path("purelib"))')
+printf '%s\n' "$BASE/lib/python3.12/site-packages" > "$SITE/pr23-readonly-deps.pth"
+cd "$ROOT/nixl"
+meson setup build --prefix="$ROOT/nixl-install" -Ducx_path="$ROOT/ucx-install" -Dwheel_variant=rocm -Denable_plugins=UCX -Dbuild_tests=false -Dbuild_examples=false -Dwith_trace=false
+meson compile -C build -j8
+meson install -C build

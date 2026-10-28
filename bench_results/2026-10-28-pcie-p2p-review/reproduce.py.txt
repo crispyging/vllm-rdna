@@ -1,0 +1,38 @@
+import ast
+from dataclasses import dataclass, field
+import importlib.util
+import json
+from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
+from typing import Any
+
+root=Path(__file__).parent
+spec=importlib.util.spec_from_file_location('layout',root/'pcie_p2p_layout.py')
+layout=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(layout)
+source=ast.parse((root/'pcie_p2p_connector.py').read_text())
+classes=[n for n in source.body if isinstance(n,ast.ClassDef) and n.name in ('_Scheduler','_Worker')]
+ns=dict(Any=Any,finished_transfer_params=layout.finished_transfer_params,remote_prefill_token_count=layout.remote_prefill_token_count)
+exec(compile(ast.Module(body=classes,type_ignores=[]),'<original PR23>', 'exec', flags=0x1000000),ns)
+config=SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector_extra_config={'handshake_port':19000},kv_role='kv_consumer',engine_id='D'),parallel_config=SimpleNamespace(tensor_parallel_size=2))
+scheduler=ns['_Scheduler'](config,None)
+request=SimpleNamespace(request_id='decode-id',prompt_token_ids=list(range(128)),kv_transfer_params={'do_remote_prefill':True,'remote_num_tokens':16,'remote_request_id':'prefill-id','remote_block_ids':([1],)})
+matched,_=scheduler.get_num_new_matched_tokens(request,0)
+assert matched==127
+worker=object.__new__(ns['_Worker'])
+worker._is_producer=False
+worker._ensure_peer=lambda:None
+worker._stream=SimpleNamespace(cuda_stream=99,synchronize=lambda:None)
+worker._layers=[SimpleNamespace(group=0,elements_per_block=8,local=SimpleNamespace(element_size=lambda:2,data_ptr=lambda:1000),local_blocks=8,remote_blocks=8,planes=1,remote_ptr=2000)]
+worker._lock=Lock()
+worker._loaded=set()
+acks=[]
+copies=[]
+worker._send_ack=acks.append
+ns['memcpy_device_async']=lambda *args:copies.append(args)
+worker.start_load_kv(SimpleNamespace(loads={'decode-id':(([1,2],),([3],))}))
+assert len(copies)==1 and acks==['decode-id']
+planes,elems=layout.block_planes((2,2,16,4,128),2)
+assert planes==1
+print(json.dumps({'remote_count_bug':{'exported':16,'claimed':matched},'partial_transfer_bug':{'requested_blocks':2,'copied':len(copies),'acknowledged_as_complete':acks},'ambiguous_axis_bug':{'expected_planes':2,'actual_planes':planes}},indent=2))

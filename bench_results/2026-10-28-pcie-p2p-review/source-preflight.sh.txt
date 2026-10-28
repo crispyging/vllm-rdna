@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=/home/chenco_adm/w4a8_runs/pr23-nixl
+mkdir -p "$ROOT"
+cd "$ROOT"
+for pair in 'ucx https://github.com/openucx/ucx.git 96e58a16039f6d7d213bc967b8069238742c5194' 'nixl https://github.com/ai-dynamo/nixl.git 231d56753047c989062a5cb2ac703a1ad761c7d2'; do
+  read -r name url revision <<< "$pair"
+  if [[ ! -d $name/.git ]]; then git init "$name"; git -C "$name" remote add origin "$url"; fi
+  git -C "$name" fetch --depth 1 origin "$revision"
+  git -C "$name" checkout --detach "$revision"
+done
+printf '\nPinned NIXL build options:\n'
+cat nixl/meson.options 2>/dev/null || cat nixl/meson_options.txt
