@@ -3,6 +3,11 @@
 Target: Flash-Next AWQ INT4, gfx1030/HIP 7.14, TP2/EP2 on HIP GPUs 6/7.
 Kernel/cache checks use GPU8. No GPU9 allocation was used.
 
+**Current qualification blocker:** the long native-copy MTP2 arm produced NaN
+logits after 810/1024 requested output tokens. The native backend remains opt-in;
+the full-model optimization is not qualified. See `native-ab/serve.log.txt` and
+the rejected `copy-long/qualification.json`. Causality is not established.
+
 ## Wider K2 gate
 
 `wide-k2/arm.sh.txt` records the serving recipe. Both arms use tensor copies,
@@ -57,7 +62,37 @@ steady workload benchmark. Both ranks report 48 native caches and equal native
 and batch call counts. Expert payload pools are 11,767,037,952 device bytes and
 31,378,685,952 host bytes per rank, including their small slot maps.
 
-Same-process native-copy performance qualification is pending. Tensor copies
-remain the default. Pool sizes and tensor addresses are
+`native-ab/` preserves the replacement same-process run. Short ABBA cells
+completed: c1 native 16.25–22.94 versus tensor 18.73–20.05 tok/s; c8 native
+58.61–64.31 versus tensor 48.76–51.06 tok/s. These are observations, not a pure
+copy speedup: MTP acceptance, generated trajectories and expert transfer bytes
+vary. Native c8 submitted 500–582 GB across both ranks, tensor 683–706 GB.
+Only the local prefix cache was reset; external CPU KV state was retained.
+No KV loads were exported in the recorded short cells, so they do not qualify
+CPU KV restoration. Forced-output warnings are preserved alongside the results.
+
+The following cold 16k/c1 tensor arm completed 1024 tokens with TTFT 105.39 s;
+this differs from older benchmarks that ran a full unmeasured ready-check
+request before measurement. The native arm then ended at 810 tokens because
+both workers detected all-NaN logits. The CLI reported `completed=1,failed=0`
+for the partial stream, but our exact-length gate rejected it. Long c8 and CPU
+profiling did not run. The replacement run is not a successful qualification.
+
+`matched-copy/` isolates actual `PackedExpertCache._copy` with the same immutable
+bank, destination addresses, stream and bytes for both backends, balanced ABBA
+ordering and 30 samples per arm/cell. Median wall completion (tensor -> native):
+
+- 1 miss: 196.003 -> 175.290 microseconds.
+- 4 misses: 848.699 -> 606.602 microseconds.
+- 16 misses: 2792.084 -> 1590.762 microseconds.
+
+Raw CPU-enqueue/event/wall timings and p10/p90 are retained. Event intervals
+include host submission gaps; they are not pure DMA time. Exact-byte, counter
+and stable-address checks passed, as did a separate 96-expert / 576-copy batch
+within 490.3 MB of host plus device payloads. This does not explain or rule out
+a scheduling fault in the full model. A finite-check reproduction with optional
+CPU KV disabled is the next diagnostic, not a performance measurement.
+
+Tensor copies remain the default. Pool sizes and tensor addresses are
 unchanged by selecting the native submission backend; HIP command metadata and
 host descriptor allocations are not a measured zero-overhead claim.

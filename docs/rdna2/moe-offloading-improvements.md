@@ -5,6 +5,11 @@ an opt-in native expert-copy backend is under qualification.
 The qualified baseline and receipts live in `moe-offloading-target.md` and
 `bench_results/2026-10-28-moe-offload/`.
 
+The long native-copy MTP2 test subsequently failed with NaN logits at 810/1024
+output tokens. The default remains tensor copies and this optimization is not
+fully qualified. A finite-check reproduction with optional CPU KV disabled is
+in progress; native-copy causality has not been established.
+
 ## Implementation status
 
 `expert_cache_copy="native"` submits a bounded pass of missed experts through
