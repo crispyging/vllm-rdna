@@ -50,7 +50,7 @@ def control(args, mode=""):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--base-url", default=os.getenv("URL", "http://127.0.0.1:18766")
+        "--base-url", default=f"http://127.0.0.1:{os.getenv('PORT', '18766')}"
     )
     parser.add_argument("--model", default=os.getenv("SERVED", "flash-next"))
     parser.add_argument("--tokenizer", default=os.getenv("MODEL"))
@@ -71,6 +71,10 @@ def main():
     report = {
         "passed": False,
         "scope": "same-server copy A/B; expert residency retained across arms",
+        "counter_scope": (
+            "whole benchmark client, including its initial test request; "
+            "not transfer bytes per measured benchmark token"
+        ),
         "semantic_quality": "run normal-EOS/PPL/prefix gates separately",
         "cells": [],
     }
@@ -132,6 +136,9 @@ def main():
                     f"{name} arm={index} mode={mode}: {result['headline']}", flush=True
                 )
         report["passed"] = True
+    except Exception as error:
+        report["error"] = str(error)
+        raise
     finally:
         save()
     print("PASS expert-copy A/B; inspect timings and separate quality gates")
