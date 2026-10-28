@@ -104,6 +104,7 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
             device,
             policy=layer._rdna_expert_cache_policy,
             decay_interval=layer._rdna_expert_cache_decay,
+            copy_mode=layer._rdna_expert_cache_copy,
         )
         for name, tensor in cache.payload.items():
             if hasattr(layer, name):

@@ -63,6 +63,7 @@ def test_options_preserve_offload_capacity_and_policy(options, slots, policy):
         ({"expert_cache_decay": -1}, "positive"),
         ({"expert_cache_decay": False}, "integer"),
         ({"expert_cache_decay": 1.5}, "integer"),
+        ({"expert_cache_copy": "unknown"}, "expert_cache_copy"),
         ({"expert_cache_slot": 32}, "unknown"),
     ],
 )
@@ -75,6 +76,7 @@ def test_options_reject_unsafe_or_misspelled_pool_configuration(
 
 def test_offload_remains_disabled_by_default(options):
     assert options.from_dict({}).expert_cache_slots == 0
+    assert options.from_dict({}).expert_cache_copy == "tensor"
 
 
 @pytest.mark.parametrize(

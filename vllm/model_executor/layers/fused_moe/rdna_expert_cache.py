@@ -74,6 +74,7 @@ def cpu_weight_context(quant_method, layer):
     layer._rdna_expert_cache_device = device
     layer._rdna_expert_cache_policy = options.get("expert_cache_policy", "lfu_lru")
     layer._rdna_expert_cache_decay = options.get("expert_cache_decay", 128)
+    layer._rdna_expert_cache_copy = options.get("expert_cache_copy", "tensor")
     quant_method.requires_device_loading = False
     with torch.device("cpu"):
         yield
@@ -123,11 +124,28 @@ class PackedExpertCache:
     """Immutable packed CPU bank with a bounded, stable device allocation."""
 
     def __init__(
-        self, host_payload, slot_count, device, policy="lfu_lru", decay_interval=128
+        self,
+        host_payload,
+        slot_count,
+        device,
+        policy="lfu_lru",
+        decay_interval=128,
+        copy_mode="tensor",
     ):
         if set(host_payload) != set(PAYLOAD_NAMES):
             raise ValueError("expert cache requires all six packed payload tensors")
         self.device = torch.device(device)
+        if copy_mode not in ("tensor", "native"):
+            raise ValueError("expert_cache_copy must be tensor or native")
+        self._copy_op = None
+        if copy_mode == "native":
+            if self.device.type != "cuda" or torch.version.hip is None:
+                raise ValueError("native expert copies require a HIP device")
+            self._copy_op = getattr(torch.ops._rocm_C, "rdna2_expert_cache_copy", None)
+            if self._copy_op is None:
+                raise RuntimeError(
+                    "native expert copies require a rebuilt ROCm extension"
+                )
         self.logical_num_experts = host_payload[PAYLOAD_NAMES[0]].shape[0]
         self.slot_count = min(slot_count, self.logical_num_experts)
         self.policy = ExpertCachePolicy(
@@ -170,6 +188,16 @@ class PackedExpertCache:
         self._map_upload_event = None
         self.map_uploads = 0
         self.copied_bytes = 0
+        self.native_copy_calls = 0
+        self.batch_copy_calls = 0
+        self.expert_demands = 0
+        self.expert_misses = 0
+        self.committed_passes = 0
+        self._copy_sources = tuple(self.host_payload[name] for name in PAYLOAD_NAMES)
+        self._copy_destinations = tuple(self.payload[name] for name in PAYLOAD_NAMES)
+        self._expert_bytes = sum(
+            tensor[0].numel() * tensor.element_size() for tensor in self._copy_sources
+        )
 
     @property
     def host_bytes(self):
@@ -233,6 +261,9 @@ class PackedExpertCache:
                 self.map_uploads += 1
                 self._active_bindings = active
             lease.commit()
+            self.expert_demands += len(lease.bindings)
+            self.expert_misses += len(misses)
+            self.committed_passes += 1
             return lease
         except Exception:
             if self._copy_stream is not None:
@@ -241,6 +272,19 @@ class PackedExpertCache:
             raise
 
     def _copy(self, bindings):
+        if not bindings:
+            return
+        if self._copy_op is not None:
+            used_batch = self._copy_op(
+                self._copy_sources,
+                self._copy_destinations,
+                [expert for expert, _, _ in bindings],
+                [slot for _, slot, _ in bindings],
+            )
+            self.native_copy_calls += 1
+            self.batch_copy_calls += int(used_batch)
+            self.copied_bytes += len(bindings) * self._expert_bytes
+            return
         for expert, slot, _ in bindings:
             for name in PAYLOAD_NAMES:
                 self.payload[name][slot].copy_(
