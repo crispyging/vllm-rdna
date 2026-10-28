@@ -12,6 +12,7 @@ Performance requests force output lengths and are not semantic quality gates.
 import argparse
 import json
 import os
+import time
 import urllib.request
 from pathlib import Path
 
@@ -47,6 +48,18 @@ def control(args, mode=""):
     return result
 
 
+def reset_prefix(args):
+    for _ in range(5):
+        request = urllib.request.Request(
+            args.base_url + "/reset_prefix_cache", method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if response.status == 200 and json.load(response).get("success") is True:
+                return
+        time.sleep(1)
+    raise RuntimeError("prefix reset did not acknowledge success")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -67,13 +80,14 @@ def main():
     if not args.tokenizer or not 0 < args.cell_timeout <= 3600:
         parser.error("tokenizer and a bounded positive cell timeout are required")
     root = args.out
+    args.skip_ready_check = True
     root.mkdir(parents=True, exist_ok=False)
     report = {
         "passed": False,
         "scope": "same-server copy A/B; expert residency retained across arms",
         "counter_scope": (
-            "whole benchmark client, including its initial test request; "
-            "not transfer bytes per measured benchmark token"
+            "measured requests only; client ready-check request disabled after "
+            "worker RPC readiness check; no client warmup requests"
         ),
         "semantic_quality": "run normal-EOS/PPL/prefix gates separately",
         "cells": [],
@@ -88,12 +102,7 @@ def main():
         for name in args.cells:
             for index, mode in enumerate(args.arms):
                 before = control(args, mode)
-                request = urllib.request.Request(
-                    args.base_url + "/reset_prefix_cache", method="POST"
-                )
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    if response.status != 200:
-                        raise RuntimeError("prefix reset failed")
+                reset_prefix(args)
                 args.out = root / f"{name}-{index}-{mode}"
                 args.out.mkdir()
                 result = bench(args, CELLS[name], 12345)

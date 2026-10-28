@@ -230,6 +230,10 @@ def bench(args, cell, seed):
         name + ".json",
         "--disable-tqdm",
     ]
+    if getattr(args, "skip_ready_check", False):
+        # The same-server A/B already checks worker readiness via RPC. Avoid
+        # an unmeasured full request warming prefix/expert state in each arm.
+        command.extend(["--ready-check-timeout-sec", "0"])
     result_path = args.out / f"{name}.json"
     result_path.unlink(
         missing_ok=True
