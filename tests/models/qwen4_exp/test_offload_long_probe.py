@@ -177,6 +177,11 @@ def test_missing_real_boundary_or_transfer_metrics_fail(tmp_path, missing):
         del samples.rows[-1]["metrics"][key]
     with pytest.raises(RuntimeError, match="boundary|before/after"):
         samples.summary()
+    if missing in ("load_counter", "store_counter"):
+        # Expert-copy qualification does not require KV restoration, and must
+        # report an unexported transfer counter as unavailable rather than zero.
+        result = samples.summary(require_boundary_counters=False)
+        assert result["counter_deltas"][key.removesuffix("_total")] is None
 
 
 @pytest.mark.parametrize("length", [16000, 17000, 32700])

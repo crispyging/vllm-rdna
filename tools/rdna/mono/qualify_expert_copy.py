@@ -81,6 +81,7 @@ def main():
         parser.error("tokenizer and a bounded positive cell timeout are required")
     root = args.out
     args.skip_ready_check = True
+    args.optional_kv_counters = True
     root.mkdir(parents=True, exist_ok=False)
     report = {
         "passed": False,

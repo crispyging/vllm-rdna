@@ -108,7 +108,7 @@ class MetricSamples:
         self.sample()
         self.path.write_text("\n".join(json.dumps(row) for row in self.rows) + "\n")
 
-    def summary(self):
+    def summary(self, require_boundary_counters=True):
         if len(self.rows) < 2 or any(
             "metrics" not in row for row in (self.rows[0], self.rows[-1])
         ):
@@ -124,7 +124,9 @@ class MetricSamples:
         for key in COUNTERS:
             name = key + "_total" if key + "_total" in before else key
             if name not in before or name not in after:
-                if key in required:
+                if key in required and (
+                    require_boundary_counters or key == "vllm:num_preemptions"
+                ):
                     raise RuntimeError(f"required boundary counter unavailable: {key}")
                 delta[key] = None
                 continue
@@ -262,7 +264,9 @@ def bench(args, cell, seed):
         "actual_output_tokens": result.get("output_lens"),
         "headline": formatter.line(str(args.out / f"{name}.json")),
         "output_quality_warnings": warnings,
-        **samples.summary(),
+        **samples.summary(
+            require_boundary_counters=not getattr(args, "optional_kv_counters", False)
+        ),
     }
 
 
