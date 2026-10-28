@@ -11,7 +11,7 @@ into a scratch directory, remove their `.txt` suffixes, then run
 original scheduler/worker class bodies with explicit CPU stubs for transport;
 it does not import the full vLLM runtime or claim to exercise HIP.
 
-`pr23-hybrid-tests.log` records 6 geometry and 7 recurrent-handoff tests
+`pr23-hybrid-tests.log.txt` records 6 geometry and 7 recurrent-handoff tests
 passing in the existing isolated ROCm environment. Transport is mocked in
 these tests; real transfers and serving remain unqualified.
 
