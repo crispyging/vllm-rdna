@@ -40,6 +40,9 @@ CPU bank, GPU pool addresses, cache policy and consumer-stream fencing.
 Copy planning stays outside captured graphs. A failed batch is drained and
 reported rather than retried, because it may already have submitted a prefix.
 
+`KV_OFFLOAD_GB=0` disables the optional CPU KV tier by omitting its connector
+flags. Positive budgets retain the native KV backend; the default is 16 GiB.
+
 For isolated, localhost qualification, load
 `--worker-extension-cls tools.rdna.mono.expert_cache_worker.ExpertCacheWorker`
 and enable `VLLM_SERVER_DEV_MODE=1`. Between workloads only, POST to

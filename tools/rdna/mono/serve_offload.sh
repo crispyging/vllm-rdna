@@ -25,7 +25,10 @@ KV_OFFLOAD_GB=${KV_OFFLOAD_GB:-16}
 [[ $POLICY == lfu_lru || $POLICY == lru ]] || exit 2
 [[ $KV_OFFLOAD_GB =~ ^[0-9]+([.][0-9]+)?$ ]] || exit 2
 KNOBS="{\"rocm_mono_decode\":{\"expert_cache_slots\":$SLOTS,\"expert_cache_policy\":\"$POLICY\",\"expert_cache_decay\":$DECAY${MONO_CFG:+,$MONO_CFG}}}"
-export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--monokernel --additional-config $KNOBS --kv-offloading-size $KV_OFFLOAD_GB --kv-offloading-backend native"
+export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--monokernel --additional-config $KNOBS"
+if [[ ! $KV_OFFLOAD_GB =~ ^0+([.]0+)?$ ]]; then
+    export EXTRA_ARGS="$EXTRA_ARGS --kv-offloading-size $KV_OFFLOAD_GB --kv-offloading-backend native"
+fi
 export PYTHONPATH=$TREE
 # Avoid split-K FP16 atomic rounding varying with cache/replay scheduling.
 # This opt-in is scoped to the isolated offloading launch, not resident recipes.
