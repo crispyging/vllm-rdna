@@ -47,6 +47,7 @@ class LiveKVOffloader:
             req_id in self.records
             or request.num_computed_tokens < request.num_prompt_tokens
             or request.has_encoder_inputs
+            or getattr(request, "lora_request", None) is not None
             or getattr(request, "resumable", False)
             or req_id not in self.last_used
         ):
@@ -71,7 +72,9 @@ class LiveKVOffloader:
             or self.manager.usage < self.watermark
             or any(r.phase not in ("host",) for r in self.records.values())
             or not any(
-                req.request_id not in self.records
+                not self.has_worker_slot(req)
+                and req.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                and getattr(req, "lora_request", None) is None
                 for queue in (scheduler.waiting, scheduler.kv_holding_waiting)
                 for req in queue
             )
@@ -171,6 +174,12 @@ class LiveKVOffloader:
                 record.detached = True
                 record.phase = "host"
                 request.status = RequestStatus.WAITING_FOR_KV_RESTORE
+                # Quiescing requests were classified as KV-holding waiters.
+                # Once detached, park behind fresh admission instead of
+                # immediately reserving the very pages this spill released.
+                scheduler.kv_holding_waiting.remove_requests((request,))
+                scheduler.waiting.remove_requests((request,))
+                scheduler.waiting.add_request(request)
                 self.spills += 1
                 logger.info(
                     "Live KV spill %s: %d pages, frontier %d",

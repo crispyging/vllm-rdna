@@ -87,7 +87,8 @@ request is waiting. It transfers complete packed physical pages into protected
 leases in the native CPU pool, waits for all ranks before releasing GPU pages,
 and restores into newly reserved GPU pages before publishing replacement tables.
 The V2 request slot and numerical selectors remain resident and count against
-`max_num_seqs`; vision/encoder and resumable streaming-input requests are excluded.
+`max_num_seqs`; vision/encoder, LoRA and resumable streaming-input requests are
+excluded.
 This is whole-request spill/resume, not per-layer KV streaming. Reset is refused
 while a live snapshot or unpublished resume owns state. Insufficient CPU/GPU
 capacity leaves the ordinary scheduler and recompute path available.

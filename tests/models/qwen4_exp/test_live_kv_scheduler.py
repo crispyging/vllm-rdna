@@ -17,6 +17,9 @@ class Status(Enum):
     WAITING_FOR_KV_SNAPSHOT = 2
     WAITING_FOR_KV_RESTORE = 3
     PREEMPTED = 4
+    WAITING = 5
+    WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR = 6
+    WAITING_FOR_REMOTE_KVS = 7
 
 
 @pytest.fixture
@@ -66,6 +69,7 @@ def setup(monkeypatch):
         kv_cache_manager=manager,
         prev_step_scheduled_req_ids={"a"},
         waiting=Mock(),
+        kv_holding_waiting=Mock(),
         _request_blocks_can_be_freed=Mock(return_value=True),
         _free_blocks=Mock(),
     )
@@ -251,3 +255,110 @@ def test_transient_source_handoff_defers_without_cancel_or_gpu_free(setup):
     controller.advance()
     assert controller.records["a"].phase == "storing"
     connector.begin_request_snapshot.assert_called_once()
+
+
+def test_ready_restore_does_not_trigger_another_admission_spill(setup):
+    controller, req, _, manager, scheduler, _ = setup
+    controller.ready_resumes.add(req.request_id)
+    victim = SimpleNamespace(request_id="other", arrival_time=2)
+    scheduler.running = [victim]
+    scheduler.waiting = [req]
+    scheduler.kv_holding_waiting = []
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.max_num_running_reqs = 8
+    manager.usage = 1.0
+    controller.start = Mock(return_value=True)
+    controller.evict_for_admission()
+    controller.start.assert_not_called()
+    assert scheduler.running == [victim]
+    assert controller.ready_resumes == {req.request_id}
+
+
+def test_detached_snapshot_leaves_holding_queue_behind_fresh_admission(
+    setup, monkeypatch
+):
+    controller, original, connector, _, scheduler, _ = setup
+    root = Path(__file__).resolve().parents[3]
+    request_module = sys.modules["vllm.v1.request"]
+    monkeypatch.setattr(request_module, "Request", object, raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "live_queue_test", root / "vllm/v1/core/sched/request_queue.py"
+    )
+    assert spec is not None and spec.loader is not None
+    queues = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(queues)
+
+    class Request:
+        request_id: str
+        status: Status
+
+    request = Request()
+    request.__dict__.update(vars(original))
+    fresh = Request()
+    fresh.request_id = "fresh"
+    scheduler.waiting = queues.FCFSRequestQueue([fresh])
+    scheduler.kv_holding_waiting = queues.FCFSRequestQueue()
+    assert controller.start(request)
+    # The scheduler prioritizes this request while it still owns source pages.
+    scheduler.waiting.remove_requests((request,))
+    scheduler.kv_holding_waiting.add_request(request)
+    connector.snapshot_status.return_value = "quiesced"
+    controller.advance()
+    connector.snapshot_status.return_value = "host_ready"
+    connector.snapshot_sources_ready.return_value = True
+    controller.advance()
+    assert not scheduler.kv_holding_waiting
+    assert list(scheduler.waiting) == [fresh, request]
+    assert request.status == Status.WAITING_FOR_KV_RESTORE
+
+
+@pytest.mark.parametrize(
+    "status,lora",
+    [
+        (Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, None),
+        (Status.WAITING_FOR_REMOTE_KVS, None),
+        (Status.WAITING, object()),
+    ],
+)
+def test_blocked_or_adapter_waiter_does_not_trigger_admission_spill(
+    setup, status, lora
+):
+    controller, victim, _, manager, scheduler, _ = setup
+    scheduler.running = [victim]
+    scheduler.waiting = [
+        SimpleNamespace(request_id="fresh", status=status, lora_request=lora)
+    ]
+    scheduler.kv_holding_waiting = []
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.max_num_running_reqs = 8
+    manager.usage = 1.0
+    controller.start = Mock(return_value=True)
+    controller.evict_for_admission()
+    controller.start.assert_not_called()
+    assert scheduler.running == [victim]
+
+
+def test_adapter_request_keeps_ordinary_scheduler_ownership(setup):
+    controller, request, connector, _, _, _ = setup
+    request.lora_request = object()
+    assert not controller.start(request)
+    connector.begin_request_quiesce.assert_not_called()
+    assert not controller.records
+
+
+def test_ready_fresh_waiter_still_spills_the_lru_resident(setup):
+    controller, oldest, _, manager, scheduler, _ = setup
+    newer = SimpleNamespace(request_id="newer", arrival_time=2)
+    controller.last_used[newer.request_id] = 2
+    scheduler.running = [newer, oldest]
+    scheduler.waiting = [
+        SimpleNamespace(request_id="fresh", status=Status.WAITING, lora_request=None)
+    ]
+    scheduler.kv_holding_waiting = []
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.max_num_running_reqs = 8
+    manager.usage = 1.0
+    controller.start = Mock(return_value=True)
+    controller.evict_for_admission()
+    controller.start.assert_called_once_with(oldest)
+    assert scheduler.running == [newer]
