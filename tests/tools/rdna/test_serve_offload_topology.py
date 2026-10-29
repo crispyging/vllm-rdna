@@ -30,8 +30,12 @@ def tree(tmp_path):
     # wrapper exported, then exit without touching a GPU.
     stub = (
         "#!/usr/bin/env bash\n"
+        # The real serve_validate.sh hard-requires an exported GPUS; mirror
+        # that contract so delegation regressions are visible here.
+        ': "${GPUS:?GPUS required}"\n'
         'echo "STUB $(basename "$0") $*"\n'
-        'echo "STUB-ENV TP=${TP:-unset} HIP=${HIP_VISIBLE_DEVICES:-unset} '
+        'echo "STUB-ENV TP=${TP:-unset} GPUS=${GPUS} '
+        'HIP=${HIP_VISIBLE_DEVICES:-unset} '
         'EXTRA=${EXTRA_ARGS:-unset} RECIPE=${RECIPE:-unset} PORT=${PORT:-unset}"\n'
     )
     (root / "tools/rdna/serve_rdna.sh").write_text(stub)
@@ -187,3 +191,13 @@ def test_validate_target_receives_resolved_tp(tree):
     assert result.returncode == 0, result.stderr
     assert "STUB serve_validate.sh" in result.stdout
     assert "TP=4" in result.stdout
+
+
+def test_validate_delegation_exports_default_gpus(tree):
+    # GPUS is deliberately NOT in the caller env: the wrapper default (6,7)
+    # must still reach the validation driver, which hard-requires GPUS.
+    result = run(tree, validate=1, CELLS="none")
+    assert result.returncode == 0, result.stderr
+    assert "STUB serve_validate.sh" in result.stdout
+    assert "GPUS=6,7" in result.stdout
+    assert "TP=2" in result.stdout

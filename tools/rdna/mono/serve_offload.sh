@@ -32,7 +32,9 @@ case "$LOCAL_EXPERTS" in 128|256) ;; *) echo "TP=$TP gives $LOCAL_EXPERTS local 
 # Allocation-safety allowlist: the GPUS set must appear verbatim (same order)
 # in ALLOWED_GPU_SETS. Default keeps the maintainer host's 6,7-only policy.
 ALLOWED_GPU_SETS=${ALLOWED_GPU_SETS:-6,7}
-GPUS=${GPUS:-6,7}
+# Exported so delegated drivers (port_v031/serve_validate.sh hard-requires
+# GPUS) inherit the resolved set even when it comes from the default.
+export GPUS=${GPUS:-6,7}
 # Canonical HIP IDs: unique, non-negative integers.
 [[ "$GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "GPUS must be a comma-separated list of HIP indices." >&2; exit 2; }
 IFS=',' read -r -a _gpu_arr <<< "$GPUS"
