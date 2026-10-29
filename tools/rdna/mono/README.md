@@ -53,7 +53,11 @@ A four-card host runs the same plan with:
 qualification drivers accept the matching `TP`; `sweep_offload_policy.py`
 takes `--local-experts 128 --global-experts 512` for TP4 traces and keeps the
 TP2 defaults, and `qualify_expert_copy.py` validates any rank count via
-`--expected-caches` (48 caches per rank on Qwen4Exp).
+`--expected-caches` (48 caches per rank on Qwen4Exp). The split-K2 fused
+all-reduce checker `benchmarks/kernels/check_rdna2_offload_tp2_ar.py` takes
+`--tp 2|4` (default 2): each rank owns 512/tp experts and a 640/tp-wide
+shared slice, the AR probe must sum to tp(tp+1)/2, and at TP4 the independent
+oracle is the resident 128-expert `mono_k2_rdna2` entry with AR detached.
 
 `KV_OFFLOAD_GB=0` disables the optional CPU KV tier by omitting its connector
 flags. Positive budgets retain the native KV backend; the default is 16 GiB.
