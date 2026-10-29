@@ -308,6 +308,22 @@ def main():
         parser.error(
             f"select exactly {args.tp} idle GPUs with HIP_VISIBLE_DEVICES"
         )
+    # rdna_ar_init() hipDeviceEnablePeerAccess()es every peer up front, and on
+    # P2P-incapable hosts the runtime fails inside the kernel init with an
+    # opaque "invalid device ordinal" (e.g. four V620s behind separate PCIe
+    # switches). Refuse with the actual reason and the supported fallback.
+    for a in range(args.tp):
+        if not all(
+            torch.cuda.can_device_access_peer(a, b)
+            for b in range(args.tp)
+            if b != a
+        ):
+            parser.error(
+                f"rdna_ar requires GPU peer access; device {a} reports none "
+                "-- this host must run collectives through the RCCL fallback "
+                "(VLLM_RDNA_AR=0), so the custom-allreduce kernel cannot be "
+                "exercised here"
+            )
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
