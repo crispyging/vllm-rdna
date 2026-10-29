@@ -44,7 +44,8 @@ def _fake_spawn(calls):
 def _run_main(monkeypatch, argv, devices):
     calls = []
     monkeypatch.setattr(ar.mp, "spawn", _fake_spawn(calls))
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: devices)
+    monkeypatch.setattr(torch.cuda, "init", lambda: None)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: devices)
     monkeypatch.setattr(sys, "argv", ["check_rdna2_offload_tp2_ar.py", *argv])
     ar.main()
     assert len(calls) == 1
@@ -103,7 +104,8 @@ def test_tp4_slots_may_reach_the_local_expert_count(monkeypatch):
 )
 def test_main_refuses_invalid_topologies(monkeypatch, argv, devices):
     monkeypatch.setattr(ar.mp, "spawn", _fake_spawn([]))
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: devices)
+    monkeypatch.setattr(torch.cuda, "init", lambda: None)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: devices)
     monkeypatch.setattr(sys, "argv", ["check_rdna2_offload_tp2_ar.py", *argv])
     with pytest.raises(SystemExit) as exit_info:
         ar.main()
