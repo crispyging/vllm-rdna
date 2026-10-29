@@ -1,0 +1,16 @@
+{
+  "scope": "bounded server-log marker scan, not kernel-ring audit",
+  "logs": {
+    "budget88-server.log": {
+      "sha256": "425812d9710497e2dba98e40924fbb38b325bddf8e05a5b62e6c6bd386ae881f",
+      "fault_marker_lines": []
+    },
+    "baseline-server.log": {
+      "sha256": "a2e047a5fddb88ee91af3450d28ea3dd66bffa96da4525934d446c102b490c2b",
+      "fault_marker_lines": [
+        "(APIServer pid=796504) ERROR 10-29 11:26:40 [async_llm.py:871] Traceback (most recent call last):"
+      ],
+      "classification": "One AsyncLLM EngineDeadError traceback during deliberate SIGTERM shutdown after all benchmark cells and idle layout RPC completed; no serving numeric/GPU-fault marker found."
+    }
+  }
+}
