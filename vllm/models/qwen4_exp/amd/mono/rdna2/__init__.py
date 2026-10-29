@@ -40,6 +40,8 @@ class Options:
     expert_cache_slot_plan: dict = field(default_factory=dict)
     expert_cache_policy: str = "lfu_lru"
     expert_cache_decay: int = 128
+    kv_cache_live_offload: bool = False
+    kv_cache_live_offload_watermark: float = 0.9
     expert_cache_overlap: bool = False  # known misses only; extra passes may cost more
     expert_cache_copy: str = "tensor"  # opt-in native batched HIP submissions
 
@@ -60,10 +62,19 @@ class Options:
                 raise ValueError(f"--monokernel: {k} must be an integer")
             if k == "expert_cache_slot_plan" and not isinstance(v, dict):
                 raise ValueError("expert_cache_slot_plan must be a dictionary")
-            if k == "expert_cache_overlap" and not isinstance(v, bool):
-                raise ValueError("expert_cache_overlap must be a boolean")
+            if k in (
+                "expert_cache_overlap",
+                "kv_cache_live_offload",
+            ) and not isinstance(v, bool):
+                raise ValueError(f"{k} must be a boolean")
+            if k == "kv_cache_live_offload_watermark" and (
+                isinstance(v, bool) or not isinstance(v, (int, float))
+            ):
+                raise ValueError(f"{k} must be a number")
             cur = getattr(opts, k)
             setattr(opts, k, type(cur)(v) if not isinstance(cur, bool) else bool(v))
+        if not 0 <= opts.kv_cache_live_offload_watermark <= 1:
+            raise ValueError("kv_cache_live_offload_watermark must be in [0, 1]")
         if opts.expert_cache_slot_plan:
             from vllm.model_executor.layers.fused_moe.rdna_expert_cache_config import (
                 validate_slot_plan,

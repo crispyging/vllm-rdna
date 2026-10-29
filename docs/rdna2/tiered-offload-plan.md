@@ -61,9 +61,14 @@ separate requirement and must not be advertised before its resume gate passes.
 
 - [x] Audit native KV connector and exact-route overlap feasibility.
 - [x] Implement deterministic per-rank byte-budget planner (26 CPU tests).
-- [ ] Add per-layer diagnostic telemetry and lightweight route traces.
-- [ ] Wire and validate startup per-layer slot selection.
-- [ ] Collect representative GPU 6–7 measurements and choose budget candidates.
-- [ ] Implement and qualify known-route overlap.
-- [ ] Implement and qualify complete hybrid live KV spill/resume.
+- [x] Add per-layer diagnostic telemetry and lightweight route traces.
+- [x] Wire and validate startup per-layer slot selection.
+- [x] Collect GPU 6–7 diagnostics and select same-budget and 88% expert-budget candidates.
+- [x] Implement known-route overlap; GPU packing/parity and cleanup tests pass.
+- [x] Qualify graph-mode overlap quality and run ABBA throughput comparison;
+  no consistent gain, so overlap remains disabled by default. Eager coverage remains.
+- [x] Reuse native CPU pool for retained, allocator-backed physical page transfers.
+- [x] Implement typed hybrid snapshots, native CPU leases and opt-in V2 live paging;
+  792 regression tests pass on GPU 7.
+- [ ] Qualify complete hybrid live KV spill/resume with the full model.
 - [ ] Run matched throughput/admission matrix and publish tested defaults.

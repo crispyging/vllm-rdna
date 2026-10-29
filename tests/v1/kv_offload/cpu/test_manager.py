@@ -1669,6 +1669,8 @@ def test_cpu_chunk_lease_rejects_reset_without_mutating_cache(lease_manager):
     generation = manager._cache_generation
     chunk = manager._policy.get(to_key(1))
     with pytest.raises(RuntimeError, match="chunk leases are retained"):
+        manager.preflight_reset_cache()
+    with pytest.raises(RuntimeError, match="chunk leases are retained"):
         manager.reset_cache()
     assert manager._cache_generation == generation
     assert manager._policy.get(to_key(1)) is chunk
@@ -1698,3 +1700,68 @@ def test_cpu_chunk_lease_does_not_change_replacement_recency(lease_manager):
     if isinstance(manager._policy, ARCCachePolicy):
         assert to_key(1) in manager._policy.t1
         assert not manager._policy.t2
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_complete_store_and_retain_never_marks_pending_evictable(policy, monkeypatch):
+    manager = make_cpu_manager(num_chunks=2, cache_policy=policy, enable_events=True)
+    ctx = make_req_context("private-snapshot")
+    keys = to_keys([1, 2])
+    assert manager.prepare_store(keys, ctx) is not None
+    marked: list[OffloadKey] = []
+    original = manager._policy.mark_evictable
+    monkeypatch.setattr(manager._policy, "mark_evictable", marked.append)
+    lease = manager.complete_store_and_retain(keys + keys, ctx)
+    assert marked == []
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 0
+    assert [event.keys for event in manager.take_events()] == [keys]
+    assert manager.prepare_store(to_keys([3]), ctx) is None
+    assert all(manager._policy.get(key).ref_cnt == 1 for key in keys)
+    manager.prepare_load(keys, ctx)
+    manager.complete_load(keys, ctx)
+    assert manager.prepare_store(to_keys([3]), ctx) is None
+    monkeypatch.setattr(manager._policy, "mark_evictable", original)
+    assert manager.release_lease(lease)
+    assert manager.prepare_store(to_keys([3]), ctx) is not None
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_complete_store_and_retain_atomic_validation_and_failed_store(policy):
+    manager = make_cpu_manager(num_chunks=2, cache_policy=policy, enable_events=True)
+    ctx = make_req_context("snapshot")
+    keys = to_keys([1, 2])
+    manager.prepare_store(keys, ctx)
+    with pytest.raises(ValueError, match="missing"):
+        manager.complete_store_and_retain(to_keys([1, 3]), ctx)
+    with pytest.raises(ValueError, match="at least one"):
+        manager.complete_store_and_retain([], ctx)
+    assert manager._num_write_pending_chunks == 2
+    assert all(manager._policy.get(key).ref_cnt == -1 for key in keys)
+    assert not list(manager.take_events())
+    manager.complete_store(keys, ctx, success=False)
+    assert manager._num_write_pending_chunks == 0
+    assert not manager._leases
+    assert manager.prepare_store(to_keys([3, 4]), ctx) is not None
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_complete_store_and_retain_mixed_ready_pending_and_reset(policy):
+    manager = make_cpu_manager(num_chunks=2, cache_policy=policy, enable_events=True)
+    ctx = make_req_context("snapshot")
+    keys = to_keys([1, 2])
+    manager.prepare_store(keys, ctx)
+    manager.complete_store(keys[:1], ctx)
+    list(manager.take_events())
+    first = manager.retain_ready_chunks(keys[:1])
+    second = manager.complete_store_and_retain(keys, ctx)
+    assert [event.keys for event in manager.take_events()] == [keys[1:]]
+    assert [manager._policy.get(key).ref_cnt for key in keys] == [2, 1]
+    with pytest.raises(RuntimeError):
+        manager.reset_cache()
+    assert manager.release_lease(first)
+    assert manager.release_lease(second)
+    assert not manager.release_lease(second)
+    manager.reset_cache()
+    with pytest.raises(ValueError, match="generation"):
+        manager.release_lease(second)

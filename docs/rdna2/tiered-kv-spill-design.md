@@ -1,9 +1,20 @@
 # Live Flash-Next KV spill into the native CPU pool
 
-Status: design only. Prefix-cache offloading exists; whole-request live paging
-is not implemented or qualified. This design does not extend deferred PR #23.
-Only physical HIP devices 6 and 7 are authorized for subsequent GPU validation.
-This audit performed no remote or GPU work.
+Status: experimental implementation present; complete model qualification is
+in progress. The initial audit below preceded implementation; its V1 portability
+notes are superseded for the target recipe by the final Model Runner V2 section.
+This work does not extend deferred PR #23. Only physical HIP devices 6 and 7
+are authorized for model validation (unit/transport tests use GPU 7).
+
+The first graph-mode live-paging run passed PPL 4.87 and 48 concurrency checks
+with no hard failures and with actual spill/resume at unchanged frontiers.
+The eight-long-context probe also passed 56 checks with zero hard failures;
+logs confirm repeated spill/resume at nonaligned 25.9k–29k-token frontiers.
+A disconnect triggered by a host-ready spill also passed: the eight surviving
+requests completed, post-abort PPL passed and reset succeeded. Across the run,
+31 spill/resume pairs preserved frontiers; only the intentionally aborted request
+had an unpaired spill. Eager coverage and performance acceptance remain open.
+Controls remain disabled by default.
 
 ## Boundary and smallest useful slice
 
@@ -188,10 +199,10 @@ restore. No background automatic swapping policy until this passes qualification
 - Cancellation in any phase is idempotent. Retain each source/destination until
   its last GPU event and all-rank completion are accounted for, then free both
   resources. Reject late completions from an older request/snapshot generation.
-- Existing reset_cache clears all policies regardless of refs and drops job
-  state after scheduling flushes. It cannot invalidate live snapshots. Refuse
-  connector reset while durable snapshots exist in the first slice, unless an
-  explicit abort-all operation drains and releases every snapshot first.
+- CPU manager reset now refuses live leases. The connector must preflight
+  this refusal before clearing its own job/request state. Refuse connector
+  reset while retained snapshots exist in the first slice, unless an explicit
+  abort-all operation drains and releases every snapshot first.
 - Process restart recovery is excluded. GPU loss fails affected requests; a
   same-process CPU pool is not durable storage. Bound stuck operations and
   report failure without unsafe reclamation of DMA-visible memory.
@@ -234,3 +245,220 @@ test_native_hybrid_cpu_roundtrip_is_byte_identical, and
 test_load_waits_for_pending_compute_stream_writes. Those existing tests do not
 qualify live paging: add the transaction, raw-ring and model continuation cases
 above. No merge/readiness claim before those new gates pass on the actual layout.
+
+## Integration audit: typed manager and worker state
+
+The packed-page transport and native CPU leases are only foundations. Exact
+Flash-Next TP2/MTP2 suspension additionally requires the following typed state.
+Do not copy a manager or runner's `__dict__`: it includes shared pools, other
+requests, transient queues and device objects with independent ownership.
+
+### Per-group manager manifest
+
+Use immutable records containing explicit optional fields, validated against
+an allowlist of the actual concrete manager/spec pairs at startup:
+
+- Common state: group ID and spec/layout fingerprint; the entire logical
+  `req_to_blocks[req_id]` table, including null holes and trailing speculative
+  slots; presence/value of `num_cached_block[req_id]`; and optional
+  `_partial_hit_reqs[req_id] = (logical_index, source_page_handle)`.
+  See `vllm/v1/core/single_type_kv_cache_manager.py:128` and `:149`.
+- CircularBufferManager: its one-element physical ring table. It has no extra
+  request-owned ring cursor; QSA derives ring positions from token positions.
+  Preserve the exact token frontier and the ring bytes, including packed
+  MRoPE positions when configured. Its normal prefix-cache lookup returns no
+  hit and is unsuitable for restoration. See
+  `vllm/v1/core/single_type_kv_cache_manager.py:1199` and
+  `vllm/models/qwen4_exp/common/qsa_cache.py:113`.
+- MambaManager in align mode: presence/value of `last_state_block_idx` and
+  `_num_retired_blocks`; membership in `_allocated_block_reqs`; optional
+  `_checkpoints = (checkpoint_token_position, logical_block_index)`; and optional
+  `_producer_partial_tail_reqs = (source_page_handle, boundary_tokens)`.
+  Logical indices remain unchanged when physical IDs change. Every stored
+  KVCacheBlock reference must instead resolve through the page remapping.
+  See `vllm/v1/core/single_type_kv_cache_manager.py:1474`, `:1800`, `:1862`
+  and `:1914`.
+
+Ordinary `pop_blocks_for_free` destroys these records: the base removes table,
+cache cursor and partial-hit state (`single_type_kv_cache_manager.py:562`),
+while Mamba additionally removes its align bookkeeping and queued boundary
+handoffs (`:1971`). The coordinator simply concatenates those destructive pops
+(`vllm/v1/core/kv_cache_coordinator.py:420`). Export before detach; do not infer
+these records afterward from `num_computed_tokens` or table length.
+
+Pending CoW copies and boundary-state handoffs are not passive manifest fields.
+They own additional asynchronous source/destination lifetimes; handoff blocks
+can already be outside the request's table. Initial integration must drain and
+acknowledge them, plus external prefix stores and their retained endpoints,
+before declaring the request quiescent. Reject suspension if any dependency
+cannot be drained. Do not serialize a stale block pointer or silently discard
+an offer. See `single_type_kv_cache_manager.py:422`, `:430` and
+`vllm/v1/core/kv_cache_manager.py:896`. The per-step
+`cached_blocks_this_step` set is shared step-local exclusion state, not a
+request snapshot; suspend at a completed step boundary (`:2044`).
+
+### Physical ownership, hashes and atomic allocation
+
+A page manifest needs a unique `(pool_identity, old_physical_id)` handle per
+non-null source page, plus references from every logical table position.
+Transport each unique page once. Preserve table holes without allocating or
+transferring null page zero. Ownership accounting must follow table references,
+not the deduplicated transfer list; never restore an old absolute `ref_cnt`,
+because other requests may have acquired/released the original shared page.
+
+`BlockPool.get_new_blocks` checks total capacity before dequeuing and returns
+fresh, unhashed blocks with one owning reference (`block_pool.py:669`). For the
+initial single-pool packed layout, validate every group record first and reserve
+all required destination pages with one call on the scheduler thread, before
+publishing any table. Add references for any validated alias multiplicity;
+never call `touch` on null holes. Keep destinations private in a reservation
+until all loads succeed. On failure, drain H2D and free the reservation without
+installing request tables. Defer multiple-pool restoration until an explicit
+all-pool reservation/rollback protocol exists.
+
+Freeing sources releases only this request's references, following the existing
+pool's reverse-order semantics. It does not guarantee physical reclamation:
+shared pages remain live for other owners, and unhashed/hashed idle pages have
+different free-queue behavior (`block_pool.py:755`, `:773`, `:777`). Report actual
+reclaimed pages separately from saved bytes. Mutable ring/live state must never
+be deduplicated with another request's snapshot merely by prefix hash.
+
+Preserve immutable prefix metadata separately from page bytes: each page's
+primary `block_hash`, `block_hash_num_tokens`, and all secondary aliases in
+`cached_block_hashes_by_block`. Restoring fresh unhashed pages while reinstating
+`num_cached_block` would skip their cache publication; losing partial-tail
+hashes also bypasses hash-driven copy-on-write protection. Publish the saved
+hashes only after H2D completion. The hash map already supports multiple physical
+blocks under the same hash (`block_pool.py:35`, `:85`), so a restored private
+copy need not steal entries from a still-shared original. A narrow public
+`restore_block_hashes(block, primary, num_tokens, aliases)` should wrap the
+existing insertion logic at `block_pool.py:628`; do not use
+`move_block_hashes`, which removes the original's entries (`:651`). Validate
+request/model/cache generation before publishing any saved hash metadata.
+
+### State outside the packed GPU allocation
+
+The accepted speculative state selector is the most important additional
+payload. `GPUModelRunner.mamba_state_idx[req_id]` is a logical source column
+(`gpu_model_runner.py:1085`). The prior step's accepted count is held in
+`InputBatch.num_accepted_tokens_cpu[row]`, backed by an asynchronous D2H copy and
+`num_accepted_tokens_event` (`gpu_model_runner.py:1711`). Align postprocessing
+can preserve a count greater than one; it does not always normalize the state
+in place (`mamba_utils.py:1805`). The next preprocess uses `accepted_count - 1`
+to select the correct conv/temporal state (`mamba_utils.py:1669`).
+
+Synchronize that event, then snapshot the count by request ID, not by the old
+batch row. `InputBatch.add_request` resets it to one (`gpu_input_batch.py:481`),
+so restore the saved count after the resumed request has been added and rows
+condensed, before `_prepare_inputs` copies accepted counts and preprocesses
+Mamba. Preserve the logical `mamba_state_idx` at that point too. Existing
+`cleanup_mamba_state_idx` removes entries for every resumed request
+(`mamba_utils.py:1557`); live restoration needs an explicit exception for a
+validated restored request, or a hook restoring its saved selector immediately
+after that cleanup. Reusing the preemption-resume path unchanged is incorrect.
+
+Retain each worker's `CachedRequestState` while it is absent from the batch:
+its token history/frontier, RNG generator, sampling parameters, prompt-logprob
+accumulator, prompt embeddings/masks, multimodal positions and
+`prev_num_draft_len` are outside packed KV (`gpu_input_batch.py:35`). Existing
+unscheduling already retains this object (`gpu_model_runner.py:1386`); finishing
+removes it. Preserve the scheduler's Request object and committed output/token
+history, speculative IDs, grammar state and accounting rather than rebuilding
+it as a fresh request (`vllm/v1/request.py:160`). Initial suspension must wait for
+`num_in_flight_tokens == 0` and all optimistic output/acceptance corrections;
+ordinary `_preempt_request` resets the frontier and speculative IDs
+(`scheduler.py:1806`) and must not be used for this transition.
+
+PLE's short-conv history, including speculative slots, is allocator-owned
+`kv_cache`; it is TP-replicated and both worker-private copies must be stored
+(`vllm/models/qwen4_exp/amd/ple_layer.py:777`, `:788`, `:800`). QSA raw/compressed
+side caches are also registered cache owners
+(`vllm/models/qwen4_exp/amd/indexer_qsa.py:199`). The actual deployed capability
+probe must prove all these owners, target GDN, and every MTP owner share the
+certified backing. A positive one-tensor transport capability alone cannot
+prove owner completeness.
+
+Ngram context is rebuilt from retained token history and the exact frontier
+(`gpu_model_runner.py:3646`). Batch-indexed QSA/top-k metadata, MTP per-group
+block-table staging (`vllm/v1/spec_decode/qwen4_exp.py:30`), and graph input
+buffers must be rebuilt for the new tables and batch slot. They are scratch,
+not transferable request state. PLE embedding tables and model weights remain
+resident/shared and are not part of the request snapshot. Initial integration
+remains text-only; multimodal encoder ownership needs separate qualification.
+
+### Minimal consuming APIs and restore order
+
+Implement explicit records beside the existing managers, not a generic state
+serialization framework:
+
+- `SingleTypeKVCacheManager.export_request_state(req_id)` returns a common
+  table record; Mamba overrides it with a typed align record. Concrete spec
+  validation rejects unsupported managers rather than omitting fields.
+- `KVCacheManager.export_live_state(request)` collects group records, unique
+  physical pages and prefix-hash metadata without mutation.
+- `detach_live_state(request, validated_manifest)` removes request bookkeeping
+  and returns precisely owned references only after all-rank store success and
+  the native CPU lease exist. It must check the manifest is still current.
+- `reserve_live_restore(manifest)` validates all records and reserves the full
+  destination set atomically; it returns an unpublished page remapping and
+  replacement typed tables. `abort_live_restore(reservation)` frees it only
+  after DMA drains.
+- `commit_live_restore(request, manifest, reservation)` installs remapped tables,
+  cache aliases and typed manager records after all-rank load completion.
+- A worker-local typed record holds `mamba_state_idx`, accepted count and the
+  retained CachedRequestState generation. `restore_live_worker_state` applies
+  those selectors after batch placement and Mamba cleanup, before preprocessing.
+
+The required order is: finish model/MTP and acceptance postprocessing; drain
+output, CoW and prefix transfers; export the typed snapshot; reserve CPU pages;
+store all ranks; complete stores directly into retained CPU leases; detach and
+release source references. On resume: reserve all GPU destinations; finish any
+required zeroing before H2D; load all ranks; publish hashes and typed tables;
+replace worker block tables through the existing resumed-table path
+(`gpu_model_runner.py:1582`); restore worker selectors after row placement and
+cleanup; rebuild metadata; then allow the next forward. No zeroing or pending
+CoW operation may overwrite restored pages after H2D.
+
+Keep the CPU lease through this complete commit, not merely through DMA. A
+failed rank leaves the request suspended with its CPU copy retained. Cancel,
+abort and reset must fence the same generation and transfer ownership before
+freeing either side. The current CPU manager rejects reset with live leases;
+the connector must preflight that refusal before clearing its own job/request
+state. Full hybrid MTP qualification remains mandatory before calling this
+usable live paging.
+
+Add manager tests for sparse/null tables, shared-prefix owner counts, hash alias
+restoration and partial-tail CoW at different IDs; transactional allocation
+failure with no partial publication; checkpoint and producer-tail remapping;
+and cleanup/reset generation failures. Add worker tests with accepted counts
+one, two and three, changed batch rows, same-block versus cross-block MTP state,
+and repeated suspend/resume. Existing nearby regression cases include
+`test_hybrid_coordinator_skips_non_cacheable_circular_group`,
+`test_hybrid_model_mamba_align_with_dynamic_draft_tokens`,
+`test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks`
+(`tests/v1/core/test_prefix_caching.py`) and
+`tests/v1/core/test_deferred_block_free.py`. Only a real TP2/MTP2 continuation
+comparison with no prefix recomputation can close the final gate.
+
+## Confirmed target runner: Model Runner V2
+
+The actual MonoKernel recipe and `/server_info` receipt select Model Runner V2
+(`VLLM_USE_V2_MODEL_RUNNER=1`, async scheduling enabled). Its persistent
+`RequestState` and `MambaHybridState` keep per-request GPU slots while a request
+is unscheduled. The V1 accepted-count reset discussion above is a portability
+hazard, not the target implementation path.
+
+Live resumes must remain __cached requests__ in V2. Sending a normal resumed
+request through `scheduled_new_reqs` calls `_remove_request`/`add_request`, resets
+accepted counts and recurrent selectors, and loses RNG/request state. Instead,
+retain the original slot and send `block_table_updates` to overwrite every group
+row. Keep `resumed_req_ids` for the connector so it replaces its source tables.
+See `vllm/v1/worker/gpu/model_runner.py:1135`, `:1180`, `:1237` and
+`vllm/v1/worker/gpu/model_states/mamba_hybrid.py:207`.
+
+Count host-resident requests against V2's total request-slot budget. Offloading
+large KV pages does not free the small persistent request slot. Fresh admission
+must not exceed `max_num_seqs` across running and suspended slots; an existing
+suspended request may still restore at that limit. Initial support targets the
+requested TP2/MTP2, FCFS, PP1, aligned-recurrent-state configuration. No V1 worker
+serialization layer is needed for this implementation.

@@ -17,6 +17,35 @@ import torch
 class ExpertCacheWorker:
     """Development-only mixin for the existing worker-extension interface."""
 
+    def rdna_kv_snapshot_layout(self: Any) -> dict[str, Any]:
+        """Read layout capabilities only; no transfer or device synchronization."""
+        state = sys.modules.get("vllm.distributed.kv_transfer.kv_transfer_state")
+        connector = getattr(state, "_KV_CONNECTOR_AGENT", None)
+        wrapper = getattr(connector, "connector_worker", None)
+        worker = getattr(wrapper, "worker", None)
+        config = getattr(getattr(self, "model_runner", None), "kv_cache_config", None)
+        groups = getattr(config, "kv_cache_groups", ())
+        return {
+            "connector": type(connector).__name__,
+            "worker": type(worker).__name__,
+            "physical_page_transport": bool(
+                getattr(worker, "supports_physical_page_snapshots", False)
+            ),
+            "physical_page_count": getattr(worker, "_physical_page_count", 0),
+            "cpu_chunk_count": getattr(worker, "_physical_cpu_chunk_count", 0),
+            "blocks_per_chunk": getattr(
+                getattr(wrapper, "spec", None), "blocks_per_chunk", None
+            ),
+            "groups": [
+                {
+                    "spec": type(group.kv_cache_spec).__name__,
+                    "layers": list(group.layer_names),
+                }
+                for group in groups
+            ],
+            "live_request_paging": False,
+        }
+
     def rdna_expert_cache_control(
         self: Any,
         copy_mode: str = "",

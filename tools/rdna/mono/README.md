@@ -70,9 +70,24 @@ and the wider K2 gate are not enabled by default.
 ### Tiered-offload experiments
 
 The next implementation stages and acceptance gates are tracked in
-`docs/rdna2/tiered-offload-plan.md`. Active hybrid KV spill/resume is **not yet
-implemented**: the CPU KV tier still serves prefix reuse. The CPU manager's
-retained-chunk leases are groundwork for safe snapshots, not live paging.
+`docs/rdna2/tiered-offload-plan.md`. An experimental hybrid KV spill/resume implementation is present behind
+`KV_LIVE_OFFLOAD=1`; full-model qualification is pending. The default CPU KV
+tier continues to serve prefix reuse. Do not treat passing prefix-cache tests
+as qualification of live paging.
+
+Live paging requires a positive `KV_OFFLOAD_GB`, the RDNA2 Qwen4Exp MonoKernel,
+Model Runner V2, aligned recurrent state, FCFS scheduling and PP=1.
+`KV_LIVE_WATERMARK=0.9` selects the GPU KV occupancy threshold. The scheduler
+selects a previously scheduled, fully prefilled request by LRU when another
+request is waiting. It transfers complete packed physical pages into protected
+leases in the native CPU pool, waits for all ranks before releasing GPU pages,
+and restores into newly reserved GPU pages before publishing replacement tables.
+The V2 request slot and numerical selectors remain resident and count against
+`max_num_seqs`; vision/encoder and resumable streaming-input requests are excluded.
+This is whole-request spill/resume, not per-layer KV streaming. Reset is refused
+while a live snapshot or unpublished resume owns state. Insufficient CPU/GPU
+capacity leaves the ordinary scheduler and recompute path available.
+Keep this control off until hybrid resume, cancellation and quality gates pass.
 
 For per-layer transfer diagnostics, use the worker extension above and call
 `rdna_expert_cache_control` with `{"transfer_timing":"on"}` between workloads.
@@ -88,12 +103,14 @@ metadata-free profiling and graph recording are excluded. Collection writes
 files and is diagnostic: do not use it for final latency claims.
 
 `tools/rdna/mono/sweep_offload_policy.py` accepts these receipts, with
-`--phase decode` or `--phase prefill` when needed. `--plan-profile profile.json`
+`--trace-phase decode` or `--trace-phase prefill` when needed. `--plan-profile profile.json`
 and `--plan-output plan.json` enable deterministic nonuniform slot planning.
 The profile contains `rank_budgets` in GPU bytes and `layers` with rank, layer,
 `expert_bytes`, optional `map_bytes`, min/max capacities and candidate capacities.
 Every traced layer needs a profile; fixed map bytes count against each rank's
-budget. This is an empty-cache replay heuristic, not a claim of global optimality
+budget. JSONL plans cross-check payload and fixed map costs against measured
+trace headers; legacy/manual inputs remain explicitly unverified modeled costs.
+This is an empty-cache replay heuristic, not a claim of global optimality
 or a prediction of end-to-end latency. `objective_weight` may represent measured
 transfer cost, but an arbitrary weight is not a measured speedup.
 

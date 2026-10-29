@@ -519,6 +519,9 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        from vllm.v1.core.sched.live_kv_offload import make_live_kv_offloader
+
+        self.live_kv_offloader = make_live_kv_offloader(self)
 
     def _mamba_block_aligned_split(
         self,
@@ -710,6 +713,10 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.live_kv_offloader is not None:
+            self.live_kv_offloader.advance()
+            if self._pause_state == PauseState.UNPAUSED:
+                self.live_kv_offloader.evict_for_admission()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1113,6 +1120,14 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if (
+                    self.live_kv_offloader is not None
+                    and not self.live_kv_offloader.has_worker_slot(request)
+                    and num_running + self.live_kv_offloader.retained_waiting_slots()
+                    >= self.max_num_running_reqs
+                ):
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1605,9 +1620,15 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Construct the scheduler output.
+        retained_live_resumes = (
+            self.live_kv_offloader.retained_v2_resumes(scheduled_resumed_reqs)
+            if self.live_kv_offloader is not None
+            else []
+        )
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
+            scheduled_resumed_reqs.extend(retained_live_resumes)
             new_reqs_data = [
                 NewRequestData.from_request(
                     req,
@@ -1733,6 +1754,12 @@ class Scheduler(SchedulerInterface):
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
 
+        if retained_live_resumes:
+            scheduler_output.block_table_updates = {
+                req.request_id: req_to_new_blocks[req.request_id].get_block_ids()
+                for req in retained_live_resumes
+            }
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -1740,6 +1767,9 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+
+        if self.live_kv_offloader is not None:
+            self.live_kv_offloader.note_schedule(scheduler_output)
 
         if self.aux_output_connector is not None:
             scheduler_output.aux_output_connector_metadata = (
@@ -2650,6 +2680,8 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
+            RequestStatus.WAITING_FOR_KV_SNAPSHOT,
+            RequestStatus.WAITING_FOR_KV_RESTORE,
         )
 
     @staticmethod
@@ -2658,6 +2690,8 @@ class Scheduler(SchedulerInterface):
         # While always the case when status is WAITING_FOR_REMOTE_KVS
         # or WAITING_FOR_STREAMING_REQ, there are such cases where it's
         # WAITING or PREEMPTED.
+        if request.status == RequestStatus.WAITING_FOR_KV_RESTORE:
+            return False
         return (
             request.num_computed_tokens > 0
             # num_computed_tokens is reset to 0 if kv transfer fails for requests in
@@ -2921,6 +2955,8 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        if self.live_kv_offloader is not None:
+            delay_free_blocks |= self.live_kv_offloader.cancel(request.request_id)
 
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
@@ -2950,6 +2986,11 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if (
+            self.live_kv_offloader is not None
+            and request.request_id in self.live_kv_offloader.records
+        ):
+            return
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -3051,6 +3092,10 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        if self.live_kv_offloader is not None and (
+            self.live_kv_offloader.records or self.live_kv_offloader.ready_resumes
+        ):
+            return False
         if reset_running_requests and self.aux_output_connector is not None:
             if self._pause_state != PauseState.PAUSED_ALL:
                 raise RuntimeError(
@@ -3369,6 +3414,13 @@ class Scheduler(SchedulerInterface):
     def _handle_blocked_waiting_request(self, request: Request) -> bool:
         """Returns True if scheduling of this request should proceed, False if
         it should be skipped for this step."""
+        if request.status in (
+            RequestStatus.WAITING_FOR_KV_SNAPSHOT,
+            RequestStatus.WAITING_FOR_KV_RESTORE,
+        ):
+            assert self.live_kv_offloader is not None
+            return self.live_kv_offloader.prepare_resume(request)
+
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             # Check whether async loading requests are finished.
             request_id = request.request_id

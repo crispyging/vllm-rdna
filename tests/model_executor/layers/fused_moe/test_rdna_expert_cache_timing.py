@@ -129,6 +129,32 @@ def test_worker_names_rank_and_quiescent_timing_control(module, monkeypatch):
     assert report["expert_misses"] == 1
     worker.rdna_expert_cache_control(transfer_timing="off")
     assert syncs == [True, True]
+    worker.rdna_expert_cache_control(overlap="on")
+    assert cache.overlap
+    reservation = cache.preload_known([1])
+    with pytest.raises(RuntimeError, match="released leases"):
+        worker.rdna_expert_cache_control(overlap="off")
+    assert cache.overlap
+    cache.cancel_preload(reservation)
+    worker.rdna_expert_cache_control(overlap="off")
+    assert not cache.overlap
+    wrapper = SimpleNamespace(
+        worker=SimpleNamespace(
+            supports_physical_page_snapshots=True,
+            _physical_page_count=8,
+            _physical_cpu_chunk_count=2,
+        ),
+        spec=SimpleNamespace(blocks_per_chunk=1),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.kv_transfer.kv_transfer_state",
+        SimpleNamespace(_KV_CONNECTOR_AGENT=SimpleNamespace(connector_worker=wrapper)),
+    )
+    layout = worker.rdna_kv_snapshot_layout()
+    assert layout["physical_page_transport"]
+    assert layout["blocks_per_chunk"] == 1
+    assert not layout["live_request_paging"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/HIP")
