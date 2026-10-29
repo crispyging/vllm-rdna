@@ -45,6 +45,13 @@ requests finished after that disconnect, post-abort PPL passed, and native cache
 reset succeeded. The 12k-word prefix probe measured 11.67 s cold versus 2.30 s
 warm TTFT. The 3k-word probe showed no benefit (3.25 s versus 3.16 s) and is
 retained as a failed timing gate. See `live-qualification/`.
-Eager coverage and the matched expert/KV budget matrix remain pending.
+The matched expert/KV matrix is complete in `budget-matrix/`: the warmed 88%
+plan changes long c8 throughput 31.20 → 31.13 output tok/s, mean TTFT
+96.18 → 79.40 s, and mean ITL 307.6 → 400.9 ms. Shorter cells regress;
+uniform96 remains the general default. `eager-live-qualification/` adds PPL 4.80,
+56 checks with zero hard failures and 28 matched-frontier spill/resumes. Combined
+eager overlap/live paging passed PPL 4.86 and 48 checks; all 802,067,884,800
+known-demand prefetch bytes were adopted, with zero unused bytes or failures.
+These are correctness receipts, not an overlap performance claim.
 Live paging uses a forced zero watermark during correctness qualification only;
 that setting is not a recommended serving default.

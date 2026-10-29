@@ -63,15 +63,19 @@ The diagnostic `post_step_checks="collective" | "wait" | "off"` control
 separates TP collective pacing from the post-step completion wait. `collective`
 is the normal guard; the other modes are solely for reproducing failures.
 
-Native-copy kernel/cache tests pass on HIP 7.14 gfx1030. A long native-copy
-MTP2 qualification hit NaN logits and remains under investigation; this backend
-and the wider K2 gate are not enabled by default.
+Native-copy kernel/cache tests pass on HIP 7.14 gfx1030. An earlier long
+native-copy MTP2 qualification hit NaN logits. The current gate of 8 passed
+TP2/MTP2 graph-mode quality and repeated 16k/1024 c8 workloads; this does not
+establish the earlier failure's root cause. The wider gate remains unqualified.
+Native copy remains opt-in. Receipts and scope are in
+`bench_results/2026-10-29-tiered-offload/`.
 
 ### Tiered-offload experiments
 
 The next implementation stages and acceptance gates are tracked in
 `docs/rdna2/tiered-offload-plan.md`. An experimental hybrid KV spill/resume implementation is present behind
-`KV_LIVE_OFFLOAD=1`; full-model qualification is pending. The default CPU KV
+`KV_LIVE_OFFLOAD=1`; graph/eager spill/resume, graph abort cleanup and combined
+eager overlap tests pass for the qualified TP2/MTP2 recipe. The default CPU KV
 tier continues to serve prefix reuse. Do not treat passing prefix-cache tests
 as qualification of live paging.
 
@@ -87,7 +91,8 @@ The V2 request slot and numerical selectors remain resident and count against
 This is whole-request spill/resume, not per-layer KV streaming. Reset is refused
 while a live snapshot or unpublished resume owns state. Insufficient CPU/GPU
 capacity leaves the ordinary scheduler and recompute path available.
-Keep this control off until hybrid resume, cancellation and quality gates pass.
+Keep this control off for ordinary launches until the workload demonstrates a
+latency/admission benefit; correctness qualification does not establish speedup.
 
 For per-layer transfer diagnostics, use the worker extension above and call
 `rdna_expert_cache_control` with `{"transfer_timing":"on"}` between workloads.
@@ -125,3 +130,8 @@ are unpublished until their transfer fence is established. No router prediction
 or extra expert pool is involved. Extra passes/map uploads may outweigh overlap;
 keep the default off until matched workloads establish a benefit. Prefetch,
 adoption, unused-byte and failure counters are included in per-layer receipts.
+
+`rdna_kv_snapshot_layout` reports native physical page/chunk counts, exact pool
+bytes and configured paging capability without synchronizing the device. CPU KV
+usage metrics measure non-evictable pins, including protected snapshots; idle
+ready entries still occupy the allocated RAM pool even when the gauge is zero.

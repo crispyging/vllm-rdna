@@ -13,8 +13,10 @@ logs confirm repeated spill/resume at nonaligned 25.9k–29k-token frontiers.
 A disconnect triggered by a host-ready spill also passed: the eight surviving
 requests completed, post-abort PPL passed and reset succeeded. Across the run,
 31 spill/resume pairs preserved frontiers; only the intentionally aborted request
-had an unpaired spill. Eager coverage and performance acceptance remain open.
-Controls remain disabled by default.
+had an unpaired spill. Eager PPL 4.80 and 56 continuation checks passed with
+28 additional equal-frontier spill/resume pairs; combined eager overlap plus
+live paging passed PPL 4.86 and 48 checks. Normal-threshold paging performance
+is a separate open measurement. Controls remain disabled by default.
 
 ## Boundary and smallest useful slice
 

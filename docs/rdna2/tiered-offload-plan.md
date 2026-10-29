@@ -70,5 +70,14 @@ separate requirement and must not be advertised before its resume gate passes.
 - [x] Reuse native CPU pool for retained, allocator-backed physical page transfers.
 - [x] Implement typed hybrid snapshots, native CPU leases and opt-in V2 live paging;
   792 regression tests pass on GPU 7.
-- [ ] Qualify complete hybrid live KV spill/resume with the full model.
-- [ ] Run matched throughput/admission matrix and publish tested defaults.
+- [x] Qualify the supported hybrid live KV configuration: graph PPL/concurrency,
+  repeated nonaligned 25k–29k-token resume, graph disconnect cleanup, eager
+  PPL/56 checks, eager prefix reuse, and combined eager overlap/48 checks.
+- [x] Run matched first/warmed four-cell matrices and retain uniform96 as the
+  general default. The 88% plan improves long c8 TTFT but not throughput and
+  worsens ITL and shorter cells; see the budget-matrix receipts.
+- [x] Finish eager live-paging and combined overlap qualification.
+- [ ] Measure normal-threshold live paging with the uniform expert budget;
+  forced-zero correctness runs do not establish its serving benefit.
+- [ ] Before promoting a nonuniform default, collect longer representative
+  prefill/decode c1/c8 traces that exercise frequency decay and retrain the plan.
