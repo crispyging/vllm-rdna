@@ -22,6 +22,8 @@ class ExpertCacheWorker:
         copy_mode: str = "",
         finite_checks: str = "",
         post_step_checks: str = "",
+        transfer_timing: str = "",
+        overlap: str = "",
     ) -> dict[str, Any]:
         """Inspect successful expert passes, optionally selecting their copy backend."""
         if copy_mode not in ("", "tensor", "native"):
@@ -30,6 +32,10 @@ class ExpertCacheWorker:
             raise ValueError("finite_checks must be on or off")
         if post_step_checks not in ("", "collective", "wait", "off"):
             raise ValueError("post_step_checks must be collective, wait or off")
+        if transfer_timing not in ("", "on", "off"):
+            raise ValueError("transfer_timing must be on or off")
+        if overlap not in ("", "on", "off"):
+            raise ValueError("overlap must be on or off")
         options = getattr(
             sys.modules.get("vllm.models.qwen4_exp.amd.mono.rdna2"), "OPTS", None
         )
@@ -45,11 +51,19 @@ class ExpertCacheWorker:
             raise RuntimeError("worker has no post-step diagnostic controls")
         caches = []
         seen = set()
-        for module in self.get_model().modules():
+        names = {}
+        model = self.get_model()
+        modules = (
+            model.named_modules()
+            if hasattr(model, "named_modules")
+            else ((str(index), module) for index, module in enumerate(model.modules()))
+        )
+        for name, module in modules:
             cache = getattr(module, "_rdna_expert_cache", None)
             if cache is not None and id(cache) not in seen:
                 seen.add(id(cache))
                 caches.append(cache)
+                names[id(cache)] = name
         if not caches:
             raise ValueError("this worker has no offloaded expert caches")
         op = None
@@ -63,13 +77,22 @@ class ExpertCacheWorker:
                 raise RuntimeError(
                     "rebuild the ROCm extension for native expert copies"
                 )
-        if copy_mode or finite_checks or post_step_checks:
-            if any(cache.policy._active is not None for cache in caches):
+        if copy_mode or finite_checks or post_step_checks or transfer_timing or overlap:
+            if any(
+                cache.policy._active is not None or cache._preload is not None
+                for cache in caches
+            ):
                 raise RuntimeError("expert-copy switching requires released leases")
             torch.accelerator.synchronize()
             if copy_mode:
                 for cache in caches:
                     cache._copy_op = op
+            if transfer_timing:
+                for cache in caches:
+                    cache.set_transfer_timing(transfer_timing == "on")
+            if overlap:
+                for cache in caches:
+                    cache.overlap = overlap == "on"
             if finite_checks:
                 # Existing debug mode: excludes this run from performance claims.
                 options.timing = finite_checks == "on"
@@ -85,7 +108,34 @@ class ExpertCacheWorker:
             )
             if not runner._mono_mtp_failstop:
                 post_mode = "off"
+        rank = getattr(
+            self, "rank", getattr(getattr(self, "model_runner", None), "rank", None)
+        )
+        layers = [
+            {
+                "module": names[id(cache)],
+                "rank": rank,
+                "expert_bytes": cache._expert_bytes,
+                "map_bytes": cache.slot_map.numel() * cache.slot_map.element_size(),
+                "slots": cache.slot_count,
+                "overlap": cache.overlap,
+                "prefetch_bytes": cache.prefetch_bytes,
+                "adopted_prefetch_bytes": cache.adopted_prefetch_bytes,
+                "unused_prefetch_bytes": cache.unused_prefetch_bytes,
+                "prefetch_failures": cache.prefetch_failures,
+                "expert_demands": cache.expert_demands,
+                "expert_misses": cache.expert_misses,
+                "committed_passes": cache.committed_passes,
+                "copied_bytes": cache.copied_bytes,
+                "map_uploads": cache.map_uploads,
+                "native_copy_calls": cache.native_copy_calls,
+                "batch_copy_calls": cache.batch_copy_calls,
+                "transfer_timing": cache.transfer_timing(),
+            }
+            for cache in caches
+        ]
         return {
+            "layers": layers,
             "caches": len(caches),
             "debug_timing": None if options is None else bool(options.timing),
             "post_step_checks": post_mode,

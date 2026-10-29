@@ -24,7 +24,19 @@ KV_OFFLOAD_GB=${KV_OFFLOAD_GB:-16}
 [[ $DECAY =~ ^[0-9]+$ && $DECAY -ge 1 ]] || exit 2
 [[ $POLICY == lfu_lru || $POLICY == lru ]] || exit 2
 [[ $KV_OFFLOAD_GB =~ ^[0-9]+([.][0-9]+)?$ ]] || exit 2
-KNOBS="{\"rocm_mono_decode\":{\"expert_cache_slots\":$SLOTS,\"expert_cache_policy\":\"$POLICY\",\"expert_cache_decay\":$DECAY${MONO_CFG:+,$MONO_CFG}}}"
+PLAN_CFG=
+if [[ -n ${SLOT_PLAN:-} ]]; then
+    # -S avoids loading the runtime's HIP-initializing sitecustomize.
+    PLAN_CFG=$("$VENV/bin/python" -S -c '
+import json, sys
+with open(sys.argv[1]) as source:
+    plan = json.load(source)["layer_slots"]
+if not isinstance(plan, dict) or not plan:
+    raise ValueError("SLOT_PLAN requires nonempty layer_slots")
+print(",\"expert_cache_slot_plan\":" + json.dumps(plan, separators=(",", ":")))
+' "$SLOT_PLAN")
+fi
+KNOBS="{\"rocm_mono_decode\":{\"expert_cache_slots\":$SLOTS,\"expert_cache_policy\":\"$POLICY\",\"expert_cache_decay\":$DECAY$PLAN_CFG${MONO_CFG:+,$MONO_CFG}}}"
 export EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--monokernel --additional-config $KNOBS"
 if [[ ! $KV_OFFLOAD_GB =~ ^0+([.]0+)?$ ]]; then
     export EXTRA_ARGS="$EXTRA_ARGS --kv-offloading-size $KV_OFFLOAD_GB --kv-offloading-backend native"

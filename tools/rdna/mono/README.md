@@ -66,3 +66,45 @@ is the normal guard; the other modes are solely for reproducing failures.
 Native-copy kernel/cache tests pass on HIP 7.14 gfx1030. A long native-copy
 MTP2 qualification hit NaN logits and remains under investigation; this backend
 and the wider K2 gate are not enabled by default.
+
+### Tiered-offload experiments
+
+The next implementation stages and acceptance gates are tracked in
+`docs/rdna2/tiered-offload-plan.md`. Active hybrid KV spill/resume is **not yet
+implemented**: the CPU KV tier still serves prefix reuse. The CPU manager's
+retained-chunk leases are groundwork for safe snapshots, not live paging.
+
+For per-layer transfer diagnostics, use the worker extension above and call
+`rdna_expert_cache_control` with `{"transfer_timing":"on"}` between workloads.
+The `layers` receipts report capacities, exact payload/map bytes, demands,
+misses, copy bytes, and separated timing intervals. Turn timing off before
+clean performance runs. GPU intervals include scheduling/enqueue gaps and are
+not pure DMA service time. Timing records are bounded; inspect dropped samples.
+
+`VLLM_RDNA_EXPERT_ROUTE_DIR=/persistent/path` enables lightweight route receipts
+from routing IDs already on the CPU. `VLLM_RDNA_EXPERT_ROUTE_MAX_CALLS=128`
+bounds invocations per rank/layer/phase. Prefill and decode have separate streams;
+metadata-free profiling and graph recording are excluded. Collection writes
+files and is diagnostic: do not use it for final latency claims.
+
+`tools/rdna/mono/sweep_offload_policy.py` accepts these receipts, with
+`--phase decode` or `--phase prefill` when needed. `--plan-profile profile.json`
+and `--plan-output plan.json` enable deterministic nonuniform slot planning.
+The profile contains `rank_budgets` in GPU bytes and `layers` with rank, layer,
+`expert_bytes`, optional `map_bytes`, min/max capacities and candidate capacities.
+Every traced layer needs a profile; fixed map bytes count against each rank's
+budget. This is an empty-cache replay heuristic, not a claim of global optimality
+or a prediction of end-to-end latency. `objective_weight` may represent measured
+transfer cost, but an arbitrary weight is not a measured speedup.
+
+Launch with `SLOT_PLAN=/path/plan.json` to consume its `layer_slots` map. Every
+loaded expert layer must have a capacity for its rank, including any offloaded
+MTP layers; missing entries fail startup. Allocation occurs once before capture.
+Without a plan, `SLOTS=96` retains uniform allocation.
+
+`MONO_CFG='"expert_cache_overlap":true'` opts into resident-hit-first execution
+while copying known misses to disjoint slots in the same GPU pool. Reservations
+are unpublished until their transfer fence is established. No router prediction
+or extra expert pool is involved. Extra passes/map uploads may outweigh overlap;
+keep the default off until matched workloads establish a benefit. Prefetch,
+adoption, unused-byte and failure counters are included in per-layer receipts.

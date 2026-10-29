@@ -1561,3 +1561,140 @@ def test_request_key_positions_order_tails_across_kv_groups():
     output = manager.prepare_store(to_keys([10, 11]), make_req_context("evict"))
     assert output is not None
     assert set(output.evicted_keys) == {group_0_tail, group_1_tail}
+
+
+@pytest.fixture(params=["lru", "arc"])
+def lease_manager(request):
+    """A full two-chunk cache for exercising persistent ownership under pressure."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy=request.param)
+    context = make_req_context("producer")
+    manager.prepare_store(to_keys([1, 2]), context)
+    manager.complete_store(to_keys([1, 2]), context)
+    manager.on_request_finished(context)
+    return manager
+
+
+def test_cpu_chunk_lease_protects_only_retained_chunks_under_pressure(lease_manager):
+    manager = lease_manager
+    lease = manager.retain_ready_chunks(to_keys([1]))
+    replacement = manager.prepare_store(to_keys([3]), make_req_context("replacement"))
+    assert replacement is not None
+    assert replacement.evicted_keys == to_keys([2])
+    manager.complete_store(to_keys([3]), make_req_context("replacement"))
+    other = manager.retain_ready_chunks(to_keys([3]))
+
+    assert manager.prepare_store(to_keys([4]), make_req_context("blocked")) is None
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) == LookupResult.HIT
+    assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) == LookupResult.HIT
+    assert manager.release_lease(lease)
+    replacement = manager.prepare_store(to_keys([4]), make_req_context("unblocked"))
+    assert replacement is not None
+    assert replacement.evicted_keys == to_keys([1])
+    assert manager.release_lease(other)
+
+
+def test_cpu_chunk_lease_deduplicates_and_composes_with_loads(lease_manager):
+    manager = lease_manager
+    chunk = manager._policy.get(to_key(1))
+    assert chunk is not None
+    first = manager.retain_ready_chunks(to_keys([1, 1]))
+    assert chunk.ref_cnt == 1
+    second = manager.retain_ready_chunks(to_keys([1]))
+    assert chunk.ref_cnt == 2
+    manager.prepare_load(to_keys([1]), make_req_context("reader"))
+    assert chunk.ref_cnt == 3
+    manager.complete_load(to_keys([1]), make_req_context("reader"))
+    assert chunk.ref_cnt == 2
+    assert manager.release_lease(first)
+    assert chunk.ref_cnt == 1
+    assert not manager.release_lease(first)
+    assert chunk.ref_cnt == 1
+    assert manager.release_lease(second)
+    assert chunk.ref_cnt == 0
+    assert manager._num_evictable_cache_chunks == 2
+
+
+def test_cpu_chunk_lease_release_keeps_inflight_load_pinned(lease_manager):
+    manager = lease_manager
+    lease = manager.retain_ready_chunks(to_keys([1]))
+    manager.prepare_load(to_keys([1]), make_req_context("reader"))
+    assert manager.release_lease(lease)
+    chunk = manager._policy.get(to_key(1))
+    assert chunk is not None and chunk.ref_cnt == 1
+    manager.prepare_load(to_keys([2]), make_req_context("other-reader"))
+    assert manager.prepare_store(to_keys([3]), make_req_context("blocked")) is None
+    manager.complete_load(to_keys([1]), make_req_context("reader"))
+    replacement = manager.prepare_store(to_keys([3]), make_req_context("unblocked"))
+    assert replacement is not None
+    assert replacement.evicted_keys == to_keys([1])
+    manager.complete_load(to_keys([2]), make_req_context("other-reader"))
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+@pytest.mark.parametrize("invalid", [[1, 2], [1, 99], []])
+def test_cpu_chunk_lease_invalid_reservation_is_atomic(policy, invalid):
+    manager = make_cpu_manager(num_chunks=2, cache_policy=policy)
+    manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    ready = manager._policy.get(to_key(1))
+    pending = manager._policy.get(to_key(2))
+    assert ready is not None and pending is not None
+
+    with pytest.raises(ValueError, match="lease requires|missing or pending"):
+        manager.retain_ready_chunks(to_keys(invalid))
+    assert ready.ref_cnt == 0
+    assert pending.ref_cnt == -1
+    assert manager._num_evictable_cache_chunks == 1
+    assert not manager._leases
+
+
+def test_cpu_chunk_lease_rejects_foreign_manager(lease_manager):
+    manager = lease_manager
+    lease = manager.retain_ready_chunks(to_keys([1]))
+    other = make_cpu_manager(num_chunks=2)
+    other.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    other.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    own_lease = other.retain_ready_chunks(to_keys([1]))
+    with pytest.raises(ValueError, match="another manager or generation"):
+        other.release_lease(lease)
+    chunk = other._policy.get(to_key(1))
+    assert chunk is not None and chunk.ref_cnt == 1
+    assert other.release_lease(own_lease)
+    assert manager.release_lease(lease)
+
+
+def test_cpu_chunk_lease_rejects_reset_without_mutating_cache(lease_manager):
+    manager = lease_manager
+    lease = manager.retain_ready_chunks(to_keys([1]))
+    generation = manager._cache_generation
+    chunk = manager._policy.get(to_key(1))
+    with pytest.raises(RuntimeError, match="chunk leases are retained"):
+        manager.reset_cache()
+    assert manager._cache_generation == generation
+    assert manager._policy.get(to_key(1)) is chunk
+    assert chunk is not None and chunk.ref_cnt == 1
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) == LookupResult.HIT
+
+    assert manager.release_lease(lease)
+    manager.reset_cache()
+    manager.prepare_store(to_keys([3]), make_req_context("new-generation"))
+    manager.complete_store(to_keys([3]), make_req_context("new-generation"))
+    current = manager.retain_ready_chunks(to_keys([3]))
+    with pytest.raises(ValueError, match="another manager or generation"):
+        manager.release_lease(lease)
+    chunk = manager._policy.get(to_key(3))
+    assert chunk is not None and chunk.ref_cnt == 1
+    assert manager.release_lease(current)
+
+
+def test_cpu_chunk_lease_does_not_change_replacement_recency(lease_manager):
+    manager = lease_manager
+    # Request finalization makes the prefix head (1) newer than its tail (2).
+    lease = manager.retain_ready_chunks(to_keys([2]))
+    assert manager.release_lease(lease)
+    replacement = manager.prepare_store(to_keys([3]), make_req_context("replacement"))
+    assert replacement is not None
+    assert replacement.evicted_keys == to_keys([2])
+    if isinstance(manager._policy, ARCCachePolicy):
+        assert to_key(1) in manager._policy.t1
+        assert not manager._policy.t2
