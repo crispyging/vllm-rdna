@@ -152,7 +152,8 @@ def test_rdna2_moe_matches_dequant_reference(symmetric, num_tokens):
 
 
 @needs_rdna2
-def test_rdna2_ct_expert_cache_matches_resident_across_overflow_and_streams():
+@pytest.mark.parametrize("copy_mode", ["tensor", "native"])
+def test_rdna2_ct_expert_cache_matches_resident_across_overflow_and_streams(copy_mode):
     """Real CT packing and HIP execution retain every routed pair under churn."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.rdna_expert_cache import PAYLOAD_NAMES
@@ -196,6 +197,7 @@ def test_rdna2_ct_expert_cache_matches_resident_across_overflow_and_streams():
     pooled._rdna_expert_cache_device = device
     pooled._rdna_expert_cache_policy = "lfu_lru"
     pooled._rdna_expert_cache_decay = 128
+    pooled._rdna_expert_cache_copy = copy_mode
     method.process_weights_after_loading(pooled)
     cache = pooled._rdna_expert_cache
     for name in PAYLOAD_NAMES:

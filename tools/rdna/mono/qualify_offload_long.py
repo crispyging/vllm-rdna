@@ -34,6 +34,10 @@ COUNTERS = (
     "vllm:kv_offload_store_bytes",
     "vllm:kv_offload_load_time",
     "vllm:kv_offload_store_time",
+    "vllm:external_prefix_cache_queries",
+    "vllm:external_prefix_cache_hits",
+    "vllm:prefix_cache_queries",
+    "vllm:prefix_cache_hits",
 )
 
 
@@ -108,7 +112,7 @@ class MetricSamples:
         self.sample()
         self.path.write_text("\n".join(json.dumps(row) for row in self.rows) + "\n")
 
-    def summary(self):
+    def summary(self, require_boundary_counters=True):
         if len(self.rows) < 2 or any(
             "metrics" not in row for row in (self.rows[0], self.rows[-1])
         ):
@@ -124,7 +128,9 @@ class MetricSamples:
         for key in COUNTERS:
             name = key + "_total" if key + "_total" in before else key
             if name not in before or name not in after:
-                if key in required:
+                if key in required and (
+                    require_boundary_counters or key == "vllm:num_preemptions"
+                ):
                     raise RuntimeError(f"required boundary counter unavailable: {key}")
                 delta[key] = None
                 continue
@@ -230,6 +236,10 @@ def bench(args, cell, seed):
         name + ".json",
         "--disable-tqdm",
     ]
+    if getattr(args, "skip_ready_check", False):
+        # The same-server A/B already checks worker readiness via RPC. Avoid
+        # an unmeasured full request warming prefix/expert state in each arm.
+        command.extend(["--ready-check-timeout-sec", "0"])
     result_path = args.out / f"{name}.json"
     result_path.unlink(
         missing_ok=True
@@ -258,7 +268,9 @@ def bench(args, cell, seed):
         "actual_output_tokens": result.get("output_lens"),
         "headline": formatter.line(str(args.out / f"{name}.json")),
         "output_quality_warnings": warnings,
-        **samples.summary(),
+        **samples.summary(
+            require_boundary_counters=not getattr(args, "optional_kv_counters", False)
+        ),
     }
 
 

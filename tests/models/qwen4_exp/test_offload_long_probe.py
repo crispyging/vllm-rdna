@@ -3,7 +3,10 @@
 """Failure gates and metric semantics of the standalone long-workload client."""
 
 import importlib.util
+import io
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -12,6 +15,55 @@ _SPEC = importlib.util.spec_from_file_location("offload_long_probe", _PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _PROBE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_PROBE)
+
+
+def test_copy_benchmark_resets_external_prefix_and_retries_unreleased_blocks(
+    monkeypatch,
+):
+    copy_probe = _PROBE.load_tool(
+        "copy_reset_probe", "tools/rdna/mono/qualify_expert_copy.py"
+    )
+    requests = []
+    responses = iter((b'{"success":false}', b'{"success":true}'))
+
+    class Response(io.BytesIO):
+        status = 200
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return Response(next(responses))
+
+    monkeypatch.setattr(copy_probe.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(copy_probe.time, "sleep", lambda _: None)
+    copy_probe.reset_prefix(SimpleNamespace(base_url="http://unused"))
+    assert len(requests) == 2
+    assert all(r.method == "POST" for r in requests)
+    assert all(
+        parse_qs(urlsplit(r.full_url).query) == {"reset_external": ["true"]}
+        for r in requests
+    )
+
+
+@pytest.mark.parametrize("hits", [0, 128, None])
+@pytest.mark.parametrize(
+    "name", ["vllm:prefix_cache_hits", "vllm:external_prefix_cache_hits"]
+)
+def test_copy_benchmark_cannot_accept_warm_or_unverified_prefixes(name, hits):
+    copy_probe = _PROBE.load_tool(
+        "copy_counter_probe", "tools/rdna/mono/qualify_expert_copy.py"
+    )
+    result = {
+        "counter_deltas": {
+            "vllm:prefix_cache_hits": 0,
+            "vllm:external_prefix_cache_hits": 0,
+        }
+    }
+    result["counter_deltas"][name] = hits
+    if hits == 0:
+        copy_probe.check_cold_prefix(result)
+    else:
+        with pytest.raises(RuntimeError, match="cold-prefix benchmark"):
+            copy_probe.check_cold_prefix(result)
 
 
 def test_metric_parser_sums_labeled_transfers_but_preserves_peak_occupancy():
@@ -177,6 +229,11 @@ def test_missing_real_boundary_or_transfer_metrics_fail(tmp_path, missing):
         del samples.rows[-1]["metrics"][key]
     with pytest.raises(RuntimeError, match="boundary|before/after"):
         samples.summary()
+    if missing in ("load_counter", "store_counter"):
+        # Expert-copy qualification does not require KV restoration, and must
+        # report an unexported transfer counter as unavailable rather than zero.
+        result = samples.summary(require_boundary_counters=False)
+        assert result["counter_deltas"][key.removesuffix("_total")] is None
 
 
 @pytest.mark.parametrize("length", [16000, 17000, 32700])

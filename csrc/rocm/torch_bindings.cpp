@@ -1,6 +1,11 @@
 #include "core/registration.h"
 #include "rocm/ops.h"
 
+bool rdna2_expert_cache_copy(const std::vector<torch::Tensor>&,
+                             const std::vector<torch::Tensor>&,
+                             const std::vector<int64_t>&,
+                             const std::vector<int64_t>&);
+
 void moe_fixedpoint_to_half_rdna2(const torch::Tensor&, torch::Tensor&);
 
 void mono_k2_offload_rdna2(
@@ -24,6 +29,12 @@ void mono_k2_offload_rdna2(
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
+  rocm_ops.def(
+      "rdna2_expert_cache_copy(Tensor[] sources, Tensor(a!)[] destinations, "
+      "int[] experts, int[] slots) -> bool");
+  rocm_ops.impl("rdna2_expert_cache_copy", torch::kCUDA,
+                &rdna2_expert_cache_copy);
+
   // vLLM custom ops for rocm
 
 // skinny_gemms.cu (LLMM1/wvSplitK/wvSplitKrc/wvSplitKQ) is excluded on gfx1250

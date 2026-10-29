@@ -39,6 +39,7 @@ class Options:
     expert_cache_slots: int = 0  # per-layer GPU expert capacity; 0: resident
     expert_cache_policy: str = "lfu_lru"
     expert_cache_decay: int = 128
+    expert_cache_copy: str = "tensor"  # opt-in native batched HIP submissions
 
     @classmethod
     def from_dict(cls, extra: dict) -> "Options":
@@ -63,6 +64,8 @@ class Options:
             raise ValueError("--monokernel: expert_cache_policy must be lfu_lru or lru")
         if opts.expert_cache_decay <= 0:
             raise ValueError("--monokernel: expert_cache_decay must be positive")
+        if opts.expert_cache_copy not in ("tensor", "native"):
+            raise ValueError("--monokernel: expert_cache_copy must be tensor or native")
         return opts
 
     def assign(self, other: "Options") -> None:

@@ -836,7 +836,9 @@ def test_gdn_fused_matches_today(layout, spec, M, sig):
         assert bool((y[~valid] == 0).all())
     assert (conv[1:].float() - conv_r[1:].float()).abs().max().item() < 1e-3
     assert (ssm[1:] - ssm_r[1:]).abs().max().item() < 1e-3
-    assert bool((scratch[: 64 * (GHV * 12 + GH * 4)] == 0).all())  # counters reset
+    # FP32 partial sums are overwritten on each call; arrival counters reset.
+    counters = scratch[64 * GHV * 16 : 64 * (GHV * 20 + GH * 4)]
+    assert bool((counters == 0).all())
     repeated = (y.clone(), conv.clone(), ssm.clone())
     for repeat in range(8):
         conv.copy_(conv_initial)

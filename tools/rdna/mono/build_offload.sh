@@ -50,7 +50,11 @@ schemas = [str(schema) for schema in torch._C._jit_get_all_schemas()]
 rocm = [schema for schema in schemas if schema.startswith("_rocm_C::")]
 assert sum("rdna" in schema for schema in rocm) > 10, rocm
 assert any("all_reduce" in schema for schema in rocm), rocm
-for name in ("mono_k2_offload_rdna2", "moe_fixedpoint_to_half_rdna2"):
+for name in (
+    "mono_k2_offload_rdna2",
+    "moe_fixedpoint_to_half_rdna2",
+    "rdna2_expert_cache_copy",
+):
     assert hasattr(torch.ops._rocm_C, name), name
 for name, argument in (
     ("gptq_gemm_rdna2", "deterministic"),

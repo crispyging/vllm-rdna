@@ -14,6 +14,7 @@ Installed into the shared GDN layer through ``qwen_gdn_linear_attn.MONO_GDN_HOOK
 """
 
 import functools
+import os
 from typing import cast
 
 import torch
@@ -89,6 +90,16 @@ class MonoGDN:
                 H,
                 1 if layer.norm.activation == "sigmoid" else 0,
             )
+            if os.environ.get("VLLM_RDNA_GDN_DIAGNOSTICS") == "1":
+                logger.info(
+                    "RDNA_GDN_DIAG layer=%s scratch=%s bytes=%d "
+                    "kinds=1:bad_nacc,2:prior_conv,3:input,4:prior_ssm,"
+                    "5:gating_input,6:conv_output,7:recurrent_fp32,"
+                    "8:fp16_overflow,9:norm_output",
+                    layer.prefix,
+                    hex(self.cache[4].data_ptr()),
+                    nbytes,
+                )
         return self.cache
 
     def eligible(self, md: GDNAttentionMetadata, qkvz: torch.Tensor) -> bool:

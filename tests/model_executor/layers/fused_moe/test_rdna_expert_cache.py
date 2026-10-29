@@ -130,6 +130,11 @@ def test_hit_has_no_payload_copy_and_map_excludes_inactive_residents(cache_modul
     third = cache.ensure([5])
     assert cache.map_uploads == maps
     cache.release(third)
+    assert (cache.expert_demands, cache.expert_misses, cache.committed_passes) == (
+        4,
+        2,
+        3,
+    )
 
 
 def test_global_local_slot_mapping_preserves_padding_and_pass_coverage(cache_module):
@@ -304,27 +309,133 @@ def test_loading_context_rejects_unsupported_expert_contracts(
     assert vars(layer) == {}
 
 
+@pytest.mark.parametrize("copy_mode", ["tensor", "native"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/HIP")
-def test_device_slot_reuse_waits_for_previous_consumer(cache_module):
+def test_device_slot_reuse_waits_for_previous_consumer(cache_module, copy_mode):
+    if copy_mode == "native":
+        if torch.version.hip is None:
+            pytest.skip("native expert copies require HIP")
+        import vllm._custom_ops  # noqa: F401
+
     bank = _bank(cache_module, 4)
-    cache = cache_module.PackedExpertCache(bank, 1, "cuda")
+    bank = {
+        name: value.half() if "scale" in name else value for name, value in bank.items()
+    }
+    cache = cache_module.PackedExpertCache(bank, 1, "cuda", copy_mode=copy_mode)
     assert all(t.is_pinned() for t in cache.host_payload.values())
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
     copies = []
     maps = []
     pointers = {name: t.data_ptr() for name, t in cache.payload.items()}
-    experts = (0, 1, 3, 0, 2, 1)
+    experts = (0, 1, 3, 0, 2, 1, 1)
     for index, expert in enumerate(experts):
         with torch.cuda.stream(streams[index % 2]):
             lease = cache.ensure([expert])
-            copies.append(cache.payload[cache_module.PAYLOAD_NAMES[0]][0].clone())
+            copies.append(
+                {name: value[0].clone() for name, value in cache.payload.items()}
+            )
             maps.append(cache.slot_map.clone())
             cache.release(lease)
     for stream in streams:
         stream.synchronize()
     for result, mapping, expert in zip(copies, maps, experts, strict=True):
-        assert torch.equal(result.cpu(), bank[cache_module.PAYLOAD_NAMES[0]][expert])
+        for name, value in result.items():
+            assert torch.equal(value.cpu(), bank[name][expert])
         expected = torch.full((4,), -1, dtype=torch.int32)
         expected[expert] = 0
         assert torch.equal(mapping.cpu(), expected)
     assert {name: t.data_ptr() for name, t in cache.payload.items()} == pointers
+    assert cache.native_copy_calls == (6 if copy_mode == "native" else 0)
+    assert 0 <= cache.batch_copy_calls <= cache.native_copy_calls
+
+
+@pytest.mark.parametrize("copy_mode", ["unknown", "native"])
+def test_cpu_cache_rejects_unsupported_copy_modes(cache_module, copy_mode):
+    with pytest.raises(ValueError):
+        cache_module.PackedExpertCache(
+            _bank(cache_module, 4), 1, "cpu", copy_mode=copy_mode
+        )
+
+
+def test_worker_copy_control_requires_quiescence_and_keeps_pool_storage(
+    cache_module, monkeypatch
+):
+    root = Path(__file__).resolve().parents[4]
+    spec = importlib.util.spec_from_file_location(
+        "expert_cache_worker_test", root / "tools/rdna/mono/expert_cache_worker.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cache = cache_module.PackedExpertCache(_bank(cache_module, 4), 2, "cpu")
+    cached_module = SimpleNamespace(_rdna_expert_cache=cache)
+    model = SimpleNamespace(modules=lambda: [cached_module, cached_module])
+    worker = module.ExpertCacheWorker()
+    worker.get_model = lambda: model
+    synchronizations = []
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda: synchronizations.append(True)
+    )
+    pointers = {name: value.data_ptr() for name, value in cache.payload.items()}
+    lease = cache.ensure([0, 1])
+    with pytest.raises(RuntimeError, match="released leases"):
+        worker.rdna_expert_cache_control("tensor")
+    assert not synchronizations
+    cache.release(lease)
+    result = worker.rdna_expert_cache_control("tensor")
+    assert result["caches"] == 1
+    assert result["expert_demands"] == result["expert_misses"] == 2
+    assert result["copy_modes"] == ["tensor"]
+    assert synchronizations == [True]
+    assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
+    assert cache.policy.mapping == {0: 0, 1: 1}
+    options = SimpleNamespace(timing=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.models.qwen4_exp.amd.mono.rdna2",
+        SimpleNamespace(OPTS=options),
+    )
+    result = worker.rdna_expert_cache_control(finite_checks="on")
+    assert result["debug_timing"] is options.timing is True
+    assert cache.policy.mapping == {0: 0, 1: 1}
+    assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
+    worker.rdna_expert_cache_control(finite_checks="off")
+    assert options.timing is False
+    worker.model_runner = SimpleNamespace(_mono_mtp_failstop=True)
+    failstop = SimpleNamespace(_USE_TP_COLLECTIVE=True)
+    monkeypatch.setitem(
+        sys.modules, "vllm.models.qwen4_exp.amd.mono.rdna2.failstop", failstop
+    )
+    for mode in ("wait", "off", "collective"):
+        result = worker.rdna_expert_cache_control(post_step_checks=mode)
+        assert result["post_step_checks"] == mode
+        assert worker.model_runner._mono_mtp_failstop is (mode != "off")
+        assert failstop._USE_TP_COLLECTIVE is (mode != "wait")
+    assert pointers == {name: value.data_ptr() for name, value in cache.payload.items()}
+
+
+@pytest.mark.skipif(
+    not torch.version.hip or not torch.cuda.is_available(), reason="requires HIP"
+)
+@pytest.mark.parametrize("invalid", ["source", "slot", "duplicate", "shape"])
+def test_native_copy_validates_entire_pass_before_writing(cache_module, invalid):
+    import vllm._custom_ops  # noqa: F401
+
+    cache = cache_module.PackedExpertCache(_bank(cache_module, 4), 2, "cuda")
+    for payload in cache.payload.values():
+        payload.fill_(-1)
+    sources = list(cache.host_payload.values())
+    destinations = list(cache.payload.values())
+    experts, slots = [0, 1], [0, 1]
+    if invalid == "source":
+        experts[-1] = 4
+    elif invalid == "slot":
+        slots[-1] = 2
+    elif invalid == "duplicate":
+        slots[-1] = 0
+    else:
+        destinations[-1] = torch.empty((2, 2, 4), dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError):
+        torch.ops._rocm_C.rdna2_expert_cache_copy(sources, destinations, experts, slots)
+    torch.accelerator.synchronize()
+    assert all(payload.eq(-1).all().item() for payload in cache.payload.values())

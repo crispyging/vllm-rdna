@@ -63,6 +63,7 @@ def test_options_preserve_offload_capacity_and_policy(options, slots, policy):
         ({"expert_cache_decay": -1}, "positive"),
         ({"expert_cache_decay": False}, "integer"),
         ({"expert_cache_decay": 1.5}, "integer"),
+        ({"expert_cache_copy": "unknown"}, "expert_cache_copy"),
         ({"expert_cache_slot": 32}, "unknown"),
     ],
 )
@@ -75,6 +76,7 @@ def test_options_reject_unsafe_or_misspelled_pool_configuration(
 
 def test_offload_remains_disabled_by_default(options):
     assert options.from_dict({}).expert_cache_slots == 0
+    assert options.from_dict({}).expert_cache_copy == "tensor"
 
 
 @pytest.mark.parametrize(
@@ -708,7 +710,7 @@ def _assert_independent_tp2(torch, helper, layer, inputs, buffers, base):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("rows", [1, 3, 8, 12, 24])
 def test_split_k2_eviction_passes_match_full_payload(native_case, rows):
     torch, helper, layer, local_experts = native_case
     base = 512 - local_experts  # Exercise nonzero rank-local ownership offsets.
@@ -728,11 +730,12 @@ def test_split_k2_eviction_passes_match_full_payload(native_case, rows):
         _assert_independent_tp2(torch, helper, layer, inputs, buffers, base)
 
 
-def test_split_stage_graphs_read_new_routes_and_slot_contents(native_case):
+@pytest.mark.parametrize("rows", [3, 12, 24])
+def test_split_stage_graphs_read_new_routes_and_slot_contents(native_case, rows):
     torch, helper, layer, local_experts = native_case
     base = 512 - local_experts
-    inputs = helper._inputs(3, 601)
-    buffers = _buffers(torch, helper, layer, 3, 3, local_experts)
+    inputs = helper._inputs(rows, 601)
+    buffers = _buffers(torch, helper, layer, rows, 3, local_experts)
     # Warm specialization and buffers before capturing each fixed-shape stage.
     for stage in (1, 2, 3):
         _stage(torch, layer, inputs, buffers, stage, base)
@@ -757,7 +760,7 @@ def test_split_stage_graphs_read_new_routes_and_slot_contents(native_case):
     prior_routes = None
     changed = False
     for seed in (602, 603, 602):
-        for destination, source in zip(inputs, helper._inputs(3, seed)):
+        for destination, source in zip(inputs, helper._inputs(rows, seed)):
             destination.copy_(source)
         expected = _full_reference(torch, helper, layer, inputs, local_experts, base)
         graphs[1].replay()
