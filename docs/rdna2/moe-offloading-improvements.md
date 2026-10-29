@@ -1,14 +1,58 @@
-# RDNA2 MoE offloading improvement backlog
+# RDNA2 MoE offloading: first optimization pass
 
-This draft tracks follow-up work after #146. The default copy backend and pool
-budgets are unchanged; an opt-in native copy backend is under qualification.
+This first pass follows #146. The default copy backend and pool
+budgets are unchanged; native batching remains explicitly selectable.
 The existing post-step fault check now also monitors the model-offload workspace.
 The qualified baseline and receipts live in `moe-offloading-target.md` and
 `bench_results/2026-10-28-moe-offload/`.
 
-The long native-copy MTP2 test subsequently failed with NaN logits at 810/1024
-output tokens. The default remains tensor copies and this optimization is not
-fully qualified; native-copy causality has not been established.
+Changing active expert sets now updates the existing pinned int32 slot map
+through a persistent zero-copy NumPy view. This removes scalar Tensor dispatch
+without changing the map address or the previous-upload completion fence.
+On the build server, matched CPU `PackedExpertCache.ensure/release` hit-only
+passes with changing active sets took 42.23 → 34.62 µs for one expert,
+83.42 → 37.73 µs for ten, 178.81 → 43.31 µs for 32, and
+317.51 → 51.18 µs for 64 (ABBA, 30 samples per arm). These are CPU control-path
+measurements, excluding GPU event and DMA time; they do not predict model speedup.
+All 147 focused GPU tests passed, including real CT overflow and cross-stream
+parity for both copy backends. The reproducible benchmark and receipts live in
+`bench_results/2026-10-29-moe-offload-first-pass/`.
+
+## First-pass serving results
+
+The final graph run used TP2/MTP2 Flash-Next AWQ text serving on GPUs 6–7,
+FULL_AND_PIECEWISE segmented graphs, 96 expert slots per layer, and CPU KV
+offloading enabled. Both backends passed greedy, PPL (native 4.82 / tensor 4.83),
+prefix reuse and 48 normal-EOS concurrency checks each with zero hard failures.
+The 16-arm ABBA matrix completed 72 forced-length requests and 55,296 output
+tokens; every request reached its exact length. Post-load greedy checks passed
+with zero numeric or new GPU fault markers.
+
+Eager mode (`enforce_eager=True`, graph mode NONE) also passed greedy, PPL 4.84,
+prefix reuse, 48 normal-EOS concurrency checks with zero hard failures, the
+1k/512 and 16k/1k c1 native-copy workloads, and post-load greedy checks. Both
+workloads reached their exact output lengths; no numeric or GPU fault markers
+were observed. All new qualification used only GPUs 6–7.
+
+Both GPU and external CPU prefixes are now reset before each measured arm.
+The client rejects warm or unavailable hit counters; all measured arms had
+zero prefix hits. Expert residency remains order-dependent and MTP acceptance
+varies, so these are model observations rather than a causal backend speedup.
+Full prefill/decode/TTFT/ITL ranges and transfer counters are retained in
+`graph-performance-summary.txt`, `graph-performance-summary.json`, and
+`graphs-cold/copy-abba/qualification.json` under the first-pass receipts.
+
+At 16k/c1, native TTFT was 16.06–16.12 s versus tensor 17.10–17.66 s.
+At 16k/c8, aggregate output was 31.91–32.63 tok/s native versus
+24.17–25.10 tensor. Short c1 decode was mixed, with substantially different MTP
+acceptance. The default remains tensor; there is no across-the-board speedup
+claim. Pool budgets and the K2 gate stay unchanged.
+
+## Earlier diagnostic history
+
+An earlier long native-copy MTP2 test failed with NaN logits at 810/1024 output
+tokens. Its cause has not been causally attributed to native copies or the GDN
+defect below. The failing receipt remains preserved alongside subsequent passes.
 
 With CPU KV disabled and per-layer finite checks enabled, the subsequent tensor
 and native 16k/c1 arms both completed all 1024 tokens without NaNs. These two
@@ -42,7 +86,7 @@ or qualify a causal model-level copy-backend speedup.
 one C++ call. HIP 7.14+ uses `hipMemcpyBatchAsync` when the loaded runtime exports
 it; the fallback submits individual copies inside C++. It preserves all six SoA
 payload pools, graph addresses, the pinned CPU bank and consumer-stream fencing.
-The default remains `"tensor"` until full-model A/B and quality gates finish.
+The default remains `"tensor"`; native batching is an opt-in tested on HIP 7.14.
 Older-HIP fallback has not received runtime qualification.
 
 Focused validation: 73 local tests passed (25 GPU-dependent skips), and 29
@@ -55,15 +99,15 @@ The optional development worker extension reports per-rank pass demands, misses,
 bytes and native/batch submission counts. Its quiescent backend switch permits
 same-process A/B with retained expert residency and captured compute graphs.
 `python -m tools.rdna.mono.qualify_expert_copy` alternates arms and records these
-counters alongside latency and throughput. Prefix state resets between cells;
+counters alongside latency and throughput. Both prefix tiers reset between cells;
 expert-cache histories remain order-dependent, so alternating repeats are needed.
-No model-level native-copy speedup is claimed yet.
+No causal model-level native-copy speedup is claimed.
 
 The integrated extension subsequently passed all 119 focused GPU tests without
 skips. Full TP2 native-copy greedy, PPL (4.78), prefix-cache and concurrency
 (48 checks, zero hard failures) gates passed with zero GPU faults. The first
 performance hook stopped on an unexported KV-load metric, and its client gate
-was fixed without engine changes; the replacement same-process A/B is pending.
+was fixed without engine changes. The final cold-prefix matrix is described above.
 
 The matched gate-8/gate-24 serving experiment completed all four cells and
 quality gates without GPU faults. Gate 24 changed aggregate output throughput
@@ -96,14 +140,14 @@ Measured 16k/1k aggregate output throughput is 19.767 tok/s at c=1 and
 identify a scaling limitation, not its causal attribution. Hosted CI was
 skipped; focused local and dedicated GPU validation passed for #146.
 
-## Ordered work
+## Later passes
 
 - [ ] Capture CPU/HIP timelines and per-rank expert hits, misses, transfer bytes,
   readback waits, collective time, and peak memory. Distinguish queue time from
   prefill execution; do not infer bottleneck percentages from wall time alone.
 - [x] A/B the 24-row K2 gate with the current 8-row default. Keep 8 after the
   observed c8 regressions; further wide-K2 work belongs with #110.
-- [ ] Batch the six payload copy submissions per missed expert and measure
+- [x] Batch the six payload copy submissions per missed expert and measure
   submission overhead versus transfer time, preserving pinned-buffer lifetime.
 - [ ] Reduce blocking route readback and host planning overhead without changing
   routing, eviction protection, overflow behavior, or graph replay correctness.
