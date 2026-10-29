@@ -275,3 +275,90 @@ def test_profile_typos_and_unrepresentable_weights_are_rejected(change):
     profiles[0, 0].update(change)
     with pytest.raises(ValueError):
         sweep.plan_slots(records, profiles, {0: 100}, [1], baseline_capacity=1)
+
+
+def _recorded_costs(tmp_path, monkeypatch, expert_bytes=100):
+    monkeypatch.setenv("VLLM_RDNA_EXPERT_ROUTE_DIR", str(tmp_path))
+    path = _PATH.parents[3] / (
+        "vllm/model_executor/layers/fused_moe/rdna_expert_route_trace.py"
+    )
+    spec = importlib.util.spec_from_file_location("cost_route_writer", path)
+    assert spec is not None and spec.loader is not None
+    writer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(writer)
+    for layer in (0, 1):
+        writer.record_routes(
+            f"model.layers.{layer}.mlp.experts",
+            [0, 1],
+            4,
+            phase="decode",
+            rank=0,
+            expert_bytes=expert_bytes,
+        )
+    return sweep.read_calls(tmp_path, local_experts=4)
+
+
+@pytest.mark.parametrize(
+    "change", [{"expert_bytes": 1}, {"map_bytes": 0}, {"map_bytes": 17}]
+)
+def test_jsonl_cost_contradictions_rejected_before_any_replay(
+    tmp_path, monkeypatch, change
+):
+    records = _recorded_costs(tmp_path, monkeypatch)
+    assert records.runtime_costs == {
+        key: {"expert_bytes": 100, "map_bytes": 16, "logical_experts": 4}
+        for key in records
+    }
+    profiles = _profiles(records, expert_bytes=100)
+    profiles[0, 1].update(change)  # Later layer must reject before first replay.
+
+    def forbidden_replay(*args, **kwargs):
+        raise AssertionError("contradictory costs must fail before simulation")
+
+    monkeypatch.setattr(sweep, "simulate", forbidden_replay)
+    with pytest.raises(ValueError, match="contradict measured runtime"):
+        sweep.plan_slots(
+            records, profiles, {0: 1000}, [1, 2], baseline_capacity=1, local_experts=4
+        )
+
+
+def test_jsonl_plan_reports_verified_payload_and_fixed_maps(tmp_path, monkeypatch):
+    records = _recorded_costs(tmp_path, monkeypatch)
+    report = sweep.plan_slots(
+        records,
+        _profiles(records, expert_bytes=100),
+        {0: 232},
+        [1, 2],
+        baseline_capacity=1,
+        local_experts=4,
+    )
+    assert report["runtime_costs_verified"] is True
+    assert "JSONL" in report["cost_scope"]
+    rank = report["per_rank"]["0"]
+    assert rank["map_bytes"] == 32 and rank["used_bytes"] == 232
+    assert rank["used_bytes"] <= rank["budget_bytes"]
+
+
+def test_jsonl_missing_measured_payload_cost_cannot_claim_feasible_plan(
+    tmp_path, monkeypatch
+):
+    records = _recorded_costs(tmp_path, monkeypatch, expert_bytes=None)
+    with pytest.raises(ValueError, match="missing measured expert_bytes"):
+        sweep.plan_slots(
+            records,
+            _profiles(records),
+            {0: 1000},
+            [1],
+            baseline_capacity=1,
+            local_experts=4,
+        )
+
+
+def test_manual_costs_remain_explicitly_modeled_and_customizable():
+    records = {(0, 0): [[0]]}
+    report = sweep.plan_slots(
+        records, _profiles(records, map_bytes=0), {0: 10}, [1], baseline_capacity=1
+    )
+    assert report["runtime_costs_verified"] is False
+    assert "Caller-supplied modeled costs" in report["cost_scope"]
+    assert report["per_rank"]["0"]["used_bytes"] == 10

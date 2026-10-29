@@ -77,7 +77,12 @@ def test_complete_routes_bounded_calls_and_count_manifest(
 def test_phase_scope_never_silently_mixes(trace, sweep, tmp_path):
     for phase in ("prefill", "decode", "profile"):
         trace.record_routes(
-            "model.layers.0.mlp.experts", [0, 1], 256, phase=phase, rank=0
+            "model.layers.0.mlp.experts",
+            [0, 1],
+            256,
+            phase=phase,
+            rank=0,
+            expert_bytes=10,
         )
     with pytest.raises(ValueError, match="mixed route phases"):
         sweep.read_calls(tmp_path)

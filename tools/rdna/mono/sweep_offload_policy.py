@@ -48,14 +48,15 @@ def simulate(calls, capacity, policy, local_experts=256, decay_interval=128):
 
 
 class TraceRecords(dict):
-    def __init__(self, values, phase, excluded_phases=()):
+    def __init__(self, values, phase, excluded_phases=(), runtime_costs=None):
         super().__init__(values)
         self.trace_phase = phase
         self.excluded_phases = tuple(excluded_phases)
+        self.runtime_costs = runtime_costs
 
 
 def _read_route_calls(paths, local_experts, phase):
-    records, phases, identities = {}, set(), set()
+    records, phases, identities, runtime_costs = {}, set(), set(), {}
     for path in paths:
         lines = path.read_text().splitlines()
         if not lines:
@@ -159,6 +160,11 @@ def _read_route_calls(paths, local_experts, phase):
         ):
             raise ValueError(f"route manifest count/schema mismatch: {path}")
         records[identity] = calls
+        runtime_costs[identity] = dict(
+            expert_bytes=header["expert_bytes"],
+            map_bytes=local_experts * 4,
+            logical_experts=local_experts,
+        )
     if phase is None:
         if len(phases) != 1:
             raise ValueError("mixed route phases require an explicit phase selection")
@@ -170,7 +176,12 @@ def _read_route_calls(paths, local_experts, phase):
         for (rank, layer, scope), calls in records.items()
         if scope == phase
     }
-    return TraceRecords(selected, phase, sorted(phases - {phase}))
+    selected_costs = {
+        (rank, layer): costs
+        for (rank, layer, scope), costs in runtime_costs.items()
+        if scope == phase
+    }
+    return TraceRecords(selected, phase, sorted(phases - {phase}), selected_costs)
 
 
 def read_calls(directory, local_experts=256, phase=None):
@@ -310,6 +321,28 @@ def plan_slots(
     ranks = sorted({rank for rank, _ in records})
     if set(rank_budgets) != set(ranks):
         raise ValueError("rank_budgets must cover exactly the traced ranks")
+    runtime_costs = getattr(records, "runtime_costs", None)
+    if runtime_costs is not None:
+        if set(runtime_costs) != set(records):
+            raise ValueError("runtime trace costs must cover exactly all traced layers")
+        # Validate all measured costs before replaying even the first capacity.
+        # Legacy/manual inputs deliberately retain caller-supplied modeled costs.
+        for key in sorted(records):
+            actual = runtime_costs[key]
+            if actual["expert_bytes"] is None:
+                raise ValueError(
+                    f"missing measured expert_bytes in JSONL trace for {key}"
+                )
+            if actual["logical_experts"] != local_experts:
+                raise ValueError(f"runtime logical_experts mismatch for {key}")
+            payload = _integer(profiles[key].get("expert_bytes"), "expert_bytes", 1)
+            fixed = _integer(
+                profiles[key].get("map_bytes", local_experts * 4), "map_bytes"
+            )
+            if payload != actual["expert_bytes"] or fixed != actual["map_bytes"]:
+                raise ValueError(
+                    f"profile costs contradict measured runtime trace for {key}"
+                )
     available = sorted(set(_integer(c, "capacity", 1) for c in capacities))
     if not available or available[-1] > local_experts:
         raise ValueError("capacities must be nonempty and <= local_experts")
@@ -440,6 +473,12 @@ def plan_slots(
         )
     return dict(
         version=1,
+        runtime_costs_verified=runtime_costs is not None,
+        cost_scope=(
+            "JSONL expert payload and fixed int32 slot-map costs verified"
+            if runtime_costs is not None
+            else "Caller-supplied modeled costs; runtime allocations unverified"
+        ),
         trace_phase=getattr(records, "trace_phase", "unspecified"),
         excluded_trace_phases=getattr(records, "excluded_phases", ()),
         policy=policy,
