@@ -464,3 +464,20 @@ must not exceed `max_num_seqs` across running and suspended slots; an existing
 suspended request may still restore at that limit. Initial support targets the
 requested TP2/MTP2, FCFS, PP1, aligned-recurrent-state configuration. No V1 worker
 serialization layer is needed for this implementation.
+
+## Admission and restore-reader fences
+
+After detaching a snapshot, move it out of the GPU-KV-holding priority queue
+and behind fresh waiting admission. A ready restored request already owns its
+GPU pages and V2 slot; it must not trigger another fresh-admission spill.
+Blocked grammar/remote-KV waiters and adapter requests do not trigger proactive
+paging. These queue/readiness cases have actual FCFS regression coverage.
+
+Private restore reservations bypass the ordinary allocation callback. Register
+their destination pages in the connector's existing allocated-page reuse set:
+a finished request's ordinary prefix store can still read a logically freed
+page. Store and load handlers have separate event chains, so submission order
+alone is insufficient. The normal metadata fence flushes only readers of reused
+destinations before H2D; unrelated stores remain asynchronous. The expanded
+GPU-7 regression suite passes 801 cases, including both reuse and unrelated-page
+checks. Normal-threshold performance is rerun on this fenced implementation.

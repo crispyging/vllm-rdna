@@ -6,6 +6,8 @@ physical-page and regression tests used GPU 7.
 
 ## Verified so far
 
+- `restore-fence-regression-tests.txt`: latest 801-test suite passes after the
+  admission-order/readiness fixes and restore-destination prefix-reader fence.
 - `live-pre-serve-tests.txt`: 792 regression tests passed, including typed hybrid
   snapshots, CPU leases, connector transactions, cancellation, prefix caching and
   allocator-backed GPU → RAM → GPU physical page copies.
