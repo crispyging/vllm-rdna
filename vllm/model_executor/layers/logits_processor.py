@@ -81,6 +81,39 @@ def _head_allreduce_gather(
     return gathered
 
 
+def _top_tokens_allreduce_argmax(
+    local_max_vals: torch.Tensor, global_indices: torch.Tensor
+) -> torch.Tensor:
+    """Global vocab argmax via two tiny all-reduces (FLASHNEXT_HEAD_ALLREDUCE=1).
+
+    gfx1030 workaround (ported from the maintainer's host-proven live patch,
+    live-patches-4425834a): the reproduced ROCm ``all_gather_into_tensor``
+    corruption also poisons the (value, index) pair gather in
+    ``get_top_tokens`` (speculator._greedy_sample_draft uses it). A MAX
+    all-reduce on the values, then a MIN all-reduce over the global indices
+    of the ranks holding the max, replaces it deterministically with two
+    collectives this fabric handles correctly. GPU-only (no host copies), so
+    CUDA-graph capture stays legal. Ties break to the lowest global vocab
+    index; the default pair-gather path (env unset) is untouched.
+    """
+    import torch.distributed as dist
+
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    local_vals = local_max_vals.float()
+    global_max = local_vals.clone()
+    dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=group.device_group)
+    # Among ranks holding the max, take the lowest global vocab index so
+    # every rank agrees deterministically.
+    sentinel = torch.full_like(local_vals, 1e9)
+    candidates = torch.where(
+        local_vals == global_max, global_indices.float(), sentinel
+    )
+    dist.all_reduce(candidates, op=dist.ReduceOp.MIN, group=group.device_group)
+    return candidates.to(torch.int64)
+
+
 # --8<-- [start:logits_processor]
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
@@ -297,6 +330,11 @@ class LogitsProcessor(PluggableLayer):
 
         if tp_size == 1:
             return global_indices
+
+        if os.environ.get("FLASHNEXT_HEAD_ALLREDUCE") == "1":
+            # gfx1030: the (value, index) pair gather below runs the same
+            # corrupted all_gather_into_tensor; use two tiny all-reduces.
+            return _top_tokens_allreduce_argmax(local_max_vals, global_indices)
 
         # All-gather (value, index) pairs, then reduce to global argmax.
         # Use float32 to avoid bf16 precision loss on large vocab indices.

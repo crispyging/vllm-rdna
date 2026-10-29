@@ -117,6 +117,7 @@ def _rank_main(rank, world, fn_name, init_file):
             "head_layout": _check_head_layout,
             "linear_layout": _check_linear_layout,
             "head_dispatch": _check_head_dispatch,
+            "top_tokens": _check_top_tokens,
         }[fn_name]
         fn(rank, world)
     finally:
@@ -333,3 +334,84 @@ def test_linear_env_gate_wiring():
     assert ".cpu()" not in fwd
     # the env gate is a runtime check, not a hardcoded enable
     assert 'os.environ.get(FLASHNEXT_GATHER_ALLREDUCE_ENV) == "1"' in fwd
+
+
+# --------------------------------------------------------------------------
+# site 3: get_top_tokens (value, index) pair gather -> all-reduce argmax.
+# The lane's live-patches logits file (4425834a) also closes the tiny
+# (value, index) all_gather in LogitsProcessor.get_top_tokens, because it
+# runs the same corrupted all_gather_into_tensor collective.
+# --------------------------------------------------------------------------
+
+def _check_top_tokens(rank, world):
+    """_top_tokens_allreduce_argmax (shipping source) == reference global
+    argmax over per-rank (value, index) pairs, tie-broken by the lowest
+    global vocab index; deterministic and identical on every rank."""
+    from unittest.mock import MagicMock
+
+    tp = MagicMock()
+    tp.world_size = world
+    tp.rank_in_group = rank
+    tp.device_group = None
+    ns = _lp_namespace(tp)
+    helper = _exec_helper(LP_SRC, "_top_tokens_allreduce_argmax", ns)
+
+    VSHARD = 1024  # vocab columns owned per rank (indices stay < 1e9)
+    torch.manual_seed(31337)  # identical design on every rank
+    b = 5
+    vals = torch.rand(b, world) * 0.5
+    # global vocab index = rank * VSHARD + local offset (unique across ranks)
+    idxs = (
+        torch.arange(world)[None, :].expand(b, world) * VSHARD
+        + torch.randint(1, VSHARD, (b, world))
+    )
+    # force an exact value tie across all ranks in an extra row
+    vals = torch.cat([vals, torch.full((1, world), 0.9)])
+    tie_idxs = (torch.arange(world) * VSHARD + 7)[None, :]
+    idxs = torch.cat([idxs, tie_idxs])
+
+    got = helper(vals[:, rank].clone().float(), idxs[:, rank].clone().long())
+    assert got.dtype == torch.int64
+
+    # reference: every rank sees the full (vals, idxs) matrix
+    allv = [torch.empty(b + 1) for _ in range(world)]
+    alli = [torch.empty(b + 1, dtype=torch.int64) for _ in range(world)]
+    dist.all_gather(allv, vals[:, rank].clone().float())
+    dist.all_gather(alli, idxs[:, rank].clone().long())
+    V = torch.stack(allv, dim=-1)  # [rows, world]
+    I = torch.stack(alli, dim=-1)
+    vmax = V.max(dim=-1, keepdim=True).values
+    ref = I.masked_fill(V < vmax, 10**9).min(dim=-1).values
+
+    assert torch.equal(got, ref), f"rank {rank}: {got.tolist()} != {ref.tolist()}"
+    # tie row must resolve to the lowest global index
+    assert int(got[-1]) == int(idxs[-1].min())
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_top_tokens_allreduce_matches_reference(world):
+    _run_spawned("top_tokens", world)
+
+
+def test_top_tokens_env_gate_wiring():
+    """Source-level: get_top_tokens must keep the plain pair-gather as the
+    default branch, gate the all-reduce argmax behind
+    FLASHNEXT_HEAD_ALLREDUCE (same flag as the head gather), and contain no
+    host copy."""
+    text = LP_SRC.read_text()
+    tree = ast.parse(text)
+    fwd = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "get_top_tokens":
+            fwd = ast.get_source_segment(text, node)
+            break
+    assert fwd is not None, "get_top_tokens not found"
+    assert 'os.environ.get("FLASHNEXT_HEAD_ALLREDUCE") == "1"' in fwd
+    assert "_top_tokens_allreduce_argmax(local_max_vals, global_indices)" in fwd
+    # default pair-gather branch preserved
+    assert "tensor_model_parallel_all_gather(local_pair, dim=-1)" in fwd
+    assert ".cpu()" not in fwd
+    # helper exists at module level and uses MAX then MIN all-reduces
+    helper_src = _extract_func(LP_SRC, "_top_tokens_allreduce_argmax")
+    assert "dist.ReduceOp.MAX" in helper_src
+    assert "dist.ReduceOp.MIN" in helper_src
