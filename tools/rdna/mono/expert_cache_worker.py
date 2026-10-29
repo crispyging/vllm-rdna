@@ -25,17 +25,30 @@ class ExpertCacheWorker:
         worker = getattr(wrapper, "worker", None)
         config = getattr(getattr(self, "model_runner", None), "kv_cache_config", None)
         groups = getattr(config, "kv_cache_groups", ())
+        spec = getattr(wrapper, "spec", None)
+        physical = bool(getattr(worker, "supports_physical_page_snapshots", False))
+        page_bytes = (
+            getattr(spec, "cpu_page_size_per_worker", None)
+            if physical and getattr(spec, "blocks_per_chunk", None) == 1
+            else None
+        )
+        gpu_pages = getattr(worker, "_physical_page_count", 0)
+        cpu_chunks = getattr(worker, "_physical_cpu_chunk_count", 0)
+        live_configured = bool(getattr(wrapper, "_live_snapshots_enabled", False))
         return {
             "connector": type(connector).__name__,
             "worker": type(worker).__name__,
-            "physical_page_transport": bool(
-                getattr(worker, "supports_physical_page_snapshots", False)
-            ),
-            "physical_page_count": getattr(worker, "_physical_page_count", 0),
-            "cpu_chunk_count": getattr(worker, "_physical_cpu_chunk_count", 0),
-            "blocks_per_chunk": getattr(
-                getattr(wrapper, "spec", None), "blocks_per_chunk", None
-            ),
+            "physical_page_transport": physical,
+            "physical_page_count": gpu_pages,
+            "cpu_chunk_count": cpu_chunks,
+            "physical_page_bytes": page_bytes,
+            "gpu_physical_bytes": None
+            if page_bytes is None
+            else gpu_pages * page_bytes,
+            "cpu_physical_bytes": None
+            if page_bytes is None
+            else cpu_chunks * page_bytes,
+            "blocks_per_chunk": getattr(spec, "blocks_per_chunk", None),
             "groups": [
                 {
                     "spec": type(group.kv_cache_spec).__name__,
@@ -43,7 +56,8 @@ class ExpertCacheWorker:
                 }
                 for group in groups
             ],
-            "live_request_paging": False,
+            "live_request_paging_configured": live_configured,
+            "live_request_paging": live_configured and physical,
         }
 
     def rdna_expert_cache_control(

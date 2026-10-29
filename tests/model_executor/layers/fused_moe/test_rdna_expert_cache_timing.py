@@ -144,7 +144,7 @@ def test_worker_names_rank_and_quiescent_timing_control(module, monkeypatch):
             _physical_page_count=8,
             _physical_cpu_chunk_count=2,
         ),
-        spec=SimpleNamespace(blocks_per_chunk=1),
+        spec=SimpleNamespace(blocks_per_chunk=1, cpu_page_size_per_worker=4096),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -155,6 +155,16 @@ def test_worker_names_rank_and_quiescent_timing_control(module, monkeypatch):
     assert layout["physical_page_transport"]
     assert layout["blocks_per_chunk"] == 1
     assert not layout["live_request_paging"]
+    assert layout["physical_page_bytes"] == 4096
+    assert layout["gpu_physical_bytes"] == 8 * 4096
+    assert layout["cpu_physical_bytes"] == 2 * 4096
+    wrapper._live_snapshots_enabled = True
+    assert worker.rdna_kv_snapshot_layout()["live_request_paging"]
+    wrapper.worker.supports_physical_page_snapshots = False
+    layout = worker.rdna_kv_snapshot_layout()
+    assert layout["live_request_paging_configured"]
+    assert not layout["live_request_paging"]
+    assert layout["physical_page_bytes"] is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/HIP")
