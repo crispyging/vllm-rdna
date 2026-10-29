@@ -28,8 +28,9 @@ Optional KV transfer counters absent from the server are recorded as unavailable
 The kernel ring could not be read; log scans do not establish hardware-ring health.
 `profile/server-info.json` is sanitized configuration only.
 
-`policy-replay.json` replays 61 decode calls per rank/layer from empty caches.
-Frequency decay at 128 calls was not exercised. Prefill and previous residency
+`policy-replay.json.gz` replays 61 decode calls per rank/layer from empty caches.
+Frequency decay at 128 calls was not exercised. Original route files/manifests
+are hash-verified in `decode-route-traces.tar.gz`. Prefill and previous residency
 are excluded. Slot plans are candidates, not measured speedups or global optima.
 
 - `slot-plan.json`: same expert byte budget, 48–160 slots per layer; about 7.2%
@@ -57,3 +58,11 @@ known-demand prefetch bytes were adopted, with zero unused bytes or failures.
 These are correctness receipts, not an overlap performance claim.
 Live paging uses a forced zero watermark during correctness qualification only;
 that setting is not a recommended serving default.
+
+The final normal-threshold paging comparison is complete in `budget-matrix/`.
+Uniform96 plus active RAM paging measures 32.44 versus 31.20 output tok/s and
+76.93 versus 96.18 s mean TTFT in warmed long c8, but the longest streaming gap
+is 125.99 versus 2.33 s. Keep the general default at uniform96 with ordinary
+CPU prefix reuse and active paging off. The final source also passes PPL 4.78,
+48 checks, and real CPU-prefix reload with 32 identical tokens and zero maximum
+token-logprob delta. Both prefix tiers reset successfully and owned servers stop.

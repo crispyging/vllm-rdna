@@ -94,6 +94,9 @@ while a live snapshot or unpublished resume owns state. Insufficient CPU/GPU
 capacity leaves the ordinary scheduler and recompute path available.
 Keep this control off for ordinary launches until the workload demonstrates a
 latency/admission benefit; correctness qualification does not establish speedup.
+The normal 90% watermark test improved long c8 TTFT but produced a 126-second
+victim streaming gap. Whole-request paging is an explicit capacity/batch tradeoff,
+not an interactive default. See the matched budget-matrix receipts.
 
 For per-layer transfer diagnostics, use the worker extension above and call
 `rdna_expert_cache_control` with `{"transfer_timing":"on"}` between workloads.

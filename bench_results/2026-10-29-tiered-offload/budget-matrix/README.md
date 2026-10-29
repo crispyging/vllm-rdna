@@ -8,7 +8,7 @@ cells. Fixed workload seeds/order match across launches. Random performance
 outputs force EOS continuation and are not semantic quality evidence.
 
 `baseline` and `budget88` are first passes, including startup shape effects.
-`*-repeat` are warmed repeats. This is one sequential pair plus its repeats;
+`*-repeat` are warmed repeats. Each comparison is one sequential configuration pair plus its repeats;
 MTP/routing trajectories and expert history can differ. Use the observations
 as workload-specific evidence, not an isolated causal or universal speedup.
 
@@ -68,9 +68,56 @@ representative c1/c8 prefill and decode traces first. Evaluate live request KV
 spilling separately: these no-preemption results do not establish its speedup.
 
 `summary.json` contains exact metrics, byte deltas, MTP acceptance and sampled
-admission totals; `summarize-tiered-budget.py.txt` reproduces it. Each arm retains
-raw benchmark results, per-layer before/after receipts and one-second metrics.
+admission totals; `summarize-tiered-budget.py.txt` reproduces it. The raw archive retains
+each arm's benchmark results, per-layer before/after receipts and one-second metrics.
+Raw matrices are in `raw-matrices.tar.gz`; every member is hash-verified in
+`raw-matrices-manifest.json`. To reproduce from the repository root, extract it
+into this directory, then run `python3` on `summarize-tiered-budget.py.txt`.
+The archived inputs reproduce every published summary value exactly.
 Server/client logs are gzip-compressed; `log-scan.json` records server hashes
 and numeric/fault markers. The baseline has one output-handler EngineDeadError
 traceback during deliberate shutdown after all cells and the idle layout RPC;
 no serving numeric/GPU-fault marker was found. Kernel-ring access was unavailable.
+
+## Uniform96 with normal-threshold RAM paging
+
+`live90` / `live90-repeat` use source `292e0b0f70`, the same expert and KV
+budgets as baseline, and a 90% live-paging watermark. Overlap remains off.
+The initial churn diagnostic is separately archived in
+`admission-churn-before-fix/`; the corrected comparison does not include it.
+
+| Warmed 16k/1024 c8 | Prefix-only baseline | Active RAM paging |
+| --- | --- | --- |
+| Output tok/s | 31.20 | 32.44 |
+| Mean TTFT | 96.18 s | 76.93 s |
+| p99 TTFT | 215.84 s | 137.35 s |
+| Mean reported ITL | 307.6 ms | 371.1 ms |
+| Longest streaming gap | 2.33 s | 125.99 s |
+| Mean request completion | 224.33 s | 226.82 s |
+| Longest request completion | 262.58 s | 252.55 s |
+
+The first paging pass measured 32.06 output tok/s, 76.53 s mean TTFT and
+353.6 ms mean ITL. Each pressure cell uses two snapshots; all four stores and
+restores preserve nonaligned token frontiers. Across both cells, private
+snapshot D2H and H2D are each 5,098,176,512 bytes (ordinary prefix traffic is
+additional). The earlier policy did eleven snapshots in one cell. Fixed
+admission ordering avoids immediately consuming pages just freed for newcomers.
+
+This is whole-request suspension: the victim waits in RAM until enough GPU
+pages are available. Earlier admission improves TTFT but can create a long gap
+in an existing stream. Keep live paging off for ordinary interactive serving;
+consider it only as an explicit capacity/batch/TTFT tradeoff. The approximately
+4% aggregate throughput difference is an observation from this pair, not a
+universal speedup. MTP trajectories differ, and cells below the watermark do
+not page at all; their throughput variation cannot be credited to paging.
+
+Final post-load quality: PPL 4.78 and 48 checks with zero hard failures. A real
+CPU-prefix reload after GPU-only reset passed: 32 identical output tokens,
+zero maximum token-logprob delta versus the GPU-cached reference, positive
+347,602,944-byte stores and 289,669,120-byte loads. External CPU state was
+preserved. Final GPU+CPU prefix reset succeeded; the API and TP workers stopped.
+`live90/qualification-summary.json` and `runtime-manifest.json` retain details.
+
+MTP streaming emits token chunks; the reported ITL follows the benchmark's
+chunk timing. The longest streaming gap is included explicitly because rare
+whole-request suspension is not adequately described by a mean or p99 alone.

@@ -77,7 +77,10 @@ separate requirement and must not be advertised before its resume gate passes.
   general default. The 88% plan improves long c8 TTFT but not throughput and
   worsens ITL and shorter cells; see the budget-matrix receipts.
 - [x] Finish eager live-paging and combined overlap qualification.
-- [ ] Measure normal-threshold live paging with the uniform expert budget;
-  forced-zero correctness runs do not establish its serving benefit.
+- [x] Measure normal-threshold live paging with the uniform expert budget:
+  warmed long c8 TTFT improves 20%, throughput changes about +4%, but a victim
+  has a 126-second streaming gap. Keep paging off for interactive defaults.
+- [ ] Bound streaming suspension or add finer-grained KV residency before
+  considering active RAM paging a general serving default.
 - [ ] Before promoting a nonuniform default, collect longer representative
   prefill/decode c1/c8 traces that exercise frequency decay and retrain the plan.

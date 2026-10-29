@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 root=Path('bench_results/2026-10-29-tiered-offload/budget-matrix')
 summary={'scope':'Same expert+configured GPU-KV byte budget; cold GPU+CPU prefix per cell; fixed seeds and order; first passes retained separately from warmed repeats; routing/MTP trajectories can differ. No universal speedup claim.','arms':{}}
-for arm in ('baseline','baseline-repeat','budget88','budget88-repeat'):
+for arm in ('baseline','baseline-repeat','budget88','budget88-repeat','live90','live90-repeat'):
     folder=root/arm
     path=folder/'results.json'
     if not path.exists(): continue
@@ -14,8 +14,10 @@ for arm in ('baseline','baseline-repeat','budget88','budget88-repeat'):
         assert len(paths)==1,(arm,name,paths)
         raw=json.loads(paths[0].read_text())
         before=cell['before']['results']; after=cell['after']['results']
+        gaps=[v for row in raw['itls'] for v in row]
+        latencies=sorted(raw['latencies'])
         assert len(before)==len(after)==2
-        kv=4026531840 if arm.startswith('baseline') else 5456547840
+        kv=4026531840 if arm.startswith(('baseline','live90')) else 5456547840
         budgets=[r['device_bytes']+kv for r in before]
         assert budgets==[15793569792]*2,(arm,budgets)
         def delta(key): return sum(x[key] for x in after)-sum(x[key] for x in before)
@@ -30,7 +32,7 @@ for arm in ('baseline','baseline-repeat','budget88','budget88-repeat'):
             observed+=dt
             seconds_waiting+=dt*metrics['vllm:num_requests_waiting']
             seconds_running+=dt*metrics['vllm:num_requests_running']
-        cells.append({'name':name,'completed':raw['completed'],'output_tokens_per_second':raw['output_throughput'],'duration_seconds':raw['duration'],'mean_ttft_ms':raw['mean_ttft_ms'],'p99_ttft_ms':raw['p99_ttft_ms'],'mean_itl_ms':raw['mean_itl_ms'],'p99_itl_ms':raw['p99_itl_ms'],'expert_bytes_per_rank':[r['device_bytes'] for r in before],'host_expert_bytes_per_rank':[r['host_bytes'] for r in before],'configured_gpu_kv_bytes_per_rank':kv,'combined_expert_and_gpu_kv_bytes_per_rank':budgets,'copied_expert_bytes_both_ranks':delta('copied_bytes'),'expert_demands_both_ranks':delta('expert_demands'),'expert_misses_both_ranks':delta('expert_misses'),'mean_mtp_acceptance_length':None if not drafts else 1+accepted/drafts,'preemptions':d['vllm:num_preemptions'],'peak_requests':b['peak_requests'],'peak_cache_usage':b['peak_cache_usage'],'sampled_waiting_request_seconds':seconds_waiting,'sampled_running_request_seconds':seconds_running,'metric_observed_seconds_including_client_launch':observed,'metric_unobserved_seconds':unobserved})
+        cells.append({'name':name,'completed':raw['completed'],'output_tokens_per_second':raw['output_throughput'],'duration_seconds':raw['duration'],'max_stream_gap_seconds':max(gaps),'mean_e2e_seconds':sum(latencies)/len(latencies),'max_e2e_seconds':max(latencies),'mean_ttft_ms':raw['mean_ttft_ms'],'p99_ttft_ms':raw['p99_ttft_ms'],'mean_itl_ms':raw['mean_itl_ms'],'p99_itl_ms':raw['p99_itl_ms'],'expert_bytes_per_rank':[r['device_bytes'] for r in before],'host_expert_bytes_per_rank':[r['host_bytes'] for r in before],'configured_gpu_kv_bytes_per_rank':kv,'combined_expert_and_gpu_kv_bytes_per_rank':budgets,'copied_expert_bytes_both_ranks':delta('copied_bytes'),'expert_demands_both_ranks':delta('expert_demands'),'expert_misses_both_ranks':delta('expert_misses'),'mean_mtp_acceptance_length':None if not drafts else 1+accepted/drafts,'preemptions':d['vllm:num_preemptions'],'peak_requests':b['peak_requests'],'peak_cache_usage':b['peak_cache_usage'],'sampled_waiting_request_seconds':seconds_waiting,'sampled_running_request_seconds':seconds_running,'metric_observed_seconds_including_client_launch':observed,'metric_unobserved_seconds':unobserved})
     summary['arms'][arm]={'passed':report['passed'],'cells':cells}
 if all(a in summary['arms'] and summary['arms'][a]['passed'] for a in ('baseline-repeat','budget88-repeat')):
     summary['warmed_comparison']=[]
@@ -38,5 +40,11 @@ if all(a in summary['arms'] and summary['arms'][a]['passed'] for a in ('baseline
         assert a['name']==b['name']
         fields=('output_tokens_per_second','mean_ttft_ms','p99_ttft_ms','mean_itl_ms','p99_itl_ms','copied_expert_bytes_both_ranks','sampled_waiting_request_seconds')
         summary['warmed_comparison'].append({'name':a['name'],'candidate_change_percent':{key:None if not a[key] else 100*(b[key]/a[key]-1) for key in fields}})
+if all(a in summary['arms'] and summary['arms'][a]['passed'] for a in ('baseline-repeat','live90-repeat')):
+    summary['warmed_comparison_live90']=[]
+    for a,b in zip(summary['arms']['baseline-repeat']['cells'],summary['arms']['live90-repeat']['cells']):
+        assert a['name']==b['name']
+        fields=('output_tokens_per_second','mean_ttft_ms','p99_ttft_ms','mean_itl_ms','p99_itl_ms','copied_expert_bytes_both_ranks','sampled_waiting_request_seconds')
+        summary['warmed_comparison_live90'].append({'name':a['name'],'candidate_change_percent':{key:None if not a[key] else 100*(b[key]/a[key]-1) for key in fields}})
 (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
-print(json.dumps(summary.get('warmed_comparison',{'completed_arms':list(summary['arms'])}),indent=2))
+print(json.dumps({k:v for k,v in summary.items() if k.startswith('warmed_comparison')},indent=2))
