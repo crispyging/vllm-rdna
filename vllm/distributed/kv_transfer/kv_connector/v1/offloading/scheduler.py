@@ -2061,6 +2061,9 @@ class OffloadingConnectorScheduler:
         if record.state != SnapshotState.HOST_READY:
             return False
         src = self.manager.prepare_load(record.keys, record.context)
+        # Private restore allocations bypass update_state_after_alloc().
+        # Reuse the normal prefix-reader fence before H2D overwrites pages.
+        self._current_batch_allocated_block_ids.update(pages)
         job_id = self._generate_job_id()
         record.job_id = job_id
         record.state = SnapshotState.RESTORE_PENDING

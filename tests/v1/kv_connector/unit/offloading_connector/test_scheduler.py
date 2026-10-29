@@ -4701,6 +4701,7 @@ def _snapshot_scheduler(num_chunks=8):
     scheduler._snapshot_store_jobs = {}
     scheduler._current_batch_load_jobs = {}
     scheduler._current_batch_jobs_to_flush = set()
+    scheduler._current_batch_allocated_block_ids = set()
     scheduler._jobs = {}
     scheduler._job_counter = 0
     scheduler._stale_job_threshold = 0
@@ -4942,3 +4943,43 @@ def test_live_snapshot_accepts_native_default_zero_admission_threshold():
     assert ticket is not None
     direct = scheduler.begin_request_snapshot("already-quiescent", [1, 3])
     assert direct is not None
+
+
+@pytest.mark.parametrize("destination,expected_flush", [(5, {99}), (7, set())])
+def test_snapshot_restore_fences_only_reused_prefix_sources(
+    monkeypatch, destination, expected_flush
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        TransferJobStatus,
+    )
+
+    scheduler = _snapshot_scheduler()
+    scheduler._connector_stats = OffloadingConnectorStats()
+    ticket = scheduler.begin_request_snapshot("restore", [1])
+    assert ticket is not None
+    store_id = next(iter(scheduler._jobs))
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={store_id: 2}
+            )
+        )
+    )
+    scheduler._snapshot_store_jobs.clear()
+    # Another finished request's prefix store still reads old physical page 5.
+    scheduler._jobs[99] = TransferJobStatus("old-prefix", 2, set(), True)
+    scheduler._block_id_to_pending_jobs = {5: {99}}
+    scheduler._req_status = {}
+    monkeypatch.setattr(scheduler, "_update_req_states", lambda _: None)
+    monkeypatch.setattr(scheduler, "_build_partial_tail_store_jobs", lambda _: {})
+    monkeypatch.setattr(scheduler, "_build_store_jobs", lambda _: {})
+    assert scheduler.begin_snapshot_restore(ticket, [destination])
+    assert scheduler._current_batch_allocated_block_ids == {destination}
+    meta = scheduler.build_connector_meta(
+        SimpleNamespace(
+            scheduled_new_reqs=[], preempted_req_ids=set(), finished_req_ids=set()
+        )
+    )
+    assert meta.jobs_to_flush == expected_flush
+    assert len(meta.load_jobs) == 1
+    assert next(iter(meta.load_jobs.values())).physical
